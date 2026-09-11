@@ -588,8 +588,9 @@ def submit_stage(
     array_command = None
     array_job_id = None
     if indices:
+        concurrency = spec["matched_objective"]["stage_array_concurrency"][stage]
         expression = workflow.format_array_indices(
-            indices, spec["scheduler"]["array_concurrency"]
+            indices, concurrency
         )
         array_command = build_sbatch_command(
             CLUSTER_DIR / "stage_array.sbatch",

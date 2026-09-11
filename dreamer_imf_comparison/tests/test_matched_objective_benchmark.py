@@ -62,9 +62,9 @@ class MatchedObjectiveBenchmarkTest(unittest.TestCase):
                 benchmark, "_compute_candidates", return_value={}
             ), mock.patch.object(
                 benchmark,
-                "build_compute_plan",
-                return_value=(plan, {}, {}),
-            ), mock.patch.object(
+                "build_compute_plan_in_fresh_process",
+                return_value=(plan, {}),
+            ) as independent_build, mock.patch.object(
                 benchmark, "validate_compute_plan_cell"
             ) as local_validation, mock.patch.object(
                 benchmark, "_validate_compute_files"
@@ -81,6 +81,7 @@ class MatchedObjectiveBenchmarkTest(unittest.TestCase):
         self.assertFalse(
             local_validation.call_args.kwargs["rederive_compiler_evidence"]
         )
+        independent_build.assert_called_once()
         independent_validation.assert_called_once_with(
             plan,
             self.protocol,
@@ -88,7 +89,7 @@ class MatchedObjectiveBenchmarkTest(unittest.TestCase):
             compute_cell,
             output,
         )
-        print("COMPUTE_REDERIVATION_PROCESS_BOUNDARY_VERIFIED")
+        print("COMPUTE_BUILD_AND_REDERIVATION_BOUNDARIES_VERIFIED")
 
     def test_exact_smoke_and_pilot_hpo_matrices(self) -> None:
         smoke = benchmark.build_matrix(

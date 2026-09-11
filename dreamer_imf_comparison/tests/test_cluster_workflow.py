@@ -114,6 +114,28 @@ class ClusterWorkflowTests(unittest.TestCase):
         self.assertEqual(runtime["jax_raise_persistent_cache_errors"], "true")
         print("FAIL_CLOSED_COMPILATION_CACHE_CONTRACT_VERIFIED")
 
+    def test_main_compute_plan_stage_is_serialized(self) -> None:
+        concurrency = self.spec["matched_objective"]["stage_array_concurrency"]
+        self.assertEqual(
+            concurrency,
+            {
+                "dataset": 4,
+                "compute_plan": 1,
+                "world_model": 4,
+                "rollout": 4,
+                "actor": 4,
+            },
+        )
+        self.assertEqual(
+            workflow.format_array_indices(range(24), concurrency["compute_plan"]),
+            "0-23%1",
+        )
+        changed = copy.deepcopy(self.spec)
+        changed["matched_objective"]["stage_array_concurrency"]["compute_plan"] = 4
+        with self.assertRaisesRegex(ValueError, "stage concurrency"):
+            workflow.validate_spec(changed)
+        print("COMPUTE_STAGE_SERIALIZATION_VERIFIED")
+
     def test_stage_maps_are_deterministic_indexed_and_immutable(self) -> None:
         matrix = {
             "matrix_sha256": "a" * 64,

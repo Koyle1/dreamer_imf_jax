@@ -2978,6 +2978,116 @@ def _rederive_compute_plan_worker(
         connection.close()
 
 
+def _build_compute_plan_worker(
+    connection: Any,
+    protocol: Mapping[str, Any],
+    profile: str,
+    task: str,
+    observation_shape: Sequence[int],
+    action_dim: int,
+    source_sha256: str,
+    output_root: str,
+    candidate_by_arm: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Build compiler evidence in a process that exits before rederivation."""
+
+    try:
+        plan, _, hlo_text = build_compute_plan(
+            protocol,
+            profile,
+            task,
+            tuple(int(value) for value in observation_shape),
+            action_dim,
+            source_sha256=source_sha256,
+            output_root=output_root,
+            candidate_by_arm=candidate_by_arm,
+        )
+    except BaseException as error:
+        connection.send(
+            {
+                "status": "failed",
+                "error_type": type(error).__name__,
+                "error": str(error),
+            }
+        )
+    else:
+        connection.send(
+            {
+                "status": "built",
+                "plan": plan,
+                "hlo_text": hlo_text,
+            }
+        )
+    finally:
+        connection.close()
+
+
+def build_compute_plan_in_fresh_process(
+    protocol: Mapping[str, Any],
+    profile: str,
+    task: str,
+    observation_shape: Sequence[int],
+    action_dim: int,
+    *,
+    source_sha256: str,
+    output_root: str | Path,
+    candidate_by_arm: Mapping[str, Mapping[str, Any]],
+    timeout_seconds: int = 900,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Build a plan, then close its compiler process so cache writes are durable."""
+
+    context = multiprocessing.get_context("spawn")
+    receiving, sending = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_build_compute_plan_worker,
+        args=(
+            sending,
+            dict(protocol),
+            profile,
+            task,
+            tuple(int(value) for value in observation_shape),
+            int(action_dim),
+            source_sha256,
+            str(Path(output_root).resolve()),
+            {arm: dict(candidate) for arm, candidate in candidate_by_arm.items()},
+        ),
+        name="compute-plan-cache-writer",
+    )
+    process.start()
+    sending.close()
+    if not receiving.poll(timeout_seconds):
+        process.terminate()
+        process.join()
+        receiving.close()
+        raise RuntimeError("fresh-process compute-plan build exceeded its bounded timeout")
+    try:
+        result = receiving.recv()
+    except EOFError as error:
+        raise RuntimeError(
+            "fresh-process compute-plan build exited without an authenticated result"
+        ) from error
+    finally:
+        receiving.close()
+    process.join(timeout_seconds)
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        raise RuntimeError("fresh-process compute-plan build did not exit cleanly")
+    if process.exitcode != 0 or result.get("status") != "built":
+        detail = result.get("error")
+        if not isinstance(detail, str) or not detail:
+            detail = f"exit code {process.exitcode}"
+        raise RuntimeError(
+            "fresh-process compute-plan build failed: "
+            f"{result.get('error_type', 'ProcessError')}: {detail}"
+        )
+    plan = result.get("plan")
+    hlo_text = result.get("hlo_text")
+    if not isinstance(plan, dict) or not isinstance(hlo_text, dict):
+        raise RuntimeError("fresh-process compute-plan build returned malformed evidence")
+    return plan, hlo_text
+
+
 def validate_compute_plan_cell_in_fresh_process(
     plan: Mapping[str, Any],
     protocol: Mapping[str, Any],
@@ -3736,7 +3846,7 @@ def run_compute_plan_cell(
     if not exemplar_path.is_file():
         raise FileNotFoundError("compute plan requires one completed task dataset")
     exemplar = read_json(exemplar_path)
-    plan, _, hlo_text = build_compute_plan(
+    plan, hlo_text = build_compute_plan_in_fresh_process(
         protocol,
         cell["profile"],
         cell["task"],

@@ -42,6 +42,13 @@
   },
   "matched_objective": {
     "stage_order": ["dataset", "compute_plan", "world_model", "rollout", "actor"],
+    "stage_array_concurrency": {
+      "dataset": 4,
+      "compute_plan": 1,
+      "world_model": 4,
+      "rollout": 4,
+      "actor": 4
+    },
     "pilot": {
       "output_name": "matched_objective_pilot",
       "expected_total_cells": 606,

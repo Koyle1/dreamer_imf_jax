@@ -9,8 +9,9 @@ testing these files locally.
 - Workspace: `/work2/ci72buri-dreamer_imf_neurips`
 - Slurm account/partition: `dep_inin_dat` / `gpu-l40s`
 - Every job: one L40S, 8 CPU cores, 64 GiB, at most 48 hours
-- Arrays: at most four concurrent tasks (`%4`); controls compute cells are
-  serialized (`%1`) because they share content-addressed compiler-IR storage
+- Arrays: at most four concurrent tasks (`%4`); main and controls compute-plan
+  cells are serialized (`%1`) so a compiler cache writer exits before its exact
+  independent cache-reading verification and no concurrent autotuning can race
 - Python: `Python/3.12.3-GCCcore-13.3.0`
 - Runtime: JAX/JAXlib 0.8.1, NumPy 2.5.3, dm-control 1.0.46,
   MuJoCo 3.13.0, CUDA 12 wheels from the hash-locked requirements file
@@ -159,7 +160,8 @@ visual workflows. Their order is deliberately after matched-objective evidence:
    development-control selection.
 3. The hard visual matrix is three tasks by five seeds by two compute tracks.
 
-All use the same L40S runtime and `%4` cap (except serialized controls compute).
+All use the same L40S runtime and `%4` cap (except serialized main and controls
+compute planning).
 Cluster maps, receipts, retry maps, stage markers, and profile markers live
 under `cluster_state/supplementary`, outside canonical scientific result roots.
 Every controls array cell runs its canonical strong validator on GPU and writes

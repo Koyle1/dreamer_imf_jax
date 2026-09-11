@@ -268,6 +268,14 @@ def validate_spec(spec: Mapping[str, Any]) -> None:
     registered = spec.get("matched_objective", {})
     if tuple(registered.get("stage_order", ())) != STAGES:
         raise ValueError("matched-objective stage order mismatch")
+    if registered.get("stage_array_concurrency") != {
+        "dataset": 4,
+        "compute_plan": 1,
+        "world_model": 4,
+        "rollout": 4,
+        "actor": 4,
+    }:
+        raise ValueError("matched-objective stage concurrency contract mismatch")
     expected = {
         "pilot": {
             "total": 606,
