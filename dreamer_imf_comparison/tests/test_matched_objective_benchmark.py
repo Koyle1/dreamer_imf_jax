@@ -28,6 +28,68 @@ class MatchedObjectiveBenchmarkTest(unittest.TestCase):
         cls.protocol = read_json(PROJECT / "matched_objective_protocol.json")
         cls.source = benchmark.build_source_manifest(WORKSPACE)
 
+    def test_compute_plan_rederivation_crosses_a_process_boundary(self) -> None:
+        compute_cell = {
+            "stage": "compute_plan",
+            "cell_id": "compute_plan-" + "a" * 24,
+            "task": "dmc_reacher_easy",
+            "profile": "smoke",
+            "source_sha256": "b" * 64,
+        }
+        dataset_cell = {
+            "stage": "dataset",
+            "cell_id": "dataset-" + "c" * 24,
+            "task": compute_cell["task"],
+        }
+        matrix = {
+            "matrix_sha256": "d" * 64,
+            "cells": [dataset_cell, compute_cell],
+        }
+        plan = {
+            "arms": {
+                arm: {"compiler_cost_analysis": {}} for arm in benchmark.ARM_ORDER
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            exemplar = benchmark._cell_result_path(output, dataset_cell)
+            exemplar.parent.mkdir(parents=True)
+            benchmark.write_json_atomic(
+                exemplar,
+                {"observation_shape": [6], "action_dim": 2},
+            )
+            with mock.patch.object(benchmark, "_cell_identity"), mock.patch.object(
+                benchmark, "_compute_candidates", return_value={}
+            ), mock.patch.object(
+                benchmark,
+                "build_compute_plan",
+                return_value=(plan, {}, {}),
+            ), mock.patch.object(
+                benchmark, "validate_compute_plan_cell"
+            ) as local_validation, mock.patch.object(
+                benchmark, "_validate_compute_files"
+            ), mock.patch.object(
+                benchmark, "validate_compute_plan_cell_in_fresh_process"
+            ) as independent_validation:
+                result = benchmark.run_compute_plan_cell(
+                    compute_cell,
+                    self.protocol,
+                    matrix,
+                    output,
+                )
+        self.assertEqual(result["cell_id"], compute_cell["cell_id"])
+        self.assertFalse(
+            local_validation.call_args.kwargs["rederive_compiler_evidence"]
+        )
+        independent_validation.assert_called_once_with(
+            plan,
+            self.protocol,
+            matrix,
+            compute_cell,
+            output,
+        )
+        print("COMPUTE_REDERIVATION_PROCESS_BOUNDARY_VERIFIED")
+
     def test_exact_smoke_and_pilot_hpo_matrices(self) -> None:
         smoke = benchmark.build_matrix(
             self.protocol, "smoke", source_manifest=self.source

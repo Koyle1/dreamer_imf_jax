@@ -15,6 +15,7 @@ from functools import partial
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import platform
@@ -2944,6 +2945,92 @@ def validate_compute_plan_cell(
             raise ValueError("retained HLO does not match an independent recompilation")
 
 
+def _rederive_compute_plan_worker(
+    connection: Any,
+    plan: Mapping[str, Any],
+    protocol: Mapping[str, Any],
+    matrix: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    output_root: str,
+) -> None:
+    """Run exact compiler rederivation in a fresh cache-reading process."""
+
+    try:
+        validate_compute_plan_cell(
+            plan,
+            protocol,
+            matrix,
+            cell,
+            output_root,
+            rederive_compiler_evidence=True,
+        )
+    except BaseException as error:
+        connection.send(
+            {
+                "status": "failed",
+                "error_type": type(error).__name__,
+                "error": str(error),
+            }
+        )
+    else:
+        connection.send({"status": "verified"})
+    finally:
+        connection.close()
+
+
+def validate_compute_plan_cell_in_fresh_process(
+    plan: Mapping[str, Any],
+    protocol: Mapping[str, Any],
+    matrix: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    output_root: str | Path,
+    *,
+    timeout_seconds: int = 900,
+) -> None:
+    """Require exact rederivation after reopening the persistent JAX cache."""
+
+    context = multiprocessing.get_context("spawn")
+    receiving, sending = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_rederive_compute_plan_worker,
+        args=(
+            sending,
+            dict(plan),
+            dict(protocol),
+            dict(matrix),
+            dict(cell),
+            str(Path(output_root).resolve()),
+        ),
+        name="compute-plan-independent-rederivation",
+    )
+    process.start()
+    sending.close()
+    process.join(timeout_seconds)
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        receiving.close()
+        raise RuntimeError(
+            "fresh-process compute-plan rederivation exceeded its bounded timeout"
+        )
+    try:
+        result = receiving.recv()
+    except EOFError as error:
+        raise RuntimeError(
+            "fresh-process compute-plan rederivation exited without an authenticated result"
+        ) from error
+    finally:
+        receiving.close()
+    if process.exitcode != 0 or result.get("status") != "verified":
+        detail = result.get("error")
+        if not isinstance(detail, str) or not detail:
+            detail = f"exit code {process.exitcode}"
+        raise RuntimeError(
+            "fresh-process compute-plan rederivation failed: "
+            f"{result.get('error_type', 'ProcessError')}: {detail}"
+        )
+
+
 def _expected_hlo_file_records(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for arm in ARM_ORDER:
@@ -3694,9 +3781,16 @@ def run_compute_plan_cell(
         matrix,
         cell,
         output_root,
-        rederive_compiler_evidence=True,
+        rederive_compiler_evidence=False,
     )
     _validate_compute_files(plan, directory)
+    validate_compute_plan_cell_in_fresh_process(
+        plan,
+        protocol,
+        matrix,
+        cell,
+        output_root,
+    )
     write_json_atomic(result_path, plan)
     return plan
 
