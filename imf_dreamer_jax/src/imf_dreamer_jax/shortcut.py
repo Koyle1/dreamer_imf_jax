@@ -388,18 +388,25 @@ def sample_shortcut_steps(
     noise: Array,
     *,
     steps: int,
+    clean_prediction_clip: float | None = None,
 ) -> Array:
     """Generate a sequence using exactly ``steps`` x-prediction evaluations.
 
     Starting from standard-normal ``noise`` at ``tau=0``, each evaluation is
     converted to a velocity and advanced by ``d=1/steps``.  The caller samples
     the noise explicitly, which keeps this primitive deterministic and easy to
-    compose with larger JAX PRNG pipelines.
+    compose with larger JAX PRNG pipelines.  ``clean_prediction_clip`` is an
+    optional sampling-only safety envelope for recursively generated latent
+    tokens.  It leaves the shortcut-forcing training objective unchanged.
     """
 
     _validate_sequence("noise", noise)
     if not isinstance(steps, int) or isinstance(steps, bool) or steps <= 0:
         raise ValueError("steps must be a positive integer")
+    if clean_prediction_clip is not None and (
+        not math.isfinite(clean_prediction_clip) or clean_prediction_clip <= 0.0
+    ):
+        raise ValueError("clean_prediction_clip must be finite and positive")
     step_scalar = jnp.asarray(1.0 / steps, dtype=noise.dtype)
 
     def sampling_step(index: int, state: Array) -> Array:
@@ -409,6 +416,10 @@ def sample_shortcut_steps(
         )
         step_column = jnp.full_like(tau_column, step_scalar)
         clean = _predict_checked(predict_clean, state, tau_column, step_column)
+        if clean_prediction_clip is not None:
+            clean = jnp.clip(
+                clean, -clean_prediction_clip, clean_prediction_clip
+            )
         velocity = (clean - state) / (1.0 - tau_column)
         return state + step_column * velocity
 

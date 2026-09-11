@@ -5,7 +5,7 @@
   "parent_protocol": {
     "path": "dreamer_imf_comparison/matched_objective_protocol.json",
     "schema_version": "trajectory-imf-shortcut-objective-v2",
-    "sha256": "22b9c9a88589cf69f9045003498a06ab966107c4d42a14e445ffb42d18814fcf"
+    "sha256": "0e572b5ded051e3364b381e21c5576330622ff46cdd02655fda4c5c510607c9f"
   },
   "claim_boundary": {
     "role": "secondary_descriptive_controls",

@@ -14,7 +14,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import imf_dreamer_jax.world_model as world_model_module
-from imf_dreamer_jax.agent import create_agent, imagine
+from imf_dreamer_jax.agent import create_agent, imagine, jit_train_actor_critic
 from imf_dreamer_jax.config import DreamerConfig
 from imf_dreamer_jax.world_model import (
     init_world_model,
@@ -133,6 +133,10 @@ class ShortcutConfigurationTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "only when prior='shortcut'"):
             DreamerConfig(prior="imf", shortcut_training_k_max=4)
+        with self.assertRaisesRegex(ValueError, "shortcut_sampling_clip"):
+            shortcut_config(shortcut_sampling_clip=0.0)
+        with self.assertRaisesRegex(ValueError, "shortcut_sampling_clip"):
+            shortcut_config(shortcut_sampling_clip=float("inf"))
 
     def test_signal_time_and_step_size_must_be_supplied_as_a_pair(self) -> None:
         config = shortcut_config()
@@ -276,6 +280,83 @@ class ShortcutContextTests(unittest.TestCase):
 
 
 class ShortcutObjectiveAndSamplingTests(unittest.TestCase):
+    def test_sampling_clip_prevents_recursive_latent_explosion(self) -> None:
+        noise = jnp.zeros((2, 1, 3), dtype=jnp.float32)
+
+        def explosive_predict_clean(state, tau, step_size):
+            del tau, step_size
+            return jnp.full_like(state, 1e20)
+
+        unbounded = world_model_module.sample_shortcut_steps(
+            explosive_predict_clean, noise, steps=4
+        )
+        bounded = world_model_module.sample_shortcut_steps(
+            explosive_predict_clean,
+            noise,
+            steps=4,
+            clean_prediction_clip=10.0,
+        )
+        self.assertGreater(float(jnp.max(jnp.abs(unbounded))), 1e19)
+        np.testing.assert_array_equal(bounded, jnp.full_like(bounded, 10.0))
+        with self.assertRaisesRegex(ValueError, "finite and positive"):
+            world_model_module.sample_shortcut_steps(
+                explosive_predict_clean,
+                noise,
+                steps=4,
+                clean_prediction_clip=float("inf"),
+            )
+
+    def test_clipped_shortcut_imagination_keeps_actor_update_finite(self) -> None:
+        config = shortcut_config(
+            shortcut_sampling_clip=10.0,
+            imagination_horizon=15,
+            reward_output_init_scale=1.0,
+        )
+        state = create_agent(config, jax.random.key(1230))
+        prior = state.params.world_model["prior"]
+        layers = list(prior["layers"])
+        layers[-1] = {
+            "weight": jnp.zeros_like(layers[-1]["weight"]),
+            "bias": jnp.full_like(layers[-1]["bias"], 1e20),
+        }
+        model = {
+            **state.params.world_model,
+            "prior": {**prior, "layers": tuple(layers)},
+        }
+        state = state._replace(
+            params=state.params._replace(world_model=model)
+        )
+        start = initial_state(config, 8)
+        imagined = imagine(
+            state.params, start, jax.random.key(1231), config
+        )
+        self.assertTrue(
+            all(
+                np.isfinite(np.asarray(getattr(imagined, field))).all()
+                for field in imagined._fields
+            )
+        )
+        self.assertLessEqual(
+            float(jnp.max(jnp.abs(imagined.features))),
+            config.shortcut_sampling_clip,
+        )
+        updated, metrics = jit_train_actor_critic(
+            state, start, jax.random.key(1232), config
+        )
+        self.assertTrue(np.isfinite(np.asarray(metrics)).all())
+        for tree in (
+            updated.params.actor,
+            updated.params.critic,
+            updated.actor_optimizer,
+            updated.critic_optimizer,
+        ):
+            self.assertTrue(
+                all(
+                    np.isfinite(np.asarray(leaf)).all()
+                    for leaf in jax.tree_util.tree_leaves(tree)
+                )
+            )
+
     def test_jitted_objective_and_gradients_are_finite_and_prior_is_exact_branch(self) -> None:
         config = shortcut_config()
         params = init_world_model(config, jax.random.key(1220))
@@ -355,6 +436,10 @@ class ShortcutObjectiveAndSamplingTests(unittest.TestCase):
             )
         self.assertEqual(wrapped.call_count, 1)
         self.assertEqual(wrapped.call_args.kwargs["steps"], 4)
+        self.assertEqual(
+            wrapped.call_args.kwargs["clean_prediction_clip"],
+            config.shortcut_sampling_clip,
+        )
         self.assertEqual(int(result.nfe), 4)
         self.assertEqual(prior_sampling_nfe(config), 4)
         self.assertEqual(prior_sampling_nfe(config, transitions=3), 12)

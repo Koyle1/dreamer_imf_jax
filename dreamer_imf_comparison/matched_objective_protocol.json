@@ -225,6 +225,7 @@
       "imf_trajectory_suffix_probability": 0.3333333333333333,
       "imf_trajectory_history_noise_max": 1.0,
       "shortcut_sampling_steps": 4,
+      "shortcut_sampling_clip": 10.0,
       "imagination_horizon": 15,
       "discount": 0.99,
       "lambda_": 0.95,
@@ -280,7 +281,7 @@
     "resolution_contract": {
       "pilot_candidate_configs_are_complete_and_executable": true,
       "confirmatory_execution_requires_immutable_selection_manifest": true,
-      "resolved_config_must_contain_exactly_all_75_non_task_shape_DreamerConfig_fields": true,
+      "resolved_config_must_contain_exactly_all_76_non_task_shape_DreamerConfig_fields": true,
       "selected_values_are_substituted_before_DreamerConfig_construction": true,
       "unresolved_placeholders_or_unknown_keys_are_fatal": true,
       "resolved_config_and_sha256_are_retained_per_run": true
@@ -323,7 +324,7 @@
       "start_context": "one_uniform_post_burn_in_posterior_state_per_replay_sequence",
       "start_count_per_actor_update": 32,
       "imagination_horizon": 15,
-      "sampler_by_arm": {"shortcut_forcing": "stochastic_4_step_shortcut_sampler", "trajectory_imf": "stochastic_1_step_iMF_sampler"},
+      "sampler_by_arm": {"shortcut_forcing": "stochastic_4_step_shortcut_sampler_with_clean_prediction_clip_10", "trajectory_imf": "stochastic_1_step_iMF_sampler"},
       "behavior_prior": "disabled",
       "real_environment_evaluation_action": "deterministic_tanh_of_actor_mean",
       "extra_generated_history_corruption": false

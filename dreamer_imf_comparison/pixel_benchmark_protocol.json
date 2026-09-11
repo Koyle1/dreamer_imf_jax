@@ -8,7 +8,7 @@
   },
   "base_model_contract": {
     "path": "matched_objective_protocol.json",
-    "sha256": "b9b3296cd4ae3ca81e55053f3caa827d1ed05d9a8a6025a10654cbfe81e0fa4b",
+    "sha256": "db5c0e4451335c9d91e95059771ded8d77ae37b2813a80baafa228f57f953840",
     "common_config_pointer": "canonical_executable_config.dreamer_config_non_task_shape_common",
     "shortcut_overrides": {
       "prior": "shortcut",

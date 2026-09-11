@@ -560,6 +560,7 @@ def sample_prior_with_nfe(
             predict_clean,
             sequence_noise,
             steps=config.shortcut_sampling_steps,
+            clean_prediction_clip=config.shortcut_sampling_clip,
         )[:, 0]
         return PriorSample(
             stochastic,

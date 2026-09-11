@@ -18,8 +18,11 @@ frozen conditions.
 
 - `shortcut_forcing`: x-space clean-target prediction, independent token signal levels and step
   sizes, the power-of-two schedule, stopped-gradient two-half-step bootstrap target, the published
-  ramp weight, and 4-NFE primary generation. The paper does not disclose training `K_max`; the
-  pilot therefore sweeps `4, 8, 16` instead of silently guessing it.
+  ramp weight, and 4-NFE primary generation. Generated clean-latent predictions use an explicit
+  sampling-only `[-10, 10]` safety envelope; the training objective remains unchanged. This avoids
+  recursive off-support latent explosions while leaving ordinary posterior-scale predictions
+  untouched. The paper does not disclose training `K_max`; the pilot therefore sweeps `4, 8, 16`
+  instead of silently guessing it.
 - `trajectory_imf`: predicted-marginal-velocity iMF regression, independent per-token query
   intervals, separately sampled history-exposure times, shared query/history Gaussian noise, the
   clean/corrupted/teacher-corrupted-suffix context mixture, and 1-NFE primary generation.

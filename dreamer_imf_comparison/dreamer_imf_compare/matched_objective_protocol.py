@@ -97,6 +97,7 @@ DREAMER_CONFIG_NON_TASK_SHAPE_FIELDS = (
     "imf_trajectory_history_noise_max",
     "shortcut_training_k_max",
     "shortcut_sampling_steps",
+    "shortcut_sampling_clip",
     "imagination_horizon",
     "discount",
     "lambda_",
@@ -171,6 +172,7 @@ FROZEN_DREAMER_CONFIG_COMMON = {
     "imf_trajectory_suffix_probability": 1.0 / 3.0,
     "imf_trajectory_history_noise_max": 1.0,
     "shortcut_sampling_steps": 4,
+    "shortcut_sampling_clip": 10.0,
     "imagination_horizon": 15,
     "discount": 0.99,
     "lambda_": 0.95,
@@ -1017,7 +1019,7 @@ def _validate_canonical_executable_config(protocol: Mapping[str, Any]) -> None:
         {
             "pilot_candidate_configs_are_complete_and_executable",
             "confirmatory_execution_requires_immutable_selection_manifest",
-            "resolved_config_must_contain_exactly_all_75_non_task_shape_DreamerConfig_fields",
+            "resolved_config_must_contain_exactly_all_76_non_task_shape_DreamerConfig_fields",
             "selected_values_are_substituted_before_DreamerConfig_construction",
             "unresolved_placeholders_or_unknown_keys_are_fatal",
             "resolved_config_and_sha256_are_retained_per_run",
@@ -1088,7 +1090,7 @@ def _validate_canonical_executable_config(protocol: Mapping[str, Any]) -> None:
     _equal(actor["start_context"], "one_uniform_post_burn_in_posterior_state_per_replay_sequence", "actor start context")
     _equal(actor["start_count_per_actor_update"], batch["batch_size"], "actor start count")
     _equal(actor["imagination_horizon"], common["imagination_horizon"], "actor horizon")
-    _equal(actor["sampler_by_arm"], {"shortcut_forcing": "stochastic_4_step_shortcut_sampler", "trajectory_imf": "stochastic_1_step_iMF_sampler"}, "actor samplers")
+    _equal(actor["sampler_by_arm"], {"shortcut_forcing": "stochastic_4_step_shortcut_sampler_with_clean_prediction_clip_10", "trajectory_imf": "stochastic_1_step_iMF_sampler"}, "actor samplers")
     _equal(actor["behavior_prior"], "disabled", "actor behavior prior")
     _equal(actor["real_environment_evaluation_action"], "deterministic_tanh_of_actor_mean", "actor evaluation action")
     _bool(actor["extra_generated_history_corruption"], False, "actor generated-history corruption")

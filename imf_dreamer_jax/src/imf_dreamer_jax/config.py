@@ -76,6 +76,7 @@ class DreamerConfig:
     imf_trajectory_history_noise_max: float = 1.0
     shortcut_training_k_max: int | None = None
     shortcut_sampling_steps: int = 4
+    shortcut_sampling_clip: float = 10.0
     imagination_horizon: int = 5
     discount: float = 0.99
     lambda_: float = 0.95
@@ -258,6 +259,7 @@ class DreamerConfig:
             "behavior_cloning_learning_rate",
             "pmpo_positive_temperature",
             "pmpo_negative_temperature",
+            "shortcut_sampling_clip",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
