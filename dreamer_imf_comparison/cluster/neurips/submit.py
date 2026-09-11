@@ -170,7 +170,7 @@ def _reject_duplicate_supplementary_array(
     if any(
         any(token in argument for argument in row.get("command", []))
         for row in prior
-    ) or any(row.get("retry_map_sha256") == retry_digest for row in rows):
+    ) or any(row.get("retry_map_sha256") == retry_digest for row in prior):
         raise RuntimeError("this immutable supplementary retry map was already submitted")
 
 

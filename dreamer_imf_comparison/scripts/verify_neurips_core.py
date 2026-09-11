@@ -55,8 +55,8 @@ REGRESSION_TEST_MANIFEST: Mapping[str, Mapping[str, Any]] = {
         "identity_sha256": "ee2e8364732ac94eefe3f86c2a3fb838b1f77cb25025fe0e35410a7235ffdd32",
     },
     "comparison": {
-        "count": 208,
-        "identity_sha256": "6132ddfbc23b25dcb31b2771b73c715d27580b8ecf3d5454fb5de5638deb3f25",
+        "count": 210,
+        "identity_sha256": "193c031f8b40df1ddba1c54f22f74cea2d83991505fdb91593f0d1332fe67723",
     },
 }
 

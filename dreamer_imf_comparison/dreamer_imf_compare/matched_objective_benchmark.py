@@ -2283,6 +2283,22 @@ def runtime_fingerprint() -> dict[str, Any]:
         "xla_platform_version": getattr(client, "platform_version", "unavailable"),
         "jax_enable_x64": bool(jax.config.jax_enable_x64),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "jax_enable_compilation_cache": os.environ.get(
+            "JAX_ENABLE_COMPILATION_CACHE"
+        ),
+        "jax_compilation_cache_dir": os.environ.get("JAX_COMPILATION_CACHE_DIR"),
+        "jax_persistent_cache_min_compile_time_secs": os.environ.get(
+            "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"
+        ),
+        "jax_persistent_cache_min_entry_size_bytes": os.environ.get(
+            "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"
+        ),
+        "jax_persistent_cache_enable_xla_caches": os.environ.get(
+            "JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES"
+        ),
+        "jax_raise_persistent_cache_errors": os.environ.get(
+            "JAX_RAISE_PERSISTENT_CACHE_ERRORS"
+        ),
     }
 
 
@@ -2299,6 +2315,12 @@ def runtime_homogeneity_identity(runtime: Mapping[str, Any]) -> dict[str, Any]:
         "visible_device_count",
         "xla_platform_version",
         "jax_enable_x64",
+        "jax_enable_compilation_cache",
+        "jax_compilation_cache_dir",
+        "jax_persistent_cache_min_compile_time_secs",
+        "jax_persistent_cache_min_entry_size_bytes",
+        "jax_persistent_cache_enable_xla_caches",
+        "jax_raise_persistent_cache_errors",
     )
     if any(field not in runtime for field in fields):
         raise ValueError("runtime homogeneity fingerprint is incomplete")
@@ -2646,6 +2668,12 @@ def validate_compute_plan(
         "xla_platform_version",
         "jax_enable_x64",
         "cuda_visible_devices",
+        "jax_enable_compilation_cache",
+        "jax_compilation_cache_dir",
+        "jax_persistent_cache_min_compile_time_secs",
+        "jax_persistent_cache_min_entry_size_bytes",
+        "jax_persistent_cache_enable_xla_caches",
+        "jax_raise_persistent_cache_errors",
     } or (
         runtime["jax_enable_x64"] is not False
         or runtime["visible_device_count"] != len(runtime["devices"])
@@ -2657,6 +2685,19 @@ def validate_compute_plan(
     runtime_homogeneity_identity(runtime)
     if profile != "smoke" and runtime["visible_device_count"] != 1:
         raise ValueError("pilot/confirmatory timing requires one exclusively visible device")
+    if profile != "smoke" and (
+        runtime["jax_enable_compilation_cache"] != "true"
+        or not runtime["jax_compilation_cache_dir"]
+        or runtime["jax_persistent_cache_min_compile_time_secs"] != "0"
+        or runtime["jax_persistent_cache_min_entry_size_bytes"] != "-1"
+        or runtime["jax_persistent_cache_enable_xla_caches"]
+        != "xla_gpu_per_fusion_autotune_cache_dir"
+        or runtime["jax_raise_persistent_cache_errors"] != "true"
+    ):
+        raise ValueError(
+            "pilot/confirmatory compiler evidence requires the fail-closed "
+            "persistent compilation cache"
+        )
     tolerance = float(protocol["budget_tracks"]["equal_compiler_flops"]["relative_tolerance"])
     if float(plan.get("relative_flop_tolerance", -1.0)) != tolerance:
         raise ValueError("compute plan tolerance drifted")
@@ -6182,7 +6223,17 @@ def _write_environment_and_dependencies(root: Path, *, strict: bool = False) -> 
         "executable": sys.executable,
         "environment": {
             key: os.environ.get(key)
-            for key in ("JAX_PLATFORM_NAME", "XLA_FLAGS", "CUDA_VISIBLE_DEVICES")
+            for key in (
+                "JAX_PLATFORM_NAME",
+                "XLA_FLAGS",
+                "CUDA_VISIBLE_DEVICES",
+                "JAX_ENABLE_COMPILATION_CACHE",
+                "JAX_COMPILATION_CACHE_DIR",
+                "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS",
+                "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES",
+                "JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES",
+                "JAX_RAISE_PERSISTENT_CACHE_ERRORS",
+            )
         },
         "dependency_capture_status": dependency_status,
     }
@@ -6312,6 +6363,24 @@ def validate_frozen_runtime_provenance(
                 "visible_device_count": environment["jax"]["visible_device_count"],
                 "xla_platform_version": environment["jax"]["xla_platform_version"],
                 "jax_enable_x64": environment["jax"]["jax_enable_x64"],
+                "jax_enable_compilation_cache": environment["environment"][
+                    "JAX_ENABLE_COMPILATION_CACHE"
+                ],
+                "jax_compilation_cache_dir": environment["environment"][
+                    "JAX_COMPILATION_CACHE_DIR"
+                ],
+                "jax_persistent_cache_min_compile_time_secs": environment[
+                    "environment"
+                ]["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"],
+                "jax_persistent_cache_min_entry_size_bytes": environment[
+                    "environment"
+                ]["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"],
+                "jax_persistent_cache_enable_xla_caches": environment[
+                    "environment"
+                ]["JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES"],
+                "jax_raise_persistent_cache_errors": environment["environment"][
+                    "JAX_RAISE_PERSISTENT_CACHE_ERRORS"
+                ],
             }
             if frozen_identity != identity:
                 raise ValueError("freeze environment differs from compute-plan hardware/compiler")

@@ -67,6 +67,53 @@ class ClusterWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(sum(confirmatory.values()), 1746)
 
+    def test_persistent_compilation_cache_contract_is_fail_closed(self) -> None:
+        from dreamer_imf_compare import matched_objective_benchmark as benchmark
+
+        expected = {
+            "JAX_ENABLE_COMPILATION_CACHE": "true",
+            "JAX_COMPILATION_CACHE_DIR": (
+                "/work2/ci72buri-dreamer_imf_neurips/jax-compilation-cache"
+            ),
+            "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
+            "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "-1",
+            "JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES": (
+                "xla_gpu_per_fusion_autotune_cache_dir"
+            ),
+            "JAX_RAISE_PERSISTENT_CACHE_ERRORS": "true",
+        }
+        environment = self.spec["runtime"]["environment"]
+        self.assertEqual(
+            {key: environment[key] for key in expected},
+            expected,
+        )
+        script = (CLUSTER / "runtime_environment.sh").read_text(encoding="utf-8")
+        shell_contract = {
+            key: f"export {key}={value}" for key, value in expected.items()
+        }
+        shell_contract["JAX_COMPILATION_CACHE_DIR"] = (
+            'export JAX_COMPILATION_CACHE_DIR="${WORK_ROOT}/jax-compilation-cache"'
+        )
+        for line in shell_contract.values():
+            self.assertIn(line, script)
+        self.assertIn('mkdir -p "${JAX_COMPILATION_CACHE_DIR}"', script)
+        self.assertIn('[[ -w "${JAX_COMPILATION_CACHE_DIR}" ]]', script)
+
+        changed = copy.deepcopy(self.spec)
+        changed["runtime"]["environment"].pop("JAX_RAISE_PERSISTENT_CACHE_ERRORS")
+        with self.assertRaisesRegex(ValueError, "cluster runtime"):
+            workflow.validate_spec(changed)
+
+        with mock.patch.dict(os.environ, expected, clear=False):
+            runtime = benchmark.runtime_fingerprint()
+        self.assertEqual(runtime["jax_enable_compilation_cache"], "true")
+        self.assertEqual(
+            runtime["jax_compilation_cache_dir"],
+            expected["JAX_COMPILATION_CACHE_DIR"],
+        )
+        self.assertEqual(runtime["jax_raise_persistent_cache_errors"], "true")
+        print("FAIL_CLOSED_COMPILATION_CACHE_CONTRACT_VERIFIED")
+
     def test_stage_maps_are_deterministic_indexed_and_immutable(self) -> None:
         matrix = {
             "matrix_sha256": "a" * 64,
@@ -1095,6 +1142,57 @@ class ClusterWorkflowTests(unittest.TestCase):
                         stage="world_model",
                         retry_map_path=retry_path,
                     )
+
+    def test_audited_retry_map_can_be_submitted_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            retry_path = root / "retry.json"
+            retry = {
+                "cell_ids": ["compute_plan-" + "a" * 24],
+                "retry_map_sha256": "b" * 64,
+            }
+            workflow.write_json_once(retry_path, retry)
+            ledger = root / "ledger.jsonl"
+            workflow.append_ledger(
+                ledger,
+                {
+                    "event": "retry_map_audited",
+                    "kind": "stage_array",
+                    "profile": "pilot",
+                    "stage": "compute_plan",
+                    "retry_map_sha256": retry["retry_map_sha256"],
+                },
+            )
+            with mock.patch.object(workflow, "ledger_path", return_value=ledger):
+                submit._reject_duplicate_supplementary_array(
+                    self.spec,
+                    kind="stage_array",
+                    profile="pilot",
+                    stage="compute_plan",
+                    retry_map_path=retry_path,
+                )
+
+            workflow.append_ledger(
+                ledger,
+                {
+                    "event": "job_submitted",
+                    "kind": "stage_array",
+                    "profile": "pilot",
+                    "stage": "compute_plan",
+                    "job_id": "202",
+                    "command": [f"NEURIPS_RETRY_MAP={retry_path.resolve()}"],
+                },
+            )
+            with mock.patch.object(workflow, "ledger_path", return_value=ledger):
+                with self.assertRaisesRegex(RuntimeError, "already submitted"):
+                    submit._reject_duplicate_supplementary_array(
+                        self.spec,
+                        kind="stage_array",
+                        profile="pilot",
+                        stage="compute_plan",
+                        retry_map_path=retry_path,
+                    )
+            print("AUDITED_RETRY_MAP_SINGLE_USE_VERIFIED")
 
     def test_lstat_snapshot_and_quarantine_preserve_symlink_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

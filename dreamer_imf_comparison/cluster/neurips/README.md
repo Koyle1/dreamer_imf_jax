@@ -14,7 +14,10 @@ testing these files locally.
 - Python: `Python/3.12.3-GCCcore-13.3.0`
 - Runtime: JAX/JAXlib 0.8.1, NumPy 2.5.3, dm-control 1.0.46,
   MuJoCo 3.13.0, CUDA 12 wheels from the hash-locked requirements file
-- Environment: `JAX_ENABLE_X64=0`, `JAX_PLATFORM_NAME=gpu`, `MUJOCO_GL=egl`
+- Environment: `JAX_ENABLE_X64=0`, `JAX_PLATFORM_NAME=gpu`, `MUJOCO_GL=egl`, plus a shared
+  fail-closed JAX compilation cache at
+  `/work2/ci72buri-dreamer_imf_neurips/jax-compilation-cache`. Every compilation is cache-eligible;
+  cache read/write errors stop the job.
 
 The preflight fails unless JAX sees exactly one L40S and a real 16x16 DMC
 render succeeds through EGL. It binds the clean Git commit, dependency-lock

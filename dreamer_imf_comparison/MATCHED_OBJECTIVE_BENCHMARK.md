@@ -83,6 +83,12 @@ All compute cells must share the same Python, JAX, jaxlib, XLA, platform, device
 state. Scheduler-assigned visible GPU ordinals are retained as provenance but do not falsely make
 GPU 0 and GPU 1 different hardware.
 
+All cluster stages share a fail-closed persistent JAX compilation cache. This makes compute
+planning, independent verification, and training reuse the same backend executable rather than
+rerunning hardware-sensitive XLA autotuning. Cache errors are fatal, and the cache configuration is
+part of the frozen runtime contract. Optimized and unoptimized HLO, raw compiler cost analysis,
+parameter counts, structural NFE, and derived update allocations remain retained and digest-bound.
+
 The 1.034% active-world-model parameter gap in the current 256-wide configuration is below the
 registered round 2% practical-equivalence trigger. The exact counts and FLOPs remain reported, but
 the current source therefore does not require a width-control experiment. If a future source-bound

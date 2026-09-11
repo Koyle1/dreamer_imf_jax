@@ -250,6 +250,16 @@ def validate_spec(spec: Mapping[str, Any]) -> None:
         "environment": {
             "JAX_ENABLE_X64": "0",
             "JAX_PLATFORM_NAME": "gpu",
+            "JAX_ENABLE_COMPILATION_CACHE": "true",
+            "JAX_COMPILATION_CACHE_DIR": (
+                "/work2/ci72buri-dreamer_imf_neurips/jax-compilation-cache"
+            ),
+            "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
+            "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "-1",
+            "JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES": (
+                "xla_gpu_per_fusion_autotune_cache_dir"
+            ),
+            "JAX_RAISE_PERSISTENT_CACHE_ERRORS": "true",
             "MUJOCO_GL": "egl",
         },
     }

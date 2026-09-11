@@ -47,6 +47,12 @@ class RolloutReplayValidationTests(unittest.TestCase):
             "xla_platform_version": "test",
             "jax_enable_x64": False,
             "cuda_visible_devices": None,
+            "jax_enable_compilation_cache": None,
+            "jax_compilation_cache_dir": None,
+            "jax_persistent_cache_min_compile_time_secs": None,
+            "jax_persistent_cache_min_entry_size_bytes": None,
+            "jax_persistent_cache_enable_xla_caches": None,
+            "jax_raise_persistent_cache_errors": None,
         }
 
     def _fixture(self, root: Path):
