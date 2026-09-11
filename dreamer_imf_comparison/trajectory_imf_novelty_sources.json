@@ -1,0 +1,512 @@
+{
+  "schema_version": 1,
+  "audit_as_of": "2026-09-10",
+  "checked_on": "2026-09-10",
+  "scope": {
+    "proposed_method_label": "fixed-context trajectory iMF",
+    "method_definition": [
+      "Apply the improved MeanFlow velocity-regression identity to every causal target token.",
+      "Sample an independent interval pair (r_k, t_k) for each target token k.",
+      "For token k, differentiate only with respect to its current corrupted value z_k and query time t_k; treat actions, earlier corrupted tokens, their noise levels, and other context as fixed conditioning in that partial JVP.",
+      "Decouple each token's iMF query pair (r_k, t_k) from the history exposure times tau_j, while using the same per-token Gaussian draw to form the query and history views.",
+      "Train across an explicit mixture of clean-history, independently timed corrupted-history, and clean-prefix/teacher-corrupted-suffix supervision contexts.",
+      "Generate each autoregressive world transition at the primary operating point with one network function evaluation."
+    ],
+    "excluded_claims": [
+      "reproducing the complete Dreamer 4 agent or its unreleased training system",
+      "inventing flow matching, MeanFlow, improved MeanFlow, per-token noise schedules, causal sequence flow, or one-step MeanFlow control",
+      "proving that learned scheduled conditionals agree with the data and all-subsequence marginals, provide a tractable likelihood, control rollout error, identify epistemic uncertainty, or prevent planner exploitation",
+      "establishing empirical superiority before the frozen confirmatory benchmark is complete"
+    ]
+  },
+  "search_boundary": {
+    "cutoff": "2026-09-10",
+    "evidence_policy": "Primary papers, official proceedings pages, author project pages, and author-maintained code repositories only. Discovery indexes and secondary summaries were not used as claim evidence.",
+    "families_checked": [
+      "flow matching and conditional flow matching",
+      "MeanFlow and improved MeanFlow",
+      "shortcut and consistency-style few-step generation",
+      "diffusion forcing, rolling diffusion, and variable-history video diffusion",
+      "token-wise, autoregressive, streaming, multi-time, and fully causal continuous generation",
+      "flow-matching and MeanFlow world models, dynamics models, and control policies"
+    ],
+    "limitations": [
+      "This is a bounded literature audit, not a patent search or proof that no unpublished, non-indexed, or differently named method exists.",
+      "Very recent 2026 preprints may change after the cutoff.",
+      "Absence of the exact combination in the audited primary sources supports only careful combination-novelty wording, never a priority claim."
+    ]
+  },
+  "required_coverage": {
+    "flow_matching": ["S01"],
+    "meanflow": ["S02"],
+    "improved_meanflow": ["S03"],
+    "shortcut_models": ["S04"],
+    "diffusion_forcing": ["S05"],
+    "dreamer4": ["S06"],
+    "per_token_flow": ["S10", "S13"],
+    "multi_time_flow": ["S12", "S13"],
+    "causal_sequence_flow": ["S05", "S09", "S10", "S11", "S13", "S18"],
+    "fixed_context_causal_jvp": ["S18"],
+    "flow_world_models": ["S06", "S15", "S16", "S18", "S21"],
+    "meanflow_world_models": ["S14", "S21"],
+    "improved_meanflow_world_models": ["S21"],
+    "meanflow_trajectory_control": ["S17"],
+    "meanflow_shortcut_relation": ["S19", "S20"]
+  },
+  "sources": [
+    {
+      "id": "S01",
+      "title": "Flow Matching for Generative Modeling",
+      "authors": ["Yaron Lipman", "Ricky T. Q. Chen", "Heli Ben-Hamu", "Maximilian Nickel", "Matt Le"],
+      "publication_date": "2022-10-06",
+      "latest_revision_date": "2023-02-08",
+      "venue_or_status": "ICLR 2023; arXiv v2",
+      "paper_url": "https://arxiv.org/abs/2210.02747",
+      "code_url": null,
+      "project_url": null,
+      "topics": ["flow_matching", "conditional_paths"],
+      "relevance": "Introduces simulation-free vector-field regression along fixed conditional probability paths; it owns the basic conditional flow-matching ingredient."
+    },
+    {
+      "id": "S02",
+      "title": "Mean Flows for One-step Generative Modeling",
+      "authors": ["Zhengyang Geng", "Mingyang Deng", "Xingjian Bai", "J. Zico Kolter", "Kaiming He"],
+      "publication_date": "2025-05-19",
+      "latest_revision_date": null,
+      "venue_or_status": "Technical report; arXiv v1",
+      "paper_url": "https://arxiv.org/abs/2505.13447",
+      "code_url": "https://github.com/Gsunshine/meanflow",
+      "project_url": null,
+      "topics": ["meanflow", "average_velocity", "one_nfe"],
+      "relevance": "Introduces interval-average velocity and the MeanFlow identity for from-scratch 1-NFE generation."
+    },
+    {
+      "id": "S03",
+      "title": "Improved Mean Flows: On the Challenges of Fastforward Generative Models",
+      "authors": ["Zhengyang Geng", "Yiyang Lu", "Zongze Wu", "Eli Shechtman", "J. Zico Kolter", "Kaiming He"],
+      "publication_date": "2025-12-01",
+      "latest_revision_date": "2026-05-09",
+      "venue_or_status": "Technical report; arXiv v2",
+      "paper_url": "https://arxiv.org/abs/2512.02012",
+      "code_url": "https://github.com/Lyy-iiis/imeanflow",
+      "project_url": null,
+      "topics": ["improved_meanflow", "average_velocity", "jvp", "one_nfe"],
+      "relevance": "Recasts MeanFlow as instantaneous-velocity regression through an average-velocity network, using a predicted marginal-velocity tangent and boundary evaluation; this owns the iMF objective used by the proposal."
+    },
+    {
+      "id": "S04",
+      "title": "One Step Diffusion via Shortcut Models",
+      "authors": ["Kevin Frans", "Danijar Hafner", "Sergey Levine", "Pieter Abbeel"],
+      "publication_date": "2024-10-16",
+      "latest_revision_date": "2025-06-23",
+      "venue_or_status": "ICLR 2025; arXiv v3",
+      "paper_url": "https://arxiv.org/abs/2410.12557",
+      "code_url": "https://github.com/kvfrans/shortcut-models",
+      "project_url": null,
+      "topics": ["shortcut_models", "step_size_conditioning", "bootstrap", "one_nfe"],
+      "relevance": "Conditions one network on requested step size and constructs larger-step targets from two stopped-gradient half steps, supporting one or several inference steps."
+    },
+    {
+      "id": "S05",
+      "title": "Diffusion Forcing: Next-token Prediction Meets Full-Sequence Diffusion",
+      "authors": ["Boyuan Chen", "Diego Marti Monso", "Yilun Du", "Max Simchowitz", "Russ Tedrake", "Vincent Sitzmann"],
+      "publication_date": "2024-07-01",
+      "latest_revision_date": "2024-12-10",
+      "venue_or_status": "NeurIPS 2024; arXiv v4",
+      "paper_url": "https://arxiv.org/abs/2407.01392",
+      "code_url": "https://github.com/buoyancy99/diffusion-forcing",
+      "project_url": "https://www.boyuan.space/diffusion-forcing/",
+      "topics": ["diffusion_forcing", "per_token_noise", "causal_sequence", "subsequence_elbo", "planning"],
+      "relevance": "Trains causal sequence models with independent per-token noise levels, partially noised histories, flexible horizons, and an all-subsequence variational interpretation."
+    },
+    {
+      "id": "S06",
+      "title": "Training Agents Inside of Scalable World Models",
+      "authors": ["Danijar Hafner", "Wilson Yan", "Timothy Lillicrap"],
+      "publication_date": "2025-09-29",
+      "latest_revision_date": null,
+      "venue_or_status": "Dreamer 4 technical report; arXiv v1",
+      "paper_url": "https://arxiv.org/abs/2509.24527",
+      "code_url": null,
+      "project_url": "https://danijar.com/dreamer4/",
+      "topics": ["dreamer4", "world_model", "shortcut_forcing", "per_token_noise", "causal_sequence", "imagination_training"],
+      "relevance": "Combines Diffusion Forcing and Shortcut Models in an action-conditioned block-causal world model, with per-token signal levels and step sizes, x-prediction, a stopped-gradient two-half-step target, context corruption, and K=4 inference per frame."
+    },
+    {
+      "id": "S07",
+      "title": "Rolling Diffusion Models",
+      "authors": ["David Ruhe", "Jonathan Heek", "Tim Salimans", "Emiel Hoogeboom"],
+      "publication_date": "2024-02-12",
+      "latest_revision_date": "2024-09-09",
+      "venue_or_status": "ICML 2024; arXiv v3",
+      "paper_url": "https://arxiv.org/abs/2402.09470",
+      "code_url": null,
+      "project_url": null,
+      "topics": ["sequence_diffusion", "heterogeneous_noise", "rolling_generation"],
+      "relevance": "Assigns progressive frame-dependent corruption across a temporal window and rolls the window forward; heterogeneous time schedules across sequence positions predate this proposal."
+    },
+    {
+      "id": "S08",
+      "title": "History-Guided Video Diffusion",
+      "authors": ["Kiwhan Song", "Boyuan Chen", "Max Simchowitz", "Yilun Du", "Russ Tedrake", "Vincent Sitzmann"],
+      "publication_date": "2025-02-10",
+      "latest_revision_date": "2025-07-24",
+      "venue_or_status": "ICML 2025; arXiv v2",
+      "paper_url": "https://arxiv.org/abs/2502.06764",
+      "code_url": "https://github.com/kwsong0113/diffusion-forcing-transformer",
+      "project_url": "https://www.boyuan.space/history-guidance/",
+      "topics": ["diffusion_forcing_transformer", "variable_history", "long_rollout", "video"],
+      "relevance": "Builds a Diffusion Forcing Transformer that supports flexible amounts of history and long video rollouts, narrowing any claim around mixed clean or corrupted history conditioning."
+    },
+    {
+      "id": "S09",
+      "title": "Probabilistic Forecasting via Autoregressive Flow Matching",
+      "authors": ["Ahmed ElGazzar", "Marcel van Gerven"],
+      "publication_date": "2025-03-13",
+      "latest_revision_date": "2026-02-08",
+      "venue_or_status": "arXiv v2",
+      "paper_url": "https://arxiv.org/abs/2503.10375",
+      "code_url": null,
+      "project_url": null,
+      "topics": ["autoregressive_flow_matching", "trajectory_forecasting", "causal_sequence"],
+      "relevance": "FlowTime factorizes a future trajectory into conditional next-observation densities represented by a shared flow, establishing autoregressive flow matching for dynamical forecasting."
+    },
+    {
+      "id": "S10",
+      "title": "FELLE: Autoregressive Speech Synthesis with Token-Wise Coarse-to-Fine Flow Matching",
+      "authors": ["Hui Wang", "Shujie Liu", "Lingwei Meng", "Jinyu Li", "Yifan Yang", "Shiwan Zhao", "Haiyang Sun", "Yanqing Liu", "Haoqin Sun", "Jiaming Zhou", "Yan Lu", "Yong Qin"],
+      "publication_date": "2025-02-16",
+      "latest_revision_date": "2025-09-03",
+      "venue_or_status": "ACM Multimedia 2025; arXiv v2",
+      "paper_url": "https://arxiv.org/abs/2502.11128",
+      "code_url": null,
+      "project_url": null,
+      "topics": ["token_wise_flow_matching", "autoregressive_flow_matching", "causal_sequence"],
+      "relevance": "Combines autoregressive continuous-token generation with token-wise flow matching; token-wise causal flow is therefore not itself new."
+    },
+    {
+      "id": "S11",
+      "title": "Transition Matching: Scalable and Flexible Generative Modeling",
+      "authors": ["Neta Shaul", "Uriel Singer", "Itai Gat", "Yaron Lipman"],
+      "publication_date": "2025-06-30",
+      "latest_revision_date": null,
+      "venue_or_status": "arXiv v1",
+      "paper_url": "https://arxiv.org/abs/2506.23589",
+      "code_url": null,
+      "project_url": null,
+      "topics": ["transition_matching", "continuous_tokens", "fully_causal_generation"],
+      "relevance": "Introduces autoregressive and full-history transition matching as partially and fully causal continuous-state generation paradigms."
+    },
+    {
+      "id": "S12",
+      "title": "Self-Supervised Flow Matching for Scalable Multi-Modal Synthesis",
+      "authors": ["Hila Chefer", "Patrick Esser", "Dominik Lorenz", "Dustin Podell", "Vikash Raja", "Vinh Tong", "Antonio Torralba", "Robin Rombach"],
+      "publication_date": "2026-03-06",
+      "latest_revision_date": null,
+      "venue_or_status": "arXiv v1",
+      "paper_url": "https://arxiv.org/abs/2603.06507",
+      "code_url": null,
+      "project_url": "https://bfl.ai/research/self-flow",
+      "topics": ["flow_matching", "heterogeneous_noise", "multi_time", "token_schedule"],
+      "relevance": "Self-Flow's dual-timestep schedule applies heterogeneous noise levels across tokens; a multi-time token schedule cannot be claimed as novel here."
+    },
+    {
+      "id": "S13",
+      "title": "StreamFlow: Streaming Audio Generation from Discrete Tokens via Streaming Flow Matching",
+      "authors": ["Ha-Yeong Choi", "Sang-Hoon Lee"],
+      "publication_date": "2025",
+      "latest_revision_date": null,
+      "venue_or_status": "NeurIPS 2025 proceedings; primary page exposes year rather than publication day",
+      "paper_url": "https://proceedings.neurips.cc/paper_files/paper/2025/hash/0713495297dab18fabca4795cb9ef8ef-Abstract-Conference.html",
+      "code_url": null,
+      "project_url": "https://streamflow25.github.io/demo/",
+      "topics": ["streaming_flow_matching", "causal_noising", "multi_time", "token_wise_flow_matching", "causal_sequence"],
+      "relevance": "Uses causal noising and predicts multiple time-indexed vector fields in a token-wise streaming generator, making it especially close to the proposal's multi-time causal sequence structure."
+    },
+    {
+      "id": "S14",
+      "title": "Inference Time Policy Optimization for Offline RL with Differentiable World Models",
+      "authors": ["Rohan Deb", "Stephen J. Wright", "Arindam Banerjee"],
+      "publication_date": "2026-03-23",
+      "latest_revision_date": "2026-05-20",
+      "venue_or_status": "arXiv v2",
+      "paper_url": "https://arxiv.org/abs/2603.22430",
+      "code_url": null,
+      "project_url": null,
+      "topics": ["meanflow", "world_model", "one_nfe", "control", "differentiable_rollout"],
+      "relevance": "Uses a one-step MeanFlow sampler in a differentiable world-model pipeline for imagined rollouts, directly precluding a broad claim that this is the first MeanFlow world model."
+    },
+    {
+      "id": "S15",
+      "title": "Flow Matching in Feature Space for Stochastic World Modeling",
+      "authors": ["Francois Porcher", "Nicolas Carion", "Karteek Alahari", "Shizhe Chen"],
+      "publication_date": "2026-06-27",
+      "latest_revision_date": "2026-07-15",
+      "venue_or_status": "arXiv v2",
+      "paper_url": "https://arxiv.org/abs/2606.29059",
+      "code_url": "https://github.com/facebookresearch/Flow-World-Models",
+      "project_url": null,
+      "topics": ["flow_matching", "world_model", "stochastic_dynamics", "feature_space"],
+      "relevance": "FlowWM performs stochastic flow matching directly in pretrained feature space and studies temporal consistency and horizon robustness in a world model."
+    },
+    {
+      "id": "S16",
+      "title": "Flow-JEPA: Flow Matching for Robust Latent Dynamics in JEPA World Models",
+      "authors": ["Yanchen Huo", "Ziying Song", "Yadan Luo"],
+      "publication_date": "2026-08-29",
+      "latest_revision_date": null,
+      "venue_or_status": "arXiv v1",
+      "paper_url": "https://arxiv.org/abs/2608.29029",
+      "code_url": "https://github.com/HuoYanchen/Flow-JEPA",
+      "project_url": null,
+      "topics": ["flow_matching", "world_model", "trajectory_generation", "action_conditioning"],
+      "relevance": "Uses conditional flow matching to jointly generate future latent trajectories from the current observation and actions, precluding a broad trajectory-flow-world-model claim."
+    },
+    {
+      "id": "S17",
+      "title": "MP1: MeanFlow Tames Policy Learning in 1-step for Robotic Manipulation",
+      "authors": ["Juyi Sheng", "Ziyi Wang", "Peiming Li", "Mengyuan Liu"],
+      "publication_date": "2026-03-14",
+      "latest_revision_date": null,
+      "venue_or_status": "AAAI 2026 proceedings",
+      "paper_url": "https://ojs.aaai.org/index.php/AAAI/article/view/38919",
+      "code_url": null,
+      "project_url": null,
+      "topics": ["meanflow", "one_nfe", "action_trajectory", "robot_policy"],
+      "relevance": "Applies MeanFlow to 1-NFE action-trajectory generation; it is a policy rather than a world dynamics model, but blocks broad MeanFlow-trajectory novelty wording."
+    },
+    {
+      "id": "S18",
+      "title": "Causal-rCM: A Unified Teacher-Forcing and Self-Forcing Open Recipe for Autoregressive Diffusion Distillation in Streaming Video Generation and Interactive World Models",
+      "authors": ["Kaiwen Zheng", "Guande He", "Min Zhao", "Jintao Zhang", "Huayu Chen", "Jianfei Chen", "Chen-Hsuan Lin", "Ming-Yu Liu", "Jun Zhu", "Qianli Ma"],
+      "publication_date": "2026-06-24",
+      "latest_revision_date": null,
+      "venue_or_status": "Technical report; arXiv v1",
+      "paper_url": "https://arxiv.org/abs/2606.25473",
+      "code_url": null,
+      "project_url": null,
+      "topics": ["meanflow", "causal_jvp", "fixed_context", "noisy_context", "world_model", "autoregressive_video"],
+      "relevance": "Its teacher-forcing continuous-time CM/MeanFlow construction explicitly gives clean causal context a zero JVP tangent and moves only the noisy target branch; it also describes noisy historical context with loss only on the current target. This directly establishes broad fixed-context causal-JVP prior art."
+    },
+    {
+      "id": "S19",
+      "title": "AlphaFlow: Understanding and Improving MeanFlow Models",
+      "authors": ["Huijie Zhang", "Aliaksandr Siarohin", "Willi Menapace", "Michael Vasilkovsky", "Sergey Tulyakov", "Qing Qu", "Ivan Skorokhodov"],
+      "publication_date": "2025-10-23",
+      "latest_revision_date": null,
+      "venue_or_status": "arXiv v1",
+      "paper_url": "https://arxiv.org/abs/2510.20771",
+      "code_url": "https://github.com/snap-research/alphaflow",
+      "project_url": null,
+      "topics": ["meanflow", "shortcut_models", "trajectory_flow_matching", "trajectory_consistency", "unified_objective"],
+      "relevance": "Decomposes MeanFlow into trajectory-flow-matching and trajectory-consistency terms and gives a formulation unifying trajectory flow matching, Shortcut Models, and MeanFlow. Their relationship is not an open novelty claim for this project."
+    },
+    {
+      "id": "S20",
+      "title": "SplitMeanFlow: Interval Splitting Consistency in Few-Step Generative Modeling",
+      "authors": ["Yi Guo", "Wei Wang", "Zhihang Yuan", "Rong Cao", "Kuan Chen", "Zhengyang Chen", "Yuanyuan Huo", "Yang Zhang", "Yuping Wang", "Shouda Liu", "Yuxuan Wang"],
+      "publication_date": "2025-07-22",
+      "latest_revision_date": null,
+      "venue_or_status": "Technical report; arXiv v1",
+      "paper_url": "https://arxiv.org/abs/2507.16884",
+      "code_url": null,
+      "project_url": null,
+      "topics": ["meanflow", "interval_splitting", "consistency", "jvp_free", "theory"],
+      "relevance": "Derives interval-splitting consistency for average velocity and proves the MeanFlow differential identity is recovered as the split approaches an endpoint. The differential-versus-splitting relation is prior theory."
+    },
+    {
+      "id": "S21",
+      "title": "Autoregressive One-Step Generative Modeling for Dynamical System Forecasting",
+      "authors": ["Tianyue Yang", "Xiao Xue"],
+      "publication_date": "2026-05-07",
+      "latest_revision_date": "2026-07-27",
+      "venue_or_status": "arXiv v2",
+      "paper_url": "https://arxiv.org/abs/2605.05540",
+      "code_url": null,
+      "project_url": null,
+      "topics": ["improved_meanflow_lineage", "meanflow", "autoregressive_dynamics", "one_nfe", "window_conditioning", "long_rollout"],
+      "relevance": "MeLISA's Window-Consistency MeanFlow is in the improved-MeanFlow lineage and trains a stochastic autoregressive spatiotemporal transition kernel with 1 NFE per forecast block. It is not the identical iMF objective: its displayed WinC-MF JVP uses the pathwise epsilon-x tangent rather than iMF's predicted marginal-velocity tangent. It uses one shared (r,t) pair across frames and adds a finite-lag Time Increment Consistency loss."
+    }
+  ],
+  "claim_elements": [
+    {
+      "id": "E01",
+      "element": "Simulation-free regression of a conditional straight-path velocity field",
+      "status": "established_prior_art",
+      "prior_source_ids": ["S01"],
+      "audit_finding": "This is the core flow-matching construction.",
+      "residual_claim": "None."
+    },
+    {
+      "id": "E02",
+      "element": "Interval-average velocity identity and direct 1-NFE generation",
+      "status": "established_prior_art",
+      "prior_source_ids": ["S02"],
+      "audit_finding": "MeanFlow supplies both the identity and the one-step operating point.",
+      "residual_claim": "None."
+    },
+    {
+      "id": "E03",
+      "element": "Improved MeanFlow v-space regression through an average-velocity predictor, with a predicted marginal-velocity JVP tangent and boundary evaluation",
+      "status": "established_prior_art",
+      "prior_source_ids": ["S03"],
+      "audit_finding": "The proposal reuses the published iMF objective rather than deriving a new MeanFlow identity.",
+      "residual_claim": "Sequence-specific application only."
+    },
+    {
+      "id": "E04",
+      "element": "Independent noise or signal levels across sequence tokens",
+      "status": "established_prior_art",
+      "prior_source_ids": ["S05", "S06", "S07", "S12"],
+      "audit_finding": "Per-token or heterogeneous sequence corruption is already central to Diffusion Forcing and related work.",
+      "residual_claim": "None."
+    },
+    {
+      "id": "E05",
+      "element": "Independent iMF interval pairs (r_k, t_k) for causal target tokens",
+      "status": "partly_prior_art",
+      "prior_source_ids": ["S03", "S05", "S12", "S13", "S18"],
+      "audit_finding": "iMF supplies interval pairs; sequence methods supply token-dependent times; Causal-rCM supplies causal continuous-time CM/MeanFlow. Independently sampled per-target iMF pairs decoupled from history exposure times were not found verbatim in the audited sources.",
+      "residual_claim": "A narrow schedule/objective combination whose value must be established theoretically or empirically."
+    },
+    {
+      "id": "E06",
+      "element": "Fixed-context partial JVP: differentiate token k only through (z_k, t_k), holding actions and all realized causal-history values and times fixed",
+      "status": "established_prior_art",
+      "prior_source_ids": ["S03", "S18"],
+      "audit_finding": "Holding conditions fixed is standard conditional differentiation, and Causal-rCM Equation (17) explicitly assigns the clean causal context a zero tangent while moving only the noisy target branch.",
+      "residual_claim": "Correctness-critical implementation semantics, not a priority-bearing novelty."
+    },
+    {
+      "id": "E07",
+      "element": "Mixture of clean-history, corrupted-history, and teacher-corrupted-suffix supervision contexts",
+      "status": "partly_prior_art",
+      "prior_source_ids": ["S05", "S06", "S07", "S08", "S13", "S18"],
+      "audit_finding": "Flexible clean or corrupted history and causal rolling/suffix patterns are prior art. Causal-rCM also explicitly replaces clean history by noisy history while supervising the current target. The exact three-way mixture with independent history times and a shared-noise two-view coupling is implementation-specific.",
+      "residual_claim": "A narrow schedule-mixture and coupling ablation, not a standalone foundational contribution."
+    },
+    {
+      "id": "E08",
+      "element": "Causal, action-conditioned continuous-token world modeling and imagination rollouts",
+      "status": "established_prior_art",
+      "prior_source_ids": ["S05", "S06", "S09", "S15", "S16", "S18"],
+      "audit_finding": "Causal sequence diffusion/flow and action-conditioned flow world models already exist.",
+      "residual_claim": "None at this level of abstraction."
+    },
+    {
+      "id": "E09",
+      "element": "Requested-step conditioning with stopped-gradient two-half-step shortcut targets",
+      "status": "established_prior_art",
+      "prior_source_ids": ["S04", "S06"],
+      "audit_finding": "This is the shortcut baseline, not part of the claimed iMF contribution.",
+      "residual_claim": "None."
+    },
+    {
+      "id": "E10",
+      "element": "A one-step MeanFlow sampler used as a world-model transition for control",
+      "status": "established_prior_art",
+      "prior_source_ids": ["S14", "S21"],
+      "audit_finding": "ITPO explicitly studies a one-step MeanFlow sampler in a differentiable world-model rollout pipeline, while MeLISA supplies a 1-NFE stochastic autoregressive dynamical transition kernel.",
+      "residual_claim": "The proposed method may differ in per-token iMF scheduling and action-control scope, but cannot claim the broad category."
+    },
+    {
+      "id": "E11",
+      "element": "Flow matching that jointly predicts an action-conditioned future latent trajectory",
+      "status": "established_prior_art",
+      "prior_source_ids": ["S16"],
+      "audit_finding": "Flow-JEPA directly occupies this broad design space; FlowWM further establishes stochastic flow world modeling.",
+      "residual_claim": "Only objective- and conditioning-level distinctions remain."
+    },
+    {
+      "id": "E12",
+      "element": "The full trajectory-iMF combination: independent per-target iMF intervals decoupled from history exposure times, shared-noise query/history views, the three-way schedule mixture, action conditioning, and 1-NFE autoregressive transitions",
+      "status": "exact_combination_not_found",
+      "prior_source_ids": ["S03", "S05", "S06", "S12", "S13", "S14", "S16", "S18", "S21"],
+      "audit_finding": "No exact combination was found in the audited primary sources through the cutoff. Causal-rCM already has teacher-forced causal continuous-time CM/MeanFlow with a zero context tangent and noisy-context extension. MeLISA is the closest 1-NFE autoregressive-dynamics precedent in the improved-MeanFlow lineage, but its displayed JVP uses the pathwise epsilon-x tangent instead of iMF's predicted marginal velocity and it shares one (r,t) pair across its temporal window.",
+      "residual_claim": "At most an apparently unreported narrow combination of decoupled per-token query/history schedules, shared-noise two-view construction, and schedule mixing; this is not a priority claim."
+    },
+    {
+      "id": "E13",
+      "element": "Trajectory iMF outperforms faithful Dreamer-4-style shortcut forcing under matched budgets",
+      "status": "unresolved_empirically",
+      "prior_source_ids": ["S03", "S06"],
+      "audit_finding": "Neither paper tests this comparison, and local smoke results cannot establish it.",
+      "residual_claim": "Requires the frozen paired confirmatory benchmark on both rollout fidelity and actor return."
+    },
+    {
+      "id": "E14",
+      "element": "Agreement of learned scheduled conditionals with data and all-subsequence marginals, tractable likelihood interpretation, and a bound on environment-time rollout error",
+      "status": "missing_theory",
+      "prior_source_ids": ["S05", "S21"],
+      "audit_finding": "Measurable normalized autoregressive conditional kernels already induce a normalized joint rollout law by sequential composition. Diffusion Forcing additionally provides an all-subsequence variational result, and MeLISA adds explicit finite-lag temporal-increment consistency, but the proposed trajectory-iMF objective has no proof that its scheduled conditionals agree with data or all-subsequence marginals, no tractable likelihood result, and no control-error bound.",
+      "residual_claim": "Open theory target."
+    },
+    {
+      "id": "E15",
+      "element": "Epistemic uncertainty, calibration under distribution shift, and protection against planner or actor exploitation",
+      "status": "missing_theory",
+      "prior_source_ids": ["S05", "S14", "S15", "S18"],
+      "audit_finding": "The Gaussian source models aleatoric randomness. It does not by itself identify epistemic uncertainty or constrain optimized policies to trustworthy regions.",
+      "residual_claim": "Requires explicit ensembles or posterior approximations, calibration tests, and policy-exploitation diagnostics."
+    },
+    {
+      "id": "E16",
+      "element": "MeanFlow generation of a continuous trajectory for control",
+      "status": "established_prior_art",
+      "prior_source_ids": ["S17"],
+      "audit_finding": "MP1 generates action trajectories with MeanFlow in one NFE; it is not a dynamics model, but narrows trajectory-level wording.",
+      "residual_claim": "The world-dynamics role and fixed-context iMF formulation remain distinguishing details."
+    },
+    {
+      "id": "E17",
+      "element": "A unifying relation among trajectory flow matching, Shortcut Models, and MeanFlow",
+      "status": "established_prior_art",
+      "prior_source_ids": ["S19"],
+      "audit_finding": "AlphaFlow explicitly decomposes MeanFlow and places trajectory flow matching, Shortcut Models, and MeanFlow in one objective family.",
+      "residual_claim": "None; the benchmark may compare members of this family but must not claim to discover the relation."
+    },
+    {
+      "id": "E18",
+      "element": "MeanFlow's differential identity as the infinitesimal limit of interval-splitting consistency",
+      "status": "established_prior_art",
+      "prior_source_ids": ["S20"],
+      "audit_finding": "SplitMeanFlow derives the algebraic interval-splitting identity and proves the differential MeanFlow identity is recovered at the infinitesimal endpoint limit.",
+      "residual_claim": "None; any new theorem must go beyond this relationship and address causal conditional trajectories."
+    },
+    {
+      "id": "E19",
+      "element": "MeanFlow/iMF-style training of a stochastic 1-NFE autoregressive dynamical transition kernel over temporal windows",
+      "status": "established_prior_art",
+      "prior_source_ids": ["S21"],
+      "audit_finding": "MeLISA's Window-Consistency MeanFlow is the closest one-evaluation autoregressive dynamical-forecasting precedent in the improved-MeanFlow lineage. Its displayed JVP uses the pathwise epsilon-x tangent, rather than the predicted marginal-velocity tangent of the iMF objective proposed here.",
+      "residual_claim": "The exact iMF objective, independent per-token query intervals, separately timed corrupted causal histories, shared-noise two-view coupling, and action-conditioned control remain narrower differences."
+    }
+  ],
+  "verdict": {
+    "code": "bounded_combination_novelty_only",
+    "summary": "No exact combination was found in the audited primary literature through 2026-09-10, but all major ingredients have close prior art. Causal-rCM already establishes a fixed-context causal JVP construction for continuous-time consistency/MeanFlow training, including a noisy-context extension. MeLISA is the closest stochastic 1-NFE autoregressive-dynamics precedent in the improved-MeanFlow lineage and uses a shared interval across its temporal window, but its displayed JVP uses the pathwise epsilon-x tangent rather than iMF's predicted marginal velocity. AlphaFlow already unifies trajectory flow matching, Shortcut Models, and MeanFlow, while SplitMeanFlow establishes the interval-splitting/differential-limit relation. The defensible residual is only an apparently unreported narrow combination of iMF with independent per-target query intervals decoupled from history exposure times, shared-noise query/history views, and a three-way schedule mixture—not a new foundational identity and not a priority claim.",
+    "allowed_wording": [
+      "We study an iMF objective with decoupled per-token query and history-exposure schedules for causal world-model transitions.",
+      "Among the primary sources audited through 2026-09-10, we did not find the exact combination of independent token-wise iMF intervals, separately sampled history exposure times, shared-noise query/history views, a three-way causal schedule mixture, and 1-NFE autoregressive world transitions.",
+      "The contribution is a narrow method combination and controlled empirical test; fixed-context causal JVPs themselves are prior art in Causal-rCM, MeLISA is the closest MeanFlow/iMF-style 1-NFE autoregressive-dynamics precedent but does not use the identical iMF tangent, and the remaining ingredients derive from iMF, Diffusion Forcing, causal sequence flow, and prior flow world models."
+    ],
+    "prohibited_wording": [
+      "the first MeanFlow world model",
+      "the first flow-matching trajectory world model",
+      "a new MeanFlow identity",
+      "the first per-token or multi-time flow model",
+      "the first fixed-context causal JVP for MeanFlow",
+      "a new unification of trajectory flow matching, Shortcut Models, and MeanFlow",
+      "a new proof that MeanFlow is an infinitesimal interval-splitting limit",
+      "the first improved-MeanFlow autoregressive dynamical world model",
+      "provably stable rollouts",
+      "solves epistemic uncertainty",
+      "outperforms Dreamer 4"
+    ],
+    "evidence_required_before_strengthening": [
+      "A completed confirmatory paired benchmark satisfying the frozen superiority rule.",
+      "A broader camera-ready literature update and citation chaining immediately before submission.",
+      "Formal results showing agreement of scheduled conditionals with data/all-subsequence marginals, a tractable likelihood interpretation, or controlled rollout error if such theorem claims are made."
+    ]
+  }
+}

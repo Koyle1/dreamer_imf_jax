@@ -1,0 +1,246 @@
+{
+  "schema_version": "trajectory-imf-neurips-controls-v1",
+  "status": "frozen_before_control_outcomes",
+  "study_name": "Matched strong controls and factorial trajectory-iMF ablations",
+  "parent_protocol": {
+    "path": "dreamer_imf_comparison/matched_objective_protocol.json",
+    "schema_version": "trajectory-imf-shortcut-objective-v2",
+    "sha256": "22b9c9a88589cf69f9045003498a06ab966107c4d42a14e445ffb42d18814fcf"
+  },
+  "claim_boundary": {
+    "role": "secondary_descriptive_controls",
+    "may_modify_or_substitute_for_primary_gate": false,
+    "may_support_primary_superiority_claim": false,
+    "primary_gate_accessed_by_runner": false,
+    "smoke_or_development_is_claim_evidence": false,
+    "dreamer4_label_allowed": false,
+    "shortcut_label": "paper-derived Dreamer-4-Equation-7-style shortcut-forcing reimplementation"
+  },
+  "reference_arms": [
+    {
+      "arm_id": "shortcut_forcing",
+      "family": "shortcut_forcing",
+      "role": "paper_derived_reference",
+      "primary_nfe": 4,
+      "training_objective": "parent_protocol_shortcut_forcing"
+    },
+    {
+      "arm_id": "ordinary_imf",
+      "family": "ordinary_imf",
+      "role": "strong_baseline",
+      "primary_nfe": 1,
+      "training_objective": "ordinary_conditional_iMF_on_one_step_posterior_transitions_without_trajectory_schedule_or_corrupted_history"
+    },
+    {
+      "arm_id": "gaussian_rssm",
+      "family": "gaussian_rssm",
+      "role": "strong_baseline",
+      "primary_nfe": 1,
+      "training_objective": "diagonal_Gaussian_RSSM_prior_with_stop_posterior_KL"
+    },
+    {
+      "arm_id": "temporal_increment_imf",
+      "family": "temporal_increment_imf",
+      "role": "strong_baseline",
+      "primary_nfe": 1,
+      "training_objective": "ordinary_iMF_plus_stopped_one_step_vs_two_half_step_endpoint_consistency"
+    },
+    {
+      "arm_id": "trajectory_endpoint_certificate",
+      "family": "trajectory_endpoint_certificate",
+      "role": "exploratory_theorem_aligned_ablation",
+      "primary_nfe": 1,
+      "training_objective": "proposed_trajectory_iMF_plus_positive_mass_raw_r_zero_endpoint_certificate"
+    }
+  ],
+  "endpoint_certificate_control": {
+    "claim_role": "exploratory_only",
+    "may_modify_or_substitute_for_primary_gate": false,
+    "base_arm": "trajectory_imf",
+    "mixture_mass": 0.25,
+    "r": 0.0,
+    "s_sampling": "independent_uniform_[0,1]_per_token_from_objective_fold_in_5",
+    "terms": "raw_unadapted_sum_of_squared_F_regression_and_boundary_v_regression",
+    "implementation": "trajectory_imf_loss_with_adaptive_power_zero_on_the_r_zero_slice",
+    "context": "same_realized_causal_context_as_the_proposed_trajectory_draw",
+    "inference_change": false
+  },
+  "temporal_increment_control": {
+    "description": "A deliberately simple MeLISA-inspired temporal-increment consistency control; it is not a MeLISA reproduction.",
+    "direct_endpoint": "one full iMF transport step from the retained base noise",
+    "teacher_endpoint": "two half iMF transport steps from the same retained base noise and fixed condition",
+    "loss": "masked_mean_square(direct_endpoint-stop_gradient(teacher_endpoint))",
+    "default_scale": 0.3,
+    "self_distillation_teacher": "live_parameters_with_stop_gradient",
+    "extra_context_corruption": false
+  },
+  "factorial": {
+    "base_family": "trajectory_imf",
+    "full_factorial": true,
+    "factors_in_id_order": [
+      "query_history_noise_coupling",
+      "query_history_time_relation",
+      "clean_context_enabled",
+      "corrupted_context_enabled",
+      "future_suffix_enabled"
+    ],
+    "levels": {
+      "query_history_noise_coupling": ["shared", "independent"],
+      "query_history_time_relation": ["separate", "tied_on_corrupted_positions"],
+      "clean_context_enabled": [false, true],
+      "corrupted_context_enabled": [false, true],
+      "future_suffix_enabled": [false, true]
+    },
+    "invalid_combinations": "exclude_only_the_four_combinations_with_all_three_context_components_disabled",
+    "context_probabilities": "uniform_after_renormalizing_over_enabled_components",
+    "expected_trajectory_arms": 28,
+    "proposed_cell": {
+      "arm_id": "trajectory_imf",
+      "query_history_noise_coupling": "shared",
+      "query_history_time_relation": "separate",
+      "clean_context_enabled": true,
+      "corrupted_context_enabled": true,
+      "future_suffix_enabled": true
+    },
+    "nonproposed_arm_id_format": "trajectory_f__noise-{noise}__time-{time}__ctx-{three_bit_CRS_mask}"
+  },
+  "expected_total_arms": 33,
+  "profile_arm_policy": {
+    "frozen_before_any_control_outcome": true,
+    "smoke": "all_registered_33",
+    "development": "all_registered_33",
+    "confirmatory": "prespecified_six_references_and_proposed",
+    "confirmatory_arm_ids": [
+      "shortcut_forcing",
+      "ordinary_imf",
+      "gaussian_rssm",
+      "temporal_increment_imf",
+      "trajectory_endpoint_certificate",
+      "trajectory_imf"
+    ],
+    "nonproposed_factorial_cells_confirmatory_excluded": true,
+    "rationale": "The complete 28-cell factorial is a development-only mechanism study; repeating it over both confirmatory tracks would create 19806 cells and invite post-hoc ablation inference. Confirmatory controls are limited prospectively to six named reference/proposed arms."
+  },
+  "profiles": {
+    "smoke": {
+      "parent_profile": "smoke",
+      "evidence_class": "engineering_smoke",
+      "claim_eligible": false,
+      "tasks": ["dmc_cartpole_swingup"],
+      "world_model_seeds": [17],
+      "actor_seeds_nested_within_world_model_seed": [101],
+      "run_budget_tracks": ["equal_updates"],
+      "analysis_bootstrap_resamples": 64
+    },
+    "development": {
+      "parent_profile": "pilot",
+      "evidence_class": "development_only",
+      "claim_eligible": false,
+      "tasks": ["dmc_reacher_easy", "dmc_pendulum_swingup"],
+      "world_model_seeds": [211, 223, 227],
+      "actor_seeds_nested_within_world_model_seed": [311, 313],
+      "run_budget_tracks": ["equal_updates"],
+      "analysis_bootstrap_resamples": 2000
+    },
+    "confirmatory": {
+      "parent_profile": "confirmatory",
+      "evidence_class": "confirmatory_secondary_descriptive",
+      "claim_eligible": false,
+      "tasks": [
+        "dmc_cartpole_swingup",
+        "dmc_ball_in_cup_catch",
+        "dmc_cheetah_run",
+        "dmc_walker_walk",
+        "dmc_finger_spin",
+        "dmc_hopper_hop"
+      ],
+      "world_model_seeds": [17, 27, 37, 47, 57, 67, 77, 87, 97, 107],
+      "actor_seeds_nested_within_world_model_seed": [101, 202, 303],
+      "run_budget_tracks": ["equal_updates", "equal_compiler_flops"],
+      "analysis_bootstrap_resamples": 20000
+    }
+  },
+  "development_selection": {
+    "selection_tasks": ["dmc_reacher_easy", "dmc_pendulum_swingup"],
+    "confirmatory_tasks_must_be_unread": true,
+    "selected_families": ["ordinary_imf", "gaussian_rssm", "temporal_increment_imf"],
+    "candidate_grid": {
+      "ordinary_imf": [
+        {"candidate_id": "ordinary_scale_0p3", "prior_scale": 0.3},
+        {"candidate_id": "ordinary_scale_1p0", "prior_scale": 1.0},
+        {"candidate_id": "ordinary_scale_3p0", "prior_scale": 3.0}
+      ],
+      "gaussian_rssm": [
+        {"candidate_id": "gaussian_scale_0p3", "prior_scale": 0.3},
+        {"candidate_id": "gaussian_scale_1p0", "prior_scale": 1.0},
+        {"candidate_id": "gaussian_scale_3p0", "prior_scale": 3.0}
+      ],
+      "temporal_increment_imf": [
+        {"candidate_id": "tic_scale_0p1", "prior_scale": 1.0, "temporal_increment_scale": 0.1},
+        {"candidate_id": "tic_scale_0p3", "prior_scale": 1.0, "temporal_increment_scale": 0.3},
+        {"candidate_id": "tic_scale_1p0", "prior_scale": 1.0, "temporal_increment_scale": 1.0}
+      ]
+    },
+    "smoke_candidates": {
+      "ordinary_imf": "ordinary_scale_1p0",
+      "gaussian_rssm": "gaussian_scale_1p0",
+      "temporal_increment_imf": "tic_scale_0p3"
+    },
+    "selection_estimand": "mean_over_tasks_of_within_task_mean_world_seed_rank_of_rollout_AUC_plus_rank_of_negative_nested_actor_return_divided_by_two",
+    "selection_budget_track": "equal_updates",
+    "within_metric_rank_tie_break": "lexicographically_smallest_candidate_id",
+    "tie_break": "lexicographically_smallest_candidate_id",
+    "factorial_settings_tuned": false,
+    "primary_or_confirmatory_outcomes_may_affect_selection": false
+  },
+  "matched_controls": {
+    "canonical_data": "import_parent_dataset_cell_and_validator",
+    "canonical_minibatch_schedule": "import_parent_batch_schedule_and_materializer",
+    "canonical_objective_key": "sha256_namespace_world-objective_task_world-seed_folded_by_update",
+    "canonical_rollout_windows": "import_parent_rollout_window_derivation",
+    "canonical_actor_initialization_and_budget": "import_parent_actor_seed_schedule_and_Dreamer_actor_critic",
+    "canonical_actor_evaluation": "import_parent_DMC_policy_evaluation_seeds_and_episodes",
+    "same_shared_dimensions_optimizer_precision_and_common_losses": true,
+    "world_model_frozen_during_actor_learning": true,
+    "parameter_and_compiler_flops_reported_per_arm": true,
+    "equal_flop_reference_arm": "shortcut_forcing",
+    "nearest_integer_allocation_tie_break": "lower_update_count",
+    "equal_flop_relative_tolerance": 0.002,
+    "smoke_runs_equal_updates_only_but_compiles_both_allocations": true
+  },
+  "evaluation": {
+    "rollout_horizons": [1, 2, 4, 8, 15, 30],
+    "rollout_context_length": 8,
+    "rollout_metric": "normalized_free_running_rollout_error_auc",
+    "actor_metric": "real_environment_normalized_return",
+    "factorial_and_controls_nfe": 1,
+    "shortcut_nfe": 4,
+    "paired_rollout_starts_noise_and_environment_seeds": true,
+    "retain_raw_predictive_draws_actions_rewards_continuations_and_terminals": true
+  },
+  "statistics": {
+    "independent_unit": "task_x_world_model_seed",
+    "actor_seeds_are_nested": true,
+    "inference_role": "descriptive_only",
+    "interval_method": "task_stratified_paired_percentile_bootstrap",
+    "interval_percentiles": [2.5, 97.5],
+    "bootstrap_seed": 314159,
+    "multiplicity_adjusted_decision": false,
+    "superiority_decision_field_permitted": false,
+    "primary_gate_fields_permitted": false
+  },
+  "provenance": {
+    "freeze_before_execution": true,
+    "source_file_hashes": true,
+    "runtime_fingerprint": true,
+    "resolved_config_and_digest_per_arm": true,
+    "compiler_IR_and_cost_analysis": true,
+    "world_and_actor_checkpoints": true,
+    "checkpoint_recomputed_rollouts": true,
+    "checkpoint_replayed_actor_environment_trajectories": true,
+    "exact_artifact_manifest": true,
+    "finalized_roots_are_immutable_to_runner": true,
+    "development_selection_requires_clean_committed_source_and_single_visible_device": true,
+    "confirmatory_requires_clean_committed_source_and_single_visible_device": true
+  }
+}

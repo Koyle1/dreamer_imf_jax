@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "imf-dreamer-jax"
+version = "0.4.0"
+description = "Pure-JAX compact Dreamer-style world models with Gaussian or Improved MeanFlow priors"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{name = "IMF Dreamer contributors"}]
+dependencies = [
+  "jax>=0.4.30",
+  "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+cuda12 = ["jax[cuda12]>=0.4.30; platform_system == 'Linux'"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

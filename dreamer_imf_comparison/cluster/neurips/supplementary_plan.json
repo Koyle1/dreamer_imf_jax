@@ -1,0 +1,65 @@
+{
+  "schema_version": "trajectory-imf-neurips-supplementary-launch-plan-v1",
+  "status": "implemented_not_executed",
+  "claim_boundary": "controls and pixel evidence are secondary; neither can replace the frozen matched-objective superiority gate",
+  "controls": {
+    "development": {
+      "requires": ["matched_objective_pilot_verified"],
+      "freeze_command": "python dreamer_imf_comparison/cluster/neurips/submit.py freeze-controls --controls-profile development --execute",
+      "canonical_dataset_units": 6,
+      "matrix_stage_counts": {
+        "compute": 2,
+        "world": 234,
+        "rollout": 234,
+        "actor": 468
+      },
+      "matrix_cells": 938,
+      "execution_units_including_datasets": 944,
+      "stage_order": ["dataset", "compute", "world", "rollout", "actor"],
+      "stage_submit_command": "python dreamer_imf_comparison/cluster/neurips/submit.py controls-stage --controls-profile development --controls-stage {stage} --execute",
+      "finalize_command": "python dreamer_imf_comparison/cluster/neurips/submit.py finalize-controls --controls-profile development --execute",
+      "finalize_before": "controls confirmatory freeze; freezes controls_selection.json without reading confirmatory tasks"
+    },
+    "confirmatory": {
+      "requires": [
+        "matched_objective_pilot_verified",
+        "matched_objective_confirmatory_verified",
+        "controls_development_verified_and_selection_frozen"
+      ],
+      "freeze_command": "python dreamer_imf_comparison/cluster/neurips/submit.py freeze-controls --controls-profile confirmatory --execute",
+      "canonical_dataset_units": 60,
+      "matrix_stage_counts": {
+        "compute": 6,
+        "world": 720,
+        "rollout": 720,
+        "actor": 2160
+      },
+      "matrix_cells": 3606,
+      "execution_units_including_datasets": 3666,
+      "stage_order": ["dataset", "compute", "world", "rollout", "actor"],
+      "stage_submit_command": "python dreamer_imf_comparison/cluster/neurips/submit.py controls-stage --controls-profile confirmatory --controls-stage {stage} --execute",
+      "finalize_command": "python dreamer_imf_comparison/cluster/neurips/submit.py finalize-controls --controls-profile confirmatory --execute",
+      "inference_role": "secondary_descriptive"
+    }
+  },
+  "pixel": {
+    "requires": ["matched_objective_pilot_verified"],
+    "profile": "hard",
+    "tasks": ["dmc_walker_walk", "dmc_cheetah_run", "dmc_finger_spin"],
+    "seeds": [19, 29, 39, 49, 59],
+    "tracks": ["equal_updates", "equal_compiler_flops"],
+    "artifact_units": 30,
+    "freeze_command": "python dreamer_imf_comparison/cluster/neurips/submit.py freeze-pixel --execute",
+    "array_command": "python dreamer_imf_comparison/cluster/neurips/submit.py pixel --execute",
+    "cell_command_template": "python dreamer_imf_comparison/cluster/neurips/supplementary.py run-pixel-cell --array-index {immutable_array_index}",
+    "verification": "verify every artifact with checkpoint replay and compiler rederivation on the same L40S runtime, then aggregate all 30"
+  },
+  "scheduler_contract": {
+    "same_resources_as_main": true,
+    "array_concurrency": 4,
+    "controls_compute_concurrency": 1,
+    "stage_dependency": "afterok on a whole-stage verifier",
+    "correlated_array_dependencies": false,
+    "retry_policy": "construct the next immutable index map only from missing or strongly invalid units, bind selected-unit state digests, and reject stale maps"
+  }
+}

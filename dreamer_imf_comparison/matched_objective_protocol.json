@@ -1,0 +1,845 @@
+{
+  "schema_version": "trajectory-imf-shortcut-objective-v2",
+  "status": "frozen_before_outcomes",
+  "study_name": "Trajectory iMF versus a published-Equation-7 shortcut-forcing reimplementation under matched objectives",
+  "claim": "Trajectory iMF outperforms a faithful-to-published-Dreamer-4-Equation-7 reimplementation with declared choices on both free-running rollout fidelity and frozen-world-model actor return under matched update and matched compiler-FLOP budgets.",
+  "claim_boundary": {
+    "baseline_identity": "faithful-to-published-Dreamer-4-Equation-7 reimplementation with declared choices",
+    "not_claimed": [
+      "official_unreleased_Dreamer4_code",
+      "the_2B_parameter_Minecraft_system",
+      "broad_video_world_model_superiority_without_the_video_track",
+      "a_full_Dreamer4_agent_or_training_system_reproduction"
+    ],
+    "smoke_or_pilot_supports_superiority": false
+  },
+  "source": {
+    "title": "Training Agents Inside of Scalable World Models",
+    "identifier": "arXiv:2509.24527v1",
+    "uri": "https://arxiv.org/abs/2509.24527",
+    "equations": [4, 7],
+    "training_k_max_disclosed": false,
+    "declared_reimplementation_choices": [
+      "pilot_selected_training_k_max_from_{4,8,16}",
+      "primary_clean_observed_prefix_then_unmodified_generated_history",
+      "state_observations_and_current_library_architecture",
+      "custom_clipped_Adam_without_weight_decay_or_world_model_EMA"
+    ]
+  },
+  "arm_order": [
+    "shortcut_forcing",
+    "trajectory_imf"
+  ],
+  "arms": {
+    "shortcut_forcing": {
+      "role": "baseline",
+      "objective": "dreamer4_equation_7_x_prediction_shortcut_forcing",
+      "parameterization": "x_prediction",
+      "independent_per_token_signal_levels": true,
+      "independent_per_token_step_sizes": true,
+      "schedule": {
+        "step_count_values": "powers_of_two_through_k_max_inclusive",
+        "training_k_max": "pilot_selection_manifest",
+        "training_k_max_candidates": [4, 8, 16],
+        "training_k_max_selection_profile": "pilot",
+        "training_k_max_paper_disclosed": false,
+        "training_k_max_choice": "selected_only_on_pilot_equal_updates_by_the_frozen_joint_selection_rule",
+        "step_size": "1/K",
+        "signal_level": "tau=j/K",
+        "signal_index_support": "j_in_{0,...,K-1}",
+        "sampling": "independent_uniform_over_step_counts_then_grid_points_per_token"
+      },
+      "bootstrap": {
+        "finest_step_target": "clean_data",
+        "nonfinest_target": "two_sequential_half_steps",
+        "two_half_steps": true,
+        "target_stop_gradient": true,
+        "target_expression": "stop_gradient((b1+b2)/2)"
+      },
+      "loss": {
+        "coordinate_space": "x_space",
+        "bootstrap_scale": "(1-tau)^2",
+        "ramp": {
+          "expression": "0.9*tau+0.1",
+          "slope": 0.9,
+          "intercept": 0.1
+        }
+      },
+      "generation": {
+        "supported_field_evaluations": [1, 2, 4],
+        "primary_field_evaluations": 4,
+        "nfe_equals_steps": true
+      }
+    },
+    "trajectory_imf": {
+      "role": "proposed",
+      "objective": "fixed_context_per_token_time_trajectory_imf",
+      "parameterization": "velocity_with_partial_time_jvp",
+      "independent_per_token_signal_levels": true,
+      "fixed_context_partial_jvp": true,
+      "same_noise_path_for_query_history_pair": true,
+      "context_patterns": {
+        "clean_context": 0.3333333333333333,
+        "corrupted_context": 0.3333333333333333,
+        "teacher_corrupted_suffix_supervision": 0.3333333333333333
+      },
+      "context_pattern_sampling_unit": "one_pattern_per_training_sequence",
+      "teacher_corrupted_suffix_is_self_generated": false,
+      "separate_legacy_losses": {
+        "shortcut_loss": false,
+        "context_loss": false,
+        "overshooting_loss": false
+      },
+      "generation": {
+        "supported_field_evaluations": [1, 2, 4],
+        "primary_field_evaluations": 1,
+        "nfe_equals_steps": true
+      }
+    }
+  },
+  "exploratory_ablations": {
+    "confirmatory_arm_count_remains_two": true,
+    "may_support_primary_superiority_claim": false,
+    "ablations": {
+      "shared_time_only": {
+        "base_arm": "trajectory_imf",
+        "change_only": "replace_independent_per_target_query_intervals_with_one_shared_query_interval_per_sequence_while_preserving_the_three_way_context_mixture_and_fixed_context_JVP",
+        "purpose": "isolate_per_target_time_heterogeneity_as_one_factor"
+      },
+      "clean_context_only": {
+        "base_arm": "trajectory_imf",
+        "change_only": "set_all_teacher_history_exposure_times_to_zero_while_preserving_independent_per_target_query_intervals_and_the_fixed_context_JVP",
+        "purpose": "isolate_teacher_history_corruption_supervision_as_one_factor"
+      },
+      "joint_diagonal_context_jvp_negative_control": {
+        "base_arm": "trajectory_imf",
+        "change_only": "rebuild_causal_prefix_context_inside_a_whole_sequence_diagonal_JVP_while_preserving_all_other_settings",
+        "exposed_unwanted_terms": "for_target_k_sum_over_j_less_than_k_of_partial_u_over_partial_c_k_times_partial_c_k_over_partial_(z_j,t_j)",
+        "purpose": "expose_unwanted_prefix_cross_terms_that_are_absent_from_the_fixed_context_partial_JVP"
+      }
+    }
+  },
+  "shared_world_model": {
+    "architecture": "causal_recurrent_state_space_model",
+    "observation_modality": "state",
+    "trunk": {
+      "encoder_width": 128,
+      "deterministic_state_size": 128,
+      "stochastic_state_size": 32,
+      "transition_width": 256,
+      "recurrent_signal_coordinate_slots": 2
+    },
+    "causal_action_alignment": "action_t_conditions_prediction_of_observation_t_plus_1",
+    "same_causal_target": true,
+    "same_action_inputs": true,
+    "objective_randomness": {
+      "same_base_gaussian_samples_within_paired_minibatch": true,
+      "paired_canonical_uniforms_by_token": true,
+      "objective_specific_deterministic_time_transform": true,
+      "identical_schedule_distribution_required": false,
+      "shortcut_schedule": "discrete_power_of_two_grid",
+      "trajectory_schedule": "continuous_R_Q_tau_and_context_pattern"
+    },
+    "same_model_trunk": true,
+    "same_latent_representation": true,
+    "same_decoder_reward_continuation_heads": true,
+    "same_representation_objectives": true,
+    "same_optimizer_and_hyperparameters": true,
+    "same_data_and_minibatch_order_when_budget_allows": true,
+    "objective_required_head_exception_only": true,
+    "world_model_frozen_during_primary_actor_training": true,
+    "context_protocol": {
+      "primary_training_start_context": "clean_posterior_context_from_replay_after_burn_in",
+      "primary_rollout_context": "clean_observed_prefix_then_unmodified_generated_history",
+      "same_primary_context_for_both_arms": true,
+      "extra_context_noise_during_primary_evaluation": false,
+      "dreamer4_context_corruption_status": "paper_implementation_ambiguity",
+      "dreamer4_context_corruption_track": "optional_nonconfirmatory_sensitivity",
+      "dreamer4_context_corruption_may_support_primary_claim": false
+    },
+    "optimization": {
+      "optimizer": "library_custom_global_norm_clipped_Adam",
+      "gradient_clipping": "global_norm_before_Adam_moment_updates",
+      "weight_decay": 0.0,
+      "world_model_ema_enabled": false,
+      "world_model_ema_use": "none",
+      "slow_critic_ema_is_not_world_model_ema": true,
+      "shortcut_bootstrap_teacher": "stop_gradient_of_live_parameters_not_ema"
+    },
+    "end_to_end_sensitivity": {
+      "enabled": false,
+      "label": "optional_nonconfirmatory_sensitivity",
+      "may_support_primary_superiority_claim": false
+    },
+    "actor_critic": {
+      "algorithm": "shared_imagination_actor_critic",
+      "same_initialization_within_paired_cell": true,
+      "same_optimizer_and_hyperparameters": true,
+      "same_imagination_horizon": true,
+      "same_value_targets": true,
+      "same_return_normalization": true
+    }
+  },
+  "canonical_executable_config": {
+    "contract": "every_DreamerConfig_field_except_task_resolved_observation_shape_and_action_dim_is_explicit_and_no_library_default_may_be_inferred",
+    "task_shape_fields": ["observation_shape", "action_dim"],
+    "dreamer_config_non_task_shape_common": {
+      "deterministic_dim": 128,
+      "stochastic_dim": 32,
+      "embedding_dim": 128,
+      "hidden_dim": 256,
+      "min_std": 0.1,
+      "max_std": 2.0,
+      "kl_free_nats": 0.0,
+      "prior_scale": 1.0,
+      "representation_scale": 0.05,
+      "reconstruction_scale": 1.0,
+      "reward_scale": 1.0,
+      "reward_min": null,
+      "reward_max": null,
+      "reward_initial_value": 0.0,
+      "reward_output_init_scale": 0.0,
+      "reward_loss": "mse",
+      "continuation_scale": 1.0,
+      "overshooting_horizon": 1,
+      "burn_in": 8,
+      "overshooting_distances": [1],
+      "overshooting_scale": 0.0,
+      "imf_boundary_fraction": 0.5,
+      "imf_time_mean": -0.4,
+      "imf_time_std": 1.0,
+      "imf_adaptive_power": 1.0,
+      "imf_adaptive_epsilon": 0.01,
+      "imf_meanflow_scale": 1.0,
+      "imf_velocity_scale": 1.0,
+      "imf_noise_coupling": "independent",
+      "imf_endpoint_scale": 0.0,
+      "imf_shortcut_scale": 0.0,
+      "imf_signal_weight_floor": 1.0,
+      "imf_signal_weight_scale": 0.0,
+      "imf_sampling_steps": 1,
+      "imf_condition_gradient_scale": 1.0,
+      "imf_boundary_velocity_supervision": true,
+      "imf_trajectory_clean_probability": 0.3333333333333333,
+      "imf_trajectory_corrupted_probability": 0.3333333333333333,
+      "imf_trajectory_suffix_probability": 0.3333333333333333,
+      "imf_trajectory_history_noise_max": 1.0,
+      "shortcut_sampling_steps": 4,
+      "imagination_horizon": 15,
+      "discount": 0.99,
+      "lambda_": 0.95,
+      "actor_entropy_scale": 0.001,
+      "actor_init_scale": 0.01,
+      "actor_mean_bound": 5.0,
+      "actor_min_std": 0.1,
+      "actor_max_std": 1.0,
+      "actor_gradient": "reinforce",
+      "actor_action_l2_scale": 0.001,
+      "behavior_cloning_learning_rate": 0.0003,
+      "behavior_kl_scale": 0.0,
+      "pmpo_positive_temperature": 1.0,
+      "pmpo_negative_temperature": 1.0,
+      "pmpo_positive_weight": 1.0,
+      "pmpo_negative_weight": 1.0,
+      "imagination_start_mode": "one_per_sequence",
+      "critic_output_init_scale": 0.0,
+      "critic_bins": 1,
+      "critic_symlog_min": -20.0,
+      "critic_symlog_max": 20.0,
+      "actor_critic_warmup_steps": 0,
+      "slow_critic_fraction": 0.02,
+      "return_normalization_epsilon": 0.000001,
+      "model_learning_rate": 0.0003,
+      "actor_learning_rate": 0.0003,
+      "critic_learning_rate": 0.0003,
+      "grad_clip": 100.0,
+      "adam_beta1": 0.9,
+      "adam_beta2": 0.999,
+      "adam_epsilon": 0.00000001
+    },
+    "dreamer_config_arm_values": {
+      "shortcut_forcing": {
+        "prior": "shortcut",
+        "imf_trajectory_enabled": false,
+        "shortcut_training_k_max": {
+          "value_source": "immutable_pilot_selection_manifest",
+          "allowed_values": [4, 8, 16]
+        }
+      },
+      "trajectory_imf": {
+        "prior": "imf",
+        "imf_trajectory_enabled": true,
+        "shortcut_training_k_max": null
+      }
+    },
+    "candidate_override_mapping": {
+      "objective_loss_scale": "prior_scale",
+      "shortcut_forcing.training_k_max": "shortcut_training_k_max",
+      "trajectory_imf.imf_boundary_fraction": "imf_boundary_fraction"
+    },
+    "resolution_contract": {
+      "pilot_candidate_configs_are_complete_and_executable": true,
+      "confirmatory_execution_requires_immutable_selection_manifest": true,
+      "resolved_config_must_contain_exactly_all_75_non_task_shape_DreamerConfig_fields": true,
+      "selected_values_are_substituted_before_DreamerConfig_construction": true,
+      "unresolved_placeholders_or_unknown_keys_are_fatal": true,
+      "resolved_config_and_sha256_are_retained_per_run": true
+    },
+    "training_batch": {
+      "batch_size": 32,
+      "sequence_length": 32,
+      "burn_in": 8,
+      "loss_bearing_steps_per_sequence": 24,
+      "sampling": "uniform_contiguous_train_episode_chunks_with_reset_mask_and_no_train_test_crossing",
+      "short_episode_handling": "right_pad_and_zero_loss_mask"
+    },
+    "precision": {
+      "parameter_dtype": "float32",
+      "activation_dtype": "float32",
+      "optimizer_state_dtype": "float32",
+      "loss_accumulation_dtype": "float32",
+      "mixed_precision": false,
+      "jax_enable_x64": false
+    },
+    "optimizer_semantics": {
+      "implementation": "imf_dreamer_jax.optim.adam_update",
+      "gradient_transform": "global_norm_clip_at_DreamerConfig.grad_clip_before_first_and_second_moment_updates",
+      "update": "bias_corrected_Adam_parameter_minus_lr_mhat_over_(sqrt(vhat)+epsilon)",
+      "weight_decay": 0.0,
+      "world_model_ema": false,
+      "slow_critic_update": "slow=(1-slow_critic_fraction)*slow+slow_critic_fraction*online_after_each_critic_update"
+    },
+    "loss_semantics": {
+      "world_model_total": "reconstruction_scale*reconstruction+reward_scale*reward+continuation_scale*continuation+prior_scale*arm_prior+representation_scale*representation+overshooting_scale*overshooting",
+      "trajectory_prior": "imf_meanflow_scale*adaptive_normalized_u+imf_velocity_scale*adaptive_normalized_v_with_fixed_context_partial_JVP",
+      "trajectory_boundary_velocity_supervision": "forced_true_by_current_trajectory_world_model_path_and_equal_to_explicit_config_value",
+      "shortcut_prior": "published_Dreamer4_Equation_7_x_space_ramped_bootstrap_loss",
+      "behavior_prior": "disabled_behavior_kl_scale_zero_no_behavior_snapshot_passed",
+      "critic": "scalar_MSE_lambda_return_target_with_slow_critic_bootstrap",
+      "actor": "REINFORCE_likelihood_ratio_plus_entropy_and_pre_tanh_action_L2_with_fixed_denominator_survival_weights"
+    },
+    "primary_actor_execution": {
+      "world_model_parameters": "frozen_final_prespecified_checkpoint",
+      "start_context": "one_uniform_post_burn_in_posterior_state_per_replay_sequence",
+      "start_count_per_actor_update": 32,
+      "imagination_horizon": 15,
+      "sampler_by_arm": {"shortcut_forcing": "stochastic_4_step_shortcut_sampler", "trajectory_imf": "stochastic_1_step_iMF_sampler"},
+      "behavior_prior": "disabled",
+      "real_environment_evaluation_action": "deterministic_tanh_of_actor_mean",
+      "extra_generated_history_corruption": false
+    }
+  },
+  "parameter_matching": {
+    "primary_control": "identical_shared_trunk_dimensions",
+    "report_total_parameters": true,
+    "report_active_parameters": true,
+    "active_parameter_definition": "instantiated_parameters_reachable_by_a_structural_gradient_path_from_the_compiled_arm_loss",
+    "inactive_objective_heads_excluded_from_active_count": true,
+    "unused_arm_specific_heads_not_instantiated": true,
+    "report_compiled_forward_flops": true,
+    "report_compiled_forward_and_backward_train_flops": true,
+    "report_compiled_inference_flops_per_transition": true,
+    "objective_required_heads_may_differ": true,
+    "relative_active_parameter_gap_trigger": 0.02,
+    "triggered_sensitivity": "prespecified_joint_hidden_width_parameter_match_without_outcome_access",
+    "triggered_sensitivity_hidden_width_candidates": [240, 248, 256, 264, 272],
+    "triggered_sensitivity_selection_rule": "enumerate_all_25_shortcut_x_trajectory_width_pairs_then_minimize_relative_active_world_model_parameter_gap_then_sum_absolute_width_deviation_from_256_then_sum_compiler_train_flops_then_lexicographic_shortcut_width_trajectory_width_without_outcome_access",
+    "triggered_sensitivity_claim_role": "supporting_not_primary"
+  },
+  "compute_accounting": {
+    "compiler_api": "jax_jit_lower_compile_cost_analysis",
+    "counting_unit": "compiler_reported_flops_for_the_complete_compiled_update",
+    "world_model_update": {
+      "compiled_entrypoint": "jit_train_world_model",
+      "include_forward_and_backward": true,
+      "include_gradient_global_norm_clip_and_Adam_update": true,
+      "trajectory_imf_include_primal_and_tangent_work_of_JVP": true,
+      "shortcut_include_clean_target_and_both_sequential_half_step_bootstrap_calls": true,
+      "exclude_host_input_pipeline": true
+    },
+    "actor_critic_update": {
+      "compiled_entrypoint": "jit_train_actor_critic",
+      "include_forward_and_backward": true,
+      "include_actor_and_critic_losses_global_norm_clips_Adam_updates_and_slow_critic_update": true,
+      "imagined_rollouts_per_update": 2,
+      "start_states_per_rollout": 32,
+      "horizon": 15,
+      "imagined_transitions_per_update_formula": "2*batch_size*imagination_horizon",
+      "imagined_transitions_per_update": 960,
+      "prior_field_evaluations_per_transition": {"shortcut_forcing": 4, "trajectory_imf": 1},
+      "prior_field_evaluations_per_update": {"shortcut_forcing": 3840, "trajectory_imf": 960},
+      "report_imagined_transitions": true,
+      "report_prior_NFE": true,
+      "report_full_compiled_forward_backward_FLOPs": true,
+      "report_synchronized_walltime": true
+    },
+    "static_signature_record": {
+      "batch_size": 32,
+      "sequence_length": 32,
+      "burn_in": 8,
+      "imagination_start_shape": "[32,160]",
+      "observation_shape": "resolved_from_canonical_DMC_task_spec",
+      "action_dim": "resolved_from_canonical_DMC_task_spec",
+      "parameter_activation_optimizer_and_loss_dtype": "float32",
+      "device_platform_model_and_count_recorded": true,
+      "jax_and_xla_versions_recorded": true,
+      "arm_task_budget_track_and_NFE_are_static_signature_keys": true
+    },
+    "hlo_retention": {
+      "retain_unoptimized_and_optimized_HLO_text": true,
+      "retain_compiler_cost_analysis_JSON": true,
+      "retain_SHA256_for_each_HLO_and_cost_record": true
+    },
+    "walltime_protocol": {
+      "block_until_ready_before_and_after_timed_region": true,
+      "compile_time_excluded": true,
+      "warmup_updates": 10,
+      "timed_updates": 100,
+      "summary": "median_seconds_per_update_and_interquartile_range",
+      "same_exclusive_device_allocation": true
+    },
+    "equal_flop_allocation_costs": {
+      "world_model": "full_compiled_world_model_update_forward_backward_FLOPs",
+      "actor_critic": "full_compiled_actor_critic_update_forward_backward_FLOPs_including_all_imagined_transition_NFE",
+      "matched_separately": true,
+      "no_forward_only_or_NFE_proxy_allowed": true
+    }
+  },
+  "data": {
+    "suite": "DeepMind_Control_Suite_state_observations",
+    "tasks": [
+      "dmc_cartpole_swingup",
+      "dmc_ball_in_cup_catch",
+      "dmc_cheetah_run",
+      "dmc_walker_walk",
+      "dmc_finger_spin",
+      "dmc_hopper_hop"
+    ],
+    "task_registry": {
+      "dmc_cartpole_swingup": {"suite": "dm_control", "domain_name": "cartpole", "task_name": "swingup"},
+      "dmc_ball_in_cup_catch": {"suite": "dm_control", "domain_name": "ball_in_cup", "task_name": "catch"},
+      "dmc_cheetah_run": {"suite": "dm_control", "domain_name": "cheetah", "task_name": "run"},
+      "dmc_walker_walk": {"suite": "dm_control", "domain_name": "walker", "task_name": "walk"},
+      "dmc_finger_spin": {"suite": "dm_control", "domain_name": "finger", "task_name": "spin"},
+      "dmc_hopper_hop": {"suite": "dm_control", "domain_name": "hopper", "task_name": "hop"},
+      "dmc_reacher_easy": {"suite": "dm_control", "domain_name": "reacher", "task_name": "easy"},
+      "dmc_pendulum_swingup": {"suite": "dm_control", "domain_name": "pendulum", "task_name": "swingup"}
+    },
+    "task_shape_resolution": {
+      "observation_shape": "flattened_float32_observation_spec_in_sorted_mapping_key_order",
+      "action_dim": "flattened_float32_action_spec",
+      "record_resolved_shapes_in_run_manifest": true,
+      "fail_if_environment_spec_differs_within_task": true
+    },
+    "action_repeat": 1,
+    "native_episode_limit": 1000,
+    "confirmatory_replay_steps_per_task_world_seed": 500000,
+    "collection_policy": {
+      "kind": "seeded_uniform_smooth_mixture",
+      "uniform_probability": 0.7,
+      "smooth_probability": 0.3
+    },
+    "episode_split": {
+      "unit": "whole_episode",
+      "train_fraction": 0.8,
+      "test_fraction": 0.2,
+      "train_test_disjoint": true,
+      "normalization_statistics_from_train_only": true
+    },
+    "pairing": {
+      "dataset_content_addressed": true,
+      "identical_dataset_digest_across_arms_and_budget_tracks": true,
+      "identical_episode_split_across_arms_and_budget_tracks": true,
+      "identical_evaluation_starts_across_arms_and_nfe_points": true,
+      "equal_update_track_identical_minibatch_indices": true,
+      "equal_flop_track_common_minibatch_prefix": true
+    }
+  },
+  "randomness": {
+    "world_model_seeds": [17, 27, 37, 47, 57, 67, 77, 87, 97, 107],
+    "actor_seeds_nested_within_world_model_seed": [101, 202, 303],
+    "pilot_world_model_seeds": [211, 223, 227],
+    "pilot_actor_seeds_nested_within_world_model_seed": [311, 313],
+    "seed_derivation": "sha256_namespace_then_32_bit_numpy_or_environment_seed_and_64_bit_JAX_key_with_update_fold_in",
+    "independent_unit": "task_x_world_model_seed",
+    "paired_common_random_numbers": [
+      "dataset_collection",
+      "episode_split",
+      "minibatch_indices",
+      "model_initialization_for_shared_parameters",
+      "actor_initialization",
+      "base_gaussian_noise",
+      "canonical_schedule_uniforms",
+      "evaluation_starts",
+      "environment_evaluation_noise"
+    ]
+  },
+  "hyperparameter_policy": {
+    "primary_non_objective_hyperparameters_shared_across_arms": true,
+    "objective_specific_hyperparameters_may_differ": true,
+    "selection_profile": "pilot",
+    "selection_tasks": ["dmc_reacher_easy", "dmc_pendulum_swingup"],
+    "selection_world_model_seeds": [211, 223, 227],
+    "selection_actor_seeds_nested_within_world_model_seed": [311, 313],
+    "candidate_evaluations_per_arm": 12,
+    "equal_candidate_evaluations_per_arm": true,
+    "selection_budget_track": "equal_updates",
+    "selection_track_frozen_before_pilot_outcomes": true,
+    "search": {
+      "method": "exhaustive_frozen_cartesian_grid",
+      "shortcut_forcing": {
+        "training_k_max": [4, 8, 16],
+        "objective_loss_scale": [0.25, 0.5, 1.0, 2.0],
+        "cartesian_product": true,
+        "candidate_count": 12
+      },
+      "trajectory_imf": {
+        "imf_boundary_fraction": [0.25, 0.5, 0.75],
+        "objective_loss_scale": [0.25, 0.5, 1.0, 2.0],
+        "cartesian_product": true,
+        "candidate_count": 12
+      }
+    },
+    "selection_rule": "within_equal_updates_track_minimize_sum_of_pilot_ranks_for_rollout_auc_and_negative_nested_actor_return_then_lower_full_forward_backward_train_flops_then_lexicographic_config_hash",
+    "ranking_semantics": "ordinal_ranks_1_to_12_per_metric_with_ties_broken_by_lexicographic_config_hash_before_rank_sum",
+    "selection_aggregation": {
+      "unit_order": "protocol_selection_task_order_then_protocol_selection_world_model_seed_order",
+      "iqm_definition": "integral_of_empirical_quantile_function_over_0.25_to_0.75_divided_by_0.5_with_fractional_endpoint_weights",
+      "rollout_auc": "interquartile_mean_over_6_task_x_world_model_seed_units",
+      "actor_return": "arithmetic_mean_over_evaluation_episodes_within_actor_seed_then_arithmetic_mean_over_2_nested_actor_seeds_within_task_x_world_model_seed_then_interquartile_mean_over_6_task_x_world_model_seed_units",
+      "compiler_flops": "arithmetic_mean_over_6_task_x_world_model_seed_units"
+    },
+    "selected_candidate_materialization": "write_immutable_pilot_selection_manifest_then_resolve_complete_per_arm_DreamerConfig_before_unsealing_confirmatory_data",
+    "pilot_cells_disjoint_from_confirmatory_cells": true,
+    "confirmatory_data_checkpoints_and_outcomes_sealed_until_selection_frozen": true,
+    "no_task_specific_confirmatory_tuning": true,
+    "all_trials_and_selection_manifest_retained": true
+  },
+  "budget_track_order": [
+    "equal_updates",
+    "equal_compiler_flops"
+  ],
+  "budget_tracks": {
+    "equal_updates": {
+      "claim_role": "primary_objective_isolation_track",
+      "matching_unit": "optimizer_updates_and_data_exposure",
+      "world_model_updates_equal": true,
+      "actor_updates_equal": true,
+      "examples_per_update_equal": true,
+      "exact_minibatch_indices_equal": true,
+      "report_realized_compiler_flops": true,
+      "report_wall_clock": true,
+      "report_parameter_counts": true
+    },
+    "equal_compiler_flops": {
+      "claim_role": "required_compute_robustness_track",
+      "matching_unit": "compiler_reported_full_forward_backward_update_flops",
+      "cost_source": "jax_jit_lower_compile_cost_analysis_of_complete_forward_and_backward_world_model_and_actor_critic_updates_including_JVP_bootstrap_optimizer_and_imagined_transition_NFE",
+      "reference_arm": "shortcut_forcing",
+      "allocation_rule": "nearest_nonnegative_integer_updates_not_exceeding_reference_flops_when_tied",
+      "relative_tolerance": 0.002,
+      "world_model_and_actor_budgets_matched_separately": true,
+      "allocation_frozen_before_outcome_evaluation": true,
+      "common_minibatch_prefix": true,
+      "report_realized_updates": true,
+      "report_realized_compiler_flops": true,
+      "report_wall_clock": true,
+      "report_parameter_counts": true
+    }
+  },
+  "profiles": {
+    "smoke": {
+      "evidence_class": "engineering_smoke",
+      "claim_eligible": false,
+      "tasks": ["dmc_cartpole_swingup"],
+      "world_model_seeds": [17],
+      "actor_seeds_nested_within_world_model_seed": [101],
+      "replay_steps_per_task_world_seed": 200,
+      "rollout_windows_per_task_world_seed": 2,
+      "predictive_draws_per_window": 8,
+      "real_environment_evaluation_episodes": 1,
+      "budgets": {
+        "equal_updates": {
+          "world_model_updates": 2,
+          "actor_updates": 2
+        },
+        "equal_compiler_flops": {
+          "reference_world_model_updates": 2,
+          "reference_actor_updates": 2
+        }
+      }
+    },
+    "pilot": {
+      "evidence_class": "development_pilot",
+      "claim_eligible": false,
+      "tasks": ["dmc_reacher_easy", "dmc_pendulum_swingup"],
+      "world_model_seeds": [211, 223, 227],
+      "actor_seeds_nested_within_world_model_seed": [311, 313],
+      "replay_steps_per_task_world_seed": 50000,
+      "rollout_windows_per_task_world_seed": 64,
+      "predictive_draws_per_window": 32,
+      "real_environment_evaluation_episodes": 5,
+      "budgets": {
+        "equal_updates": {
+          "world_model_updates": 10000,
+          "actor_updates": 10000
+        },
+        "equal_compiler_flops": {
+          "reference_world_model_updates": 10000,
+          "reference_actor_updates": 10000
+        }
+      }
+    },
+    "confirmatory": {
+      "evidence_class": "confirmatory",
+      "claim_eligible": true,
+      "tasks": [
+        "dmc_cartpole_swingup",
+        "dmc_ball_in_cup_catch",
+        "dmc_cheetah_run",
+        "dmc_walker_walk",
+        "dmc_finger_spin",
+        "dmc_hopper_hop"
+      ],
+      "world_model_seeds": [17, 27, 37, 47, 57, 67, 77, 87, 97, 107],
+      "actor_seeds_nested_within_world_model_seed": [101, 202, 303],
+      "replay_steps_per_task_world_seed": 500000,
+      "rollout_windows_per_task_world_seed": 256,
+      "predictive_draws_per_window": 64,
+      "real_environment_evaluation_episodes": 10,
+      "budgets": {
+        "equal_updates": {
+          "world_model_updates": 100000,
+          "actor_updates": 100000
+        },
+        "equal_compiler_flops": {
+          "reference_world_model_updates": 100000,
+          "reference_actor_updates": 100000
+        }
+      }
+    }
+  },
+  "diagnostics": {
+    "required_before_confirmatory_interpretation": [
+      "deterministic_transition_diagnostic",
+      "genuinely_stochastic_transition_diagnostic"
+    ],
+    "deterministic_transition_diagnostic": {
+      "required": true,
+      "purpose": "detect_bias_and_compounding_error_without_aleatoric_ambiguity",
+      "equation": "x_(t+1)=0.85*x_t+0.10*tanh(2*x_t)+0.20*a_t",
+      "initial_state_distribution": "x_0~Uniform(-1,1)",
+      "action_process": "a_t=clip(0.6*sin(0.17*t+phi)+0.2*u_t,-1,1),phi~Uniform(0,2*pi),u_t~Uniform(-1,1)",
+      "episode_length": 64,
+      "training_episodes": 4096,
+      "test_initial_conditions": 512,
+      "repeated_futures_per_identical_condition": 1,
+      "world_model_updates": 20000,
+      "actor_updates": 0,
+      "estimands": ["one_step_normalized_RMSE", "horizon_30_normalized_RMSE", "normalized_rollout_error_AUC", "horizon_30_to_horizon_1_error_ratio"],
+      "interpretation_thresholds": {"one_step_normalized_RMSE_max": 0.05, "horizon_30_normalized_RMSE_max": 0.25, "horizon_30_to_horizon_1_error_ratio_max": 5.0},
+      "threshold_role": "engineering_interpretation_only_non_primary"
+    },
+    "genuinely_stochastic_transition_diagnostic": {
+      "required": true,
+      "purpose": "test_distributional_fidelity_and_calibration_under_aleatoric_branching",
+      "mechanisms": ["exogenous_Bernoulli_branch", "exogenous_Gaussian_innovation"],
+      "equation": "b_t~Bernoulli(sigmoid(2*x_t+0.5*a_t));eta_t~Normal(0,0.15^2);x_(t+1)=0.70*x_t+0.20*a_t+0.60*(2*b_t-1)+eta_t",
+      "initial_state_distribution": "x_0~Uniform(-1,1)",
+      "action_process": "a_t=clip(0.6*sin(0.17*t+phi)+0.2*u_t,-1,1),phi~Uniform(0,2*pi),u_t~Uniform(-1,1)",
+      "episode_length": 64,
+      "training_episodes": 8192,
+      "test_conditions": 512,
+      "repeated_futures_per_identical_condition": 64,
+      "predictive_draws_per_condition": 64,
+      "oracle_reference_futures_per_condition": 64,
+      "evaluation_futures_per_condition": 64,
+      "rollout_horizons": [1, 2, 4, 8, 15, 30],
+      "branch_probability_calibration_bins": 10,
+      "identical_condition_and_action_prefix": true,
+      "world_model_updates": 40000,
+      "actor_updates": 0,
+      "estimands": ["energy_score_over_oracle_ratio_horizon_1", "energy_score_over_oracle_ratio_horizon_8", "energy_score_over_oracle_ratio_horizon_30", "central_90_percent_interval_coverage_horizon_1", "central_90_percent_interval_coverage_horizon_8", "central_90_percent_interval_coverage_horizon_30", "branch_probability_expected_calibration_error", "normalized_rollout_error_AUC"],
+      "interpretation_thresholds": {"energy_score_over_oracle_ratio_horizon_1_max": 1.25, "energy_score_over_oracle_ratio_horizon_8_max": 1.25, "energy_score_over_oracle_ratio_horizon_30_max": 1.25, "central_90_percent_interval_coverage_horizon_1_min": 0.85, "central_90_percent_interval_coverage_horizon_1_max": 0.95, "central_90_percent_interval_coverage_horizon_8_min": 0.85, "central_90_percent_interval_coverage_horizon_8_max": 0.95, "central_90_percent_interval_coverage_horizon_30_min": 0.85, "central_90_percent_interval_coverage_horizon_30_max": 0.95, "branch_probability_expected_calibration_error_max": 0.05},
+      "interpretation_pass_rule": "all_registered_energy_score_ratios_at_horizons_1_8_30_are_at_most_their_maxima_and_all_registered_coverages_are_within_their_inclusive_minima_and_maxima_and_branch_probability_expected_calibration_error_is_at_most_its_maximum",
+      "threshold_role": "engineering_interpretation_only_non_primary"
+    },
+    "diagnostic_budget_track": "equal_updates",
+    "diagnostic_scores_may_substitute_for_primary_outcomes": false,
+    "diagnostic_thresholds_may_pass_or_fail_superiority_claim": false
+  },
+  "evaluation": {
+    "world_model_checkpoint": "final_prespecified_training_update",
+    "actor_checkpoint": "final_prespecified_training_update",
+    "rollout_context_length": 8,
+    "rollout_horizons": [1, 2, 4, 8, 15, 30],
+    "rollout_metric": {
+      "name": "normalized_free_running_rollout_error_auc",
+      "direction": "lower_is_better",
+      "free_running_after_context": true,
+      "normalizer": "per_dimension_training_split_standard_deviation_clipped_below_1e-6",
+      "per_horizon_formula": "e(h)=(1/(W*M*D))*sum_w,sum_m,sum_d[((xhat_(w,m,h,d)-x_(w,h,d))/max(training_split_std_d,1e-6))^2]",
+      "auc_formula": "AUC=(1/(h_last-h_first))*sum_i[0.5*(e(h_i)+e(h_(i+1)))*(h_(i+1)-h_i)]_for_h=[1,2,4,8,15,30]",
+      "within_task_world_seed_estimand": "one_AUC_after_averaging_all_prespecified_windows_draws_and_dimensions",
+      "cross_task_seed_aggregation": "IQM_of_the_6_tasks_by_10_world_model_seeds_matrix",
+      "aggregation": "normalized_trapezoidal_AUC_over_prespecified_native_step_horizons"
+    },
+    "actor_metric": {
+      "name": "real_environment_normalized_return_iqm",
+      "direction": "higher_is_better",
+      "world_model_frozen": true,
+      "normalization": "dmc_episodic_return_divided_by_1000",
+      "episode_aggregation_within_actor_seed": "arithmetic_mean_of_10_normalized_episode_returns",
+      "nested_actor_seed_aggregation": "arithmetic_mean_of_the_3_actor_seed_episode_means_within_each_task_world_model_seed_arm_cell",
+      "matrix_construction": "assemble_the_nested_actor_means_as_a_6_task_by_10_world_model_seed_matrix_per_arm_and_budget_track",
+      "task_seed_aggregation": "interquartile_mean_of_the_60_matrix_entries_with_symmetric_25_percent_trimming",
+      "hierarchy": "episode_to_actor_seed_mean_to_nested_actor_mean_to_6x10_matrix_to_IQM"
+    },
+    "nfe_frontier": [1, 2, 4],
+    "primary_nfe": {
+      "shortcut_forcing": 4,
+      "trajectory_imf": 1
+    },
+    "secondary_metrics": [
+      "rollout_error_at_each_horizon",
+      "reward_prediction_error",
+      "continuation_prediction_error",
+      "energy_score",
+      "central_90_percent_interval_coverage",
+      "central_90_percent_interval_width",
+      "central_90_percent_interval_calibration_absolute_error_at_each_horizon",
+      "continuation_predictive_mean_brier_at_each_horizon",
+      "inference_field_evaluations_per_transition",
+      "total_parameters",
+      "active_parameters",
+      "compiler_reported_forward_flops",
+      "compiler_reported_forward_and_backward_train_flops",
+      "compiler_reported_inference_flops_per_transition",
+      "actor_imagined_transitions_per_update",
+      "actor_prior_field_evaluations_per_update",
+      "compiler_reported_actor_critic_forward_and_backward_train_flops",
+      "synchronized_update_wall_clock_seconds",
+      "wall_clock_seconds"
+    ],
+    "paired_evaluation_starts_and_environment_noise": true,
+    "raw_predictive_draws_retained": true,
+    "raw_action_traces_retained": true
+  },
+  "statistics": {
+    "independent_experimental_unit": "task_x_world_model_seed",
+    "actor_seeds_are_nested_not_independent_replicates": true,
+    "paired_contrasts_within_task_world_seed": true,
+    "bootstrap": {
+      "method": "task_stratified_paired_percentile_bootstrap",
+      "resamples": 20000,
+      "seed": 271828,
+      "resample_world_model_seeds_within_task": true,
+      "world_model_indices_drawn_per_task_per_replicate": 10,
+      "same_resampled_world_model_indices_applied_jointly_to_both_arms": true,
+      "actor_seeds_resampled": false,
+      "tasks_resampled": false,
+      "retain_task_weights": true,
+      "recompute_each_arm_6x10_matrix_IQM_then_the_paired_arm_difference_each_replicate": true,
+      "two_sided_percentile_lower_quantile": 0.00625,
+      "two_sided_percentile_upper_quantile": 0.99375
+    },
+    "multiplicity": {
+      "family": "two_primary_metrics_by_two_budget_tracks",
+      "number_of_confirmatory_intervals": 4,
+      "familywise_confidence": 0.95,
+      "interval_confidence": 0.9875,
+      "two_sided_tail_probability_each": 0.00625,
+      "reported_percentiles": [0.625, 99.375],
+      "correction": "bonferroni"
+    },
+    "primary_contrasts": {
+      "normalized_free_running_rollout_error_auc": {
+        "formula": "IQM_6x10(shortcut_forcing_AUC)-IQM_6x10(trajectory_imf_AUC)",
+        "favorable_direction": "positive"
+      },
+      "real_environment_normalized_return_iqm": {
+        "formula": "IQM_6x10(trajectory_imf_nested_actor_returns)-IQM_6x10(shortcut_forcing_nested_actor_returns)",
+        "favorable_direction": "positive"
+      }
+    },
+    "practical_significance": {
+      "status": "frozen_before_pilot_or_confirmatory_outcomes",
+      "claim_role": "descriptive_interpretation_gate_not_a_substitute_for_adjusted_confidence_intervals",
+      "required_budget_tracks": ["equal_updates", "equal_compiler_flops"],
+      "thresholds": {
+        "normalized_free_running_rollout_error_auc": {
+          "minimum_absolute_iqm_contrast": 0.05,
+          "minimum_relative_iqm_reduction": 0.10,
+          "relative_denominator": "shortcut_forcing_rollout_auc_clipped_below_1e-6"
+        },
+        "real_environment_normalized_return_iqm": {
+          "minimum_absolute_iqm_contrast": 0.05,
+          "raw_dmc_return_equivalent": 50.0
+        }
+      },
+      "criterion": "all_required_point_estimate_thresholds_met_on_both_budget_tracks",
+      "threshold_failure_blocks_practically_meaningful_wording": true
+    },
+    "superiority_rule": {
+      "eligible_evidence_class": "confirmatory",
+      "primary_objective_isolation_track": "equal_updates",
+      "required_compute_robustness_track": "equal_compiler_flops",
+      "required_budget_tracks": ["equal_updates", "equal_compiler_flops"],
+      "required_primary_metrics": [
+        "normalized_free_running_rollout_error_auc",
+        "real_environment_normalized_return_iqm"
+      ],
+      "criterion": "every_required_finite_interval_has_lower_bound_strictly_greater_than_zero",
+      "conjunctive": true,
+      "missing_or_nonfinite_is_failure": true,
+      "secondary_metrics_may_substitute": false,
+      "compensating_wins_allowed": false,
+      "smoke_or_pilot_may_support_claim": false
+    },
+    "report_raw_seed_values": true,
+    "report_final_checkpoint_only_for_primary_inference": true
+  },
+  "provenance": {
+    "hash_algorithm": "sha256",
+    "artifacts_immutable_after_registration": true,
+    "atomic_manifest_write": true,
+    "required_artifacts": [
+      "frozen_protocol",
+      "source_commit_and_dirty_patch",
+      "dependency_lock",
+      "hardware_and_software_environment",
+      "dataset_payload_and_digest",
+      "episode_split_indices",
+      "minibatch_indices",
+      "sampled_objective_noise_times_and_step_sizes",
+      "evaluation_start_indices",
+      "evaluation_episode_seeds",
+      "compiler_ir_and_cost_analysis",
+      "world_model_and_actor_checkpoints",
+      "parameter_tree_hashes_and_counts",
+      "hpo_trial_metrics_and_selection_manifest",
+      "resolved_per_arm_DreamerConfig_and_sha256",
+      "unoptimized_and_optimized_HLO_with_sha256",
+      "full_update_compute_and_synchronized_walltime_records",
+      "diagnostic_raw_samples_estimands_and_threshold_interpretations",
+      "raw_predictive_draws",
+      "raw_action_traces",
+      "raw_per_seed_primary_and_secondary_metrics",
+      "bootstrap_draw_indices_and_intervals",
+      "machine_readable_summary_and_human_report"
+    ],
+    "manifest_records_relative_path_size_and_sha256": true,
+    "content_addressed_dataset_and_checkpoints": true
+  },
+  "video_track": {
+    "execution": "optional_separately_labeled_extension",
+    "required_before_broad_video_world_model_claims": true,
+    "minimum_requirements": [
+      "pixel_observations",
+      "temporally_coherent_free_running_video_rollouts",
+      "perceptual_and_task_relevant_fidelity_metrics",
+      "the_same_nfe_frontier_and_compute_tracks"
+    ],
+    "may_support_state_control_superiority_without_execution": false
+  }
+}

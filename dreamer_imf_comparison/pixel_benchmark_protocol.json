@@ -1,0 +1,271 @@
+{
+  "schema_version": "trajectory-imf-pixel-secondary-v1",
+  "study_role": {
+    "evidence_class": "secondary_hard_visual_evaluation",
+    "claim_eligible_for_primary_gate": false,
+    "non_substitution": "No pixel-track result, positive or negative, substitutes for any of the four prespecified six-task primary intervals in matched_objective_protocol.json.",
+    "comparison": "paper-derived Dreamer-4 Equation-(7)-style shortcut forcing versus trajectory iMF in the same compact recurrent world model"
+  },
+  "base_model_contract": {
+    "path": "matched_objective_protocol.json",
+    "sha256": "b9b3296cd4ae3ca81e55053f3caa827d1ed05d9a8a6025a10654cbfe81e0fa4b",
+    "common_config_pointer": "canonical_executable_config.dreamer_config_non_task_shape_common",
+    "shortcut_overrides": {
+      "prior": "shortcut",
+      "imf_trajectory_enabled": false,
+      "shortcut_training_k_max": 4,
+      "shortcut_sampling_steps": 4,
+      "imf_sampling_steps": 1,
+      "prior_scale": 1.0
+    },
+    "trajectory_overrides": {
+      "prior": "imf",
+      "imf_trajectory_enabled": true,
+      "shortcut_training_k_max": null,
+      "shortcut_sampling_steps": 4,
+      "imf_sampling_steps": 1,
+      "imf_boundary_fraction": 0.5,
+      "prior_scale": 1.0
+    },
+    "arm_order": [
+      "shortcut_forcing",
+      "trajectory_imf"
+    ],
+    "shared_initialization": "identical initialization seed; all same-shaped shared trunk tensors must be bit-identical before training",
+    "objective_rng_pairing": "one retained per-update JAX key schedule shared by arm"
+  },
+  "environment": {
+    "suite": "DeepMind Control Suite",
+    "tasks": {
+      "dmc_walker_walk": {
+        "camera_id": 0
+      },
+      "dmc_cheetah_run": {
+        "camera_id": 0
+      },
+      "dmc_finger_spin": {
+        "camera_id": 0
+      },
+      "dmc_pendulum_swingup": {
+        "camera_id": 0,
+        "smoke_only": true
+      }
+    },
+    "normalized_action_input": [-1.0, 1.0],
+    "action_repeat": 2,
+    "native_termination": true,
+    "time_limit_override": null,
+    "reward_aggregation": "sum over executed native steps",
+    "continuation_aggregation": "product of native discounts over executed native steps",
+    "terminal_repeat_rule": "stop the repeat loop immediately after the first LAST time step",
+    "reset_action": "all-zero normalized action aligned with the reset observation",
+    "reset_frame_stack": "repeat the first rendered frame exactly frame_stack times",
+    "exploration_policy": {
+      "name": "clipped_gaussian_ar1",
+      "coefficient": 0.8,
+      "innovation_scale": 0.6,
+      "reset_state": 0.0,
+      "clip": [-1.0, 1.0]
+    }
+  },
+  "rendering": {
+    "raw_height": 64,
+    "raw_width": 64,
+    "channels": 3,
+    "channel_order": "RGB",
+    "dtype": "uint8",
+    "render_point": "after reset and after the final executed native step of each repeated action",
+    "hard_backend": "egl",
+    "local_smoke_backend": "glfw",
+    "backend_environment_variable": "MUJOCO_GL",
+    "camera_source": "environment.tasks.<task>.camera_id",
+    "depth": false,
+    "segmentation": false
+  },
+  "observation": {
+    "model_height": 32,
+    "model_width": 32,
+    "downsampling": "non-overlapping integer 2x2 area mean with round-half-up in uint arithmetic",
+    "frame_stack": 3,
+    "stack_axis": "channels_oldest_to_newest",
+    "model_shape": [32, 32, 9],
+    "training_storage_dtype": "uint8",
+    "jax_preprocessing": "astype(float32)/255.0",
+    "decoder_target_range": [0.0, 1.0],
+    "visual_metric_frame": "newest RGB frame only"
+  },
+  "evaluation": {
+    "context_length": 8,
+    "horizons": [1, 2, 4, 8, 15, 30, 60],
+    "nfe_frontier": [1, 2, 4],
+    "primary_nfe": {
+      "shortcut_forcing": 4,
+      "trajectory_imf": 1
+    },
+    "window_rule": "uniform without replacement from held-out windows whose context and complete 60-step suffix lie in one episode",
+    "paired_windows_actions_context_keys_and_base_noise": true,
+    "metrics": {
+      "normalized_visual_mse": "mean over newest-frame RGB pixels and predictive draws of squared error divided per channel by training-pixel variance clipped below 0.0004",
+      "predictive_mean_psnr_db": "10*log10(1/MSE) after clipping the predictive mean and target to [0,1]",
+      "predictive_mean_global_ssim": "per-image RGB global SSIM with C1=0.0001 and C2=0.0009, then arithmetic mean over windows",
+      "energy_score": "mean normalized pixel L2 distance from predictive draws to target minus half the mean normalized distance between all ordered distinct draw pairs",
+      "temporal_difference_mse": "MSE between predicted and true newest-frame changes across successive registered horizons",
+      "auc": "normalized trapezoidal AUC of normalized_visual_mse over registered horizons"
+    },
+    "raw_retention": "targets, context, future actions, posterior keys, base noise, every arm/NFE prediction at registered horizons, and per-window metrics"
+  },
+  "analysis": {
+    "independent_unit": "task_by_registered_world_model_seed",
+    "paired_primary_visual_contrast": "shortcut_forcing_4NFE_normalized_visual_mse_AUC minus trajectory_imf_1NFE_normalized_visual_mse_AUC; positive favors trajectory iMF",
+    "aggregation": "interquartile mean with exact symmetric 25 percent fractional trimming over the 3 task by 5 seed matrix",
+    "uncertainty": "paired hierarchical percentile bootstrap resampling tasks and then seeds within each sampled task",
+    "bootstrap_draws": 10000,
+    "confidence_level": 0.95,
+    "bootstrap_seed": 704729,
+    "multiplicity_role": "descriptive secondary interval; it cannot enter or alter the primary four-interval family"
+  },
+  "compute": {
+    "tracks": [
+      "equal_updates",
+      "equal_compiler_flops"
+    ],
+    "equal_updates": "both arms receive the frozen reference update count",
+    "equal_compiler_flops": "shortcut receives the frozen reference count; trajectory receives floor(reference_count*shortcut_train_flops/trajectory_train_flops), at least one",
+    "compiler_measure": "XLA cost_analysis FLOPs for a full jitted forward-and-backward Adam world-model update",
+    "inference_measure": "retain raw XLA cost_analysis for the complete transition and a structural NFE-adjusted value equal to one-NFE transition FLOPs plus (NFE-1) times separately compiled prior-field FLOPs; this avoids treating loop-body-once XLA accounting as multi-NFE cost",
+    "reported": [
+      "total_and_active_parameter_counts",
+      "compiler_train_flops_per_update",
+      "allocated_updates",
+      "realized_compiler_train_flops",
+      "compiler_inference_flops_per_transition_at_1_2_4_nfe",
+      "nfe_adjusted_inference_flops_per_transition_at_1_2_4_nfe",
+      "separately_compiled_prior_field_flops",
+      "prior_field_evaluations_per_transition",
+      "synchronized_training_wall_seconds"
+    ]
+  },
+  "runtime_contract": {
+    "jax_enable_x64": false,
+    "smoke": {
+      "claim_eligible": false,
+      "allowed_backends": ["cpu", "gpu"],
+      "version_binding": "informational_only",
+      "device_binding": "informational_only",
+      "visible_device_count": null
+    },
+    "hard": {
+      "claim_eligible": false,
+      "backend": "gpu",
+      "visible_device_count": 1,
+      "device_platforms": ["gpu"],
+      "device_kind_substring": "L40S",
+      "versions": {
+        "python": "3.12.3",
+        "jax": "0.8.1",
+        "jaxlib": "0.8.1",
+        "numpy": "2.5.3",
+        "dm_control": "1.0.46",
+        "mujoco": "3.13.0"
+      },
+      "environment": {
+        "JAX_ENABLE_X64": "0",
+        "JAX_PLATFORM_NAME": "gpu",
+        "MUJOCO_GL": "egl"
+      },
+      "cuda_visible_devices": "one nonempty selector other than -1 or NoDevFiles, with no comma"
+    }
+  },
+  "profiles": {
+    "smoke": {
+      "claim_eligible": false,
+      "tasks": [
+        "dmc_pendulum_swingup"
+      ],
+      "seeds": [7],
+      "tracks": [
+        "equal_updates"
+      ],
+      "training_observations": 24,
+      "heldout_observations": 24,
+      "reference_updates": 1,
+      "batch_size": 1,
+      "sequence_length": 8,
+      "burn_in": 2,
+      "context_length": 3,
+      "horizons": [1, 2, 4],
+      "windows": 1,
+      "predictive_draws": 2,
+      "model_overrides": {
+        "deterministic_dim": 16,
+        "stochastic_dim": 4,
+        "embedding_dim": 16,
+        "hidden_dim": 32,
+        "imagination_horizon": 5
+      },
+      "evidence_label": "real-render engineering smoke; never scientific evidence"
+    },
+    "hard": {
+      "claim_eligible": false,
+      "tasks": [
+        "dmc_walker_walk",
+        "dmc_cheetah_run",
+        "dmc_finger_spin"
+      ],
+      "seeds": [19, 29, 39, 49, 59],
+      "tracks": [
+        "equal_updates",
+        "equal_compiler_flops"
+      ],
+      "training_observations": 100000,
+      "heldout_observations": 5000,
+      "reference_updates": 20000,
+      "batch_size": 32,
+      "sequence_length": 32,
+      "burn_in": 8,
+      "context_length": 8,
+      "horizons": [1, 2, 4, 8, 15, 30, 60],
+      "windows": 32,
+      "predictive_draws": 8,
+      "model_overrides": {},
+      "evidence_label": "secondary hard visual evaluation"
+    }
+  },
+  "randomness": {
+    "derivation": "SHA-256 domain-separated uint32 pairs for JAX; SHA-256 domain-separated uint64 for NumPy",
+    "environment_seed_formula": "uint64_big_endian(SHA256(canonical_json(['pixel-benchmark', domain, task, registered_seed])) first 8 bytes) modulo (2^32-1)",
+    "environment_seed_domains": {
+      "training": "environment-train",
+      "heldout": "environment-heldout"
+    },
+    "domains": [
+      "environment-train",
+      "environment-heldout",
+      "exploration-train",
+      "exploration-heldout",
+      "world-init",
+      "compile",
+      "batch-schedule",
+      "world-objective",
+      "evaluation-window",
+      "posterior-context",
+      "evaluation-noise",
+      "aggregate-bootstrap"
+    ],
+    "environment_train_heldout_disjoint": true
+  },
+  "provenance": {
+    "exact_protocol_copy": true,
+    "source_sha256_manifest": true,
+    "runtime_and_dependency_versions": true,
+    "dataset_and_schedule_sha256": true,
+    "objective_key_sha256": true,
+    "checkpoint_sha256": true,
+    "raw_prediction_sha256": true,
+    "checkpoint_recomputation_required": true,
+    "environment_replay_from_retained_actions_and_seeds_required": true,
+    "manifest_exact_file_set": true,
+    "seal_binds_manifest_sha256": true,
+    "mutation_after_seal": "fatal"
+  }
+}

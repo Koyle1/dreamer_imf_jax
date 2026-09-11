@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dreamer-imf-comparison"
+version = "0.1.0"
+description = "Matched-compute trajectory-iMF world-model research benchmarks"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = [
+  "jax>=0.4.35",
+  "numpy>=1.26",
+  "dm-control>=1.0.14",
+]
+
+[tool.setuptools]
+packages = ["dreamer_imf_compare"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

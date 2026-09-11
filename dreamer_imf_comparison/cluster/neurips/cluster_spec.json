@@ -1,0 +1,123 @@
+{
+  "schema_version": "trajectory-imf-neurips-cluster-spec-v1",
+  "status": "frozen_before_cluster_execution",
+  "site": "Leipzig login01",
+  "workspace_root": "/work2/ci72buri-dreamer_imf_neurips",
+  "source_root": "/work2/ci72buri-dreamer_imf_neurips/source",
+  "environment_root": "/work2/ci72buri-dreamer_imf_neurips/venv-cuda12",
+  "state_root": "/work2/ci72buri-dreamer_imf_neurips/cluster_state",
+  "results_root": "/work2/ci72buri-dreamer_imf_neurips/results",
+  "repository_url": "https://github.com/Koyle1/dreamer_imf_jax",
+  "scheduler": {
+    "account": "dep_inin_dat",
+    "partition": "gpu-l40s",
+    "gpu_resource": "gpu:1",
+    "gpu_model_substring": "L40S",
+    "cpus_per_task": 8,
+    "memory": "64G",
+    "time_limit": "2-00:00:00",
+    "array_concurrency": 4,
+    "dependency_type": "afterok",
+    "forbidden_dependency_types": ["aftercorr"]
+  },
+  "python_module": "Python/3.12.3-GCCcore-13.3.0",
+  "runtime": {
+    "python": "3.12.3",
+    "jax": "0.8.1",
+    "jaxlib": "0.8.1",
+    "numpy": "2.5.3",
+    "dm-control": "1.0.46",
+    "mujoco": "3.13.0",
+    "environment": {
+      "JAX_ENABLE_X64": "0",
+      "JAX_PLATFORM_NAME": "gpu",
+      "MUJOCO_GL": "egl"
+    }
+  },
+  "matched_objective": {
+    "stage_order": ["dataset", "compute_plan", "world_model", "rollout", "actor"],
+    "pilot": {
+      "output_name": "matched_objective_pilot",
+      "expected_total_cells": 606,
+      "expected_stage_counts": {
+        "dataset": 6,
+        "compute_plan": 24,
+        "world_model": 144,
+        "rollout": 144,
+        "actor": 288
+      }
+    },
+    "confirmatory": {
+      "output_name": "matched_objective_confirmatory",
+      "expected_total_cells": 1746,
+      "expected_stage_counts": {
+        "dataset": 60,
+        "compute_plan": 6,
+        "world_model": 240,
+        "rollout": 720,
+        "actor": 720
+      }
+    }
+  },
+  "supplementary": {
+    "controls": {
+      "stage_order": ["dataset", "compute", "world", "rollout", "actor"],
+      "development": {
+        "output_name": "controls_development",
+        "expected_execution_units": 944,
+        "expected_stage_counts": {
+          "dataset": 6,
+          "compute": 2,
+          "world": 234,
+          "rollout": 234,
+          "actor": 468
+        },
+        "requires": ["matched_objective_pilot_verified"]
+      },
+      "confirmatory": {
+        "output_name": "controls_confirmatory",
+        "expected_execution_units": 3666,
+        "expected_stage_counts": {
+          "dataset": 60,
+          "compute": 6,
+          "world": 720,
+          "rollout": 720,
+          "actor": 2160
+        },
+        "requires": [
+          "matched_objective_pilot_verified",
+          "matched_objective_confirmatory_verified",
+          "controls_development_verified_and_selection_frozen"
+        ]
+      },
+      "stage_array_concurrency": {
+        "dataset": 4,
+        "compute": 1,
+        "world": 4,
+        "rollout": 4,
+        "actor": 4
+      }
+    },
+    "pixel": {
+      "profile": "hard",
+      "output_name": "pixel_hard",
+      "tasks": ["dmc_walker_walk", "dmc_cheetah_run", "dmc_finger_spin"],
+      "seeds": [19, 29, 39, 49, 59],
+      "tracks": ["equal_updates", "equal_compiler_flops"],
+      "expected_artifacts": 30,
+      "requires": ["matched_objective_pilot_verified"]
+    }
+  },
+  "workspace_allocator": {
+    "id": "dreamer_imf_neurips",
+    "comment": "Trajectory iMF NeurIPS matched-compute benchmark",
+    "timezone": "Europe/Berlin",
+    "minimum_remaining_hours": 168,
+    "minimum_available_extensions": 0,
+    "quota_filesystem": "/work2",
+    "quota_user": "ci72buri",
+    "minimum_block_limit_kib": 5368709120,
+    "minimum_inode_limit": 10000000
+  },
+  "minimum_free_workspace_bytes": 107374182400
+}
