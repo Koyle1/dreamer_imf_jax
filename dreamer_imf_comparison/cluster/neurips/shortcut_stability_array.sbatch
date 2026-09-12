@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=08:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --output=/work2/ci72buri-dreamer_imf_neurips/logs/%x-%A_%a.out
 #SBATCH --error=/work2/ci72buri-dreamer_imf_neurips/logs/%x-%A_%a.err
 
