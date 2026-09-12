@@ -156,10 +156,13 @@ def build_manifest(
         },
         "epistemic_penalty_scales": [float(value) for value in epistemic_scales],
         "shared_probe": {
-            "states": 16,
-            "candidates": "replay_plus_coordinatewise_minus_plus_0.1",
+            "states": 32,
+            "candidate_pool_size": 256,
+            "selection": "top_simulator_return_range_at_horizon_15_model_independent",
+            "candidates": "replay_plus_coordinatewise_minus_plus_0.5_for_first_5_steps",
             "horizons": [1, 3, 5, 15],
             "draws": 8,
+            "minimum_informative_fraction": 0.5,
             "policy_independent": True,
         },
         "source_artifacts": sources,
@@ -255,6 +258,10 @@ def prepare_probe_bank(
         action_repeat=action_repeat,
         probes=manifest["shared_probe"]["states"],
         horizons=manifest["shared_probe"]["horizons"],
+        action_delta=0.5,
+        intervention_steps=5,
+        selection_pool_multiplier=8,
+        minimum_informative_fraction=manifest["shared_probe"]["minimum_informative_fraction"],
         stochastic_dim=stochastic_dims.pop(),
         draws=manifest["shared_probe"]["draws"],
     )
@@ -263,7 +270,7 @@ def prepare_probe_bank(
         task=TASK,
         world_model_seed=seed,
         dataset_sha256=source["dataset_sha256"],
-        action_delta=0.1,
+        action_delta=0.5,
     )
     directory.mkdir(parents=True, exist_ok=True)
     benchmark._write_npz_atomic(bank_path, bank)

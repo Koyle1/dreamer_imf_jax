@@ -30,11 +30,16 @@ must have exactly zero parameter delta. Horizons 5 and 15 are separate cells.
 ## 2. Shared fixed probe bank
 
 The probe bank is constructed before checkpoint evaluation and contains only
-test-split replay state indices, the replay action plus coordinatewise
-\(\pm0.1\) alternatives, shared replay-action suffixes, horizons 1/3/5/15,
+test-split replay state indices, the replay suffix plus coordinatewise
+\(\pm0.5\) alternatives for a fixed five-step prefix, horizons 1/3/5/15,
 simulator returns, and standard-normal model draws. The same bank digest is
 required for shortcut forcing, original trajectory-iMF, and causal
 trajectory-iMF. No learned policy selects a state or action in this evaluation.
+To avoid a vacuous diagnostic on Reacher's large flat-reward region, 32 probes
+are selected from 256 deterministic replay locations by simulator return range
+at horizon 15 before any checkpoint is loaded. At least half must be
+informative or the stage fails. This is a model-independent stratified
+action-sensitivity diagnostic, not an estimate over the natural state distribution.
 
 Reported metrics include informative-pair accuracy, statewise rank behavior,
 top-1 simulator regret, action-independent flatness, and horizon dependence.

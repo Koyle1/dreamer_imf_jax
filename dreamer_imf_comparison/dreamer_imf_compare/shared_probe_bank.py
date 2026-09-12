@@ -17,7 +17,7 @@ from .matched_objective_benchmark import (
 from .policy_alignment_diagnostics import action_ranking_metrics
 
 
-SCHEMA = "trajectory-imf-shared-probe-bank-v1"
+SCHEMA = "trajectory-imf-shared-probe-bank-v2"
 
 
 def _json_digest(value: Mapping[str, Any]) -> str:
@@ -32,7 +32,8 @@ def build_probe_plan(
     world_model_seed: int,
     probes: int = 16,
     horizons: Sequence[int] = (1, 3, 5, 15),
-    action_delta: float = 0.1,
+    action_delta: float = 0.5,
+    intervention_steps: int = 5,
     stochastic_dim: int = 16,
     draws: int = 8,
     episode_ids_key: str = "test_episode_ids",
@@ -46,6 +47,8 @@ def build_probe_plan(
         raise ValueError("probe counts, horizons, draws, and stochastic_dim must be positive")
     if not 0.0 < action_delta <= 1.0:
         raise ValueError("action_delta must lie in (0, 1]")
+    if not 0 < intervention_steps <= ordered_horizons[-1]:
+        raise ValueError("intervention_steps must lie in [1, maximum_horizon]")
     observations = np.asarray(arrays["observations"])
     actions = np.asarray(arrays["actions"], dtype=np.float32)
     if episode_ids_key not in ("train_episode_ids", "test_episode_ids"):
@@ -78,12 +81,17 @@ def build_probe_plan(
         suffix = actions[episode, anchor : anchor + maximum_horizon]
         action_sequences[probe_index] = suffix[None]
         for dimension in range(action_dim):
-            lower = suffix[0].copy()
-            upper = suffix[0].copy()
-            lower[dimension] = np.clip(lower[dimension] - action_delta, -1.0, 1.0)
-            upper[dimension] = np.clip(upper[dimension] + action_delta, -1.0, 1.0)
-            action_sequences[probe_index, 1 + 2 * dimension, 0] = lower
-            action_sequences[probe_index, 2 + 2 * dimension, 0] = upper
+            for offset in range(intervention_steps):
+                lower = suffix[offset].copy()
+                upper = suffix[offset].copy()
+                lower[dimension] = np.clip(
+                    lower[dimension] - action_delta, -1.0, 1.0
+                )
+                upper[dimension] = np.clip(
+                    upper[dimension] + action_delta, -1.0, 1.0
+                )
+                action_sequences[probe_index, 1 + 2 * dimension, offset] = lower
+                action_sequences[probe_index, 2 + 2 * dimension, offset] = upper
     noise = np.random.default_rng(
         derive_seed(
             "shared-probe-model-noise", episode_ids_key, task, world_model_seed
@@ -107,22 +115,31 @@ def generate_shared_probe_bank(
     world_model_seed: int,
     action_repeat: int,
     discount: float = 0.99,
-    probes: int = 16,
+    probes: int = 32,
     horizons: Sequence[int] = (1, 3, 5, 15),
-    action_delta: float = 0.1,
+    action_delta: float = 0.5,
+    intervention_steps: int = 5,
+    selection_pool_multiplier: int = 8,
+    minimum_informative_fraction: float = 0.5,
     stochastic_dim: int = 16,
     draws: int = 8,
     episode_ids_key: str = "test_episode_ids",
 ) -> dict[str, np.ndarray]:
     """Replay exact simulator states and label every fixed candidate suffix."""
 
+    if selection_pool_multiplier <= 0:
+        raise ValueError("selection_pool_multiplier must be positive")
+    if not 0.0 <= minimum_informative_fraction <= 1.0:
+        raise ValueError("minimum_informative_fraction must lie in [0, 1]")
+    pool_probes = probes * selection_pool_multiplier
     plan = build_probe_plan(
         arrays,
         task=task,
         world_model_seed=world_model_seed,
-        probes=probes,
+        probes=pool_probes,
         horizons=horizons,
         action_delta=action_delta,
+        intervention_steps=intervention_steps,
         stochastic_dim=stochastic_dim,
         draws=draws,
         episode_ids_key=episode_ids_key,
@@ -132,9 +149,9 @@ def generate_shared_probe_bank(
     action_sequences = np.asarray(plan["action_sequences"], dtype=np.float32)
     ordered_horizons = tuple(int(value) for value in plan["horizons"])
     targets = np.zeros(
-        (probes, action_sequences.shape[1], len(ordered_horizons)), np.float32
+        (pool_probes, action_sequences.shape[1], len(ordered_horizons)), np.float32
     )
-    valid = np.zeros((probes, len(ordered_horizons)), np.float32)
+    valid = np.zeros((pool_probes, len(ordered_horizons)), np.float32)
     replay_error = 0.0
     by_location = {
         (int(episode), int(anchor)): index
@@ -199,11 +216,32 @@ def generate_shared_probe_bank(
         environment.close()
     if replay_error > 1e-6:
         raise ValueError(f"shared probe replay differs from dataset by {replay_error}")
+    longest_ranges = np.ptp(targets[:, :, -1], axis=1)
+    ranked = np.argsort(-longest_ranges, kind="stable")[:probes]
+    informative = int(np.sum(longest_ranges[ranked] > 1e-8))
+    required_informative = int(np.ceil(probes * minimum_informative_fraction))
+    if informative < required_informative:
+        raise ValueError(
+            "shared probe bank is not informative enough at the longest horizon: "
+            f"{informative}/{probes}, required {required_informative}"
+        )
+    # Put retained probes back into location order. Selection uses simulator
+    # labels only and is therefore independent of every learned model arm.
+    retained = ranked[
+        np.lexsort((anchors[ranked], episodes[ranked]))
+    ]
     result = {
-        **plan,
-        "simulator_returns": targets,
-        "horizon_mask": valid,
+        **{name: np.asarray(value)[retained] for name, value in plan.items() if name not in ("horizons", "model_noise")},
+        "horizons": np.asarray(plan["horizons"]),
+        "model_noise": np.asarray(plan["model_noise"])[:, retained],
+        "simulator_returns": targets[retained],
+        "horizon_mask": valid[retained],
         "maximum_replay_error": np.asarray([replay_error], np.float64),
+        "candidate_pool_size": np.asarray([pool_probes], np.int32),
+        "selection_horizon": np.asarray([ordered_horizons[-1]], np.int32),
+        "selection_return_ranges": longest_ranges[retained].astype(np.float32),
+        "action_delta": np.asarray([action_delta], np.float32),
+        "intervention_steps": np.asarray([intervention_steps], np.int32),
     }
     validate_shared_probe_bank(result)
     return result
@@ -219,6 +257,11 @@ def validate_shared_probe_bank(bank: Mapping[str, np.ndarray]) -> None:
         "simulator_returns",
         "horizon_mask",
         "maximum_replay_error",
+        "candidate_pool_size",
+        "selection_horizon",
+        "selection_return_ranges",
+        "action_delta",
+        "intervention_steps",
     }
     if set(bank) != required:
         raise ValueError("shared probe bank fields differ from schema")
@@ -240,6 +283,14 @@ def validate_shared_probe_bank(bank: Mapping[str, np.ndarray]) -> None:
         or noise.shape[2] != actions.shape[2]
         or targets.shape != (probes, actions.shape[1], len(horizons))
         or mask.shape != (probes, len(horizons))
+        or np.asarray(bank["candidate_pool_size"]).shape != (1,)
+        or int(np.asarray(bank["candidate_pool_size"])[0]) < probes
+        or np.asarray(bank["selection_horizon"]).shape != (1,)
+        or int(np.asarray(bank["selection_horizon"])[0]) != int(horizons[-1])
+        or np.asarray(bank["selection_return_ranges"]).shape != (probes,)
+        or np.asarray(bank["action_delta"]).shape != (1,)
+        or np.asarray(bank["intervention_steps"]).shape != (1,)
+        or not 0 < int(np.asarray(bank["intervention_steps"])[0]) <= int(horizons[-1])
         or not np.all((mask == 0.0) | (mask == 1.0))
     ):
         raise ValueError("shared probe bank shapes are invalid")
@@ -257,6 +308,9 @@ def shared_probe_manifest(
     action_delta: float,
 ) -> dict[str, Any]:
     validate_shared_probe_bank(bank)
+    retained_delta = float(np.asarray(bank["action_delta"])[0])
+    if not np.isclose(retained_delta, action_delta):
+        raise ValueError("manifest action_delta differs from retained bank")
     manifest = {
         "schema_version": SCHEMA,
         "task": task,
@@ -268,8 +322,15 @@ def shared_probe_manifest(
         "horizons": [int(value) for value in bank["horizons"]],
         "draws": int(bank["model_noise"].shape[0]),
         "action_delta": float(action_delta),
+        "intervention_steps": int(np.asarray(bank["intervention_steps"])[0]),
+        "candidate_pool_size": int(np.asarray(bank["candidate_pool_size"])[0]),
+        "selection_horizon": int(np.asarray(bank["selection_horizon"])[0]),
+        "informative_states_at_selection_horizon": int(
+            np.sum(np.asarray(bank["selection_return_ranges"]) > 1e-8)
+        ),
         "policy_independent": True,
-        "candidate_rule": "replay_action_then_coordinatewise_minus_plus_delta_shared_replay_suffix",
+        "selection_rule": "largest_simulator_return_range_at_longest_horizon_before_model_evaluation",
+        "candidate_rule": "replay_suffix_with_coordinatewise_minus_plus_delta_for_fixed_prefix",
         "noise_rule": "same_standard_normal_draw_per_state_step_across_candidates_and_model_arms",
     }
     return {**manifest, "manifest_sha256": _json_digest(manifest)}

@@ -40,6 +40,8 @@ class SharedProbeBankTests(unittest.TestCase):
             world_model_seed=211,
             probes=4,
             horizons=(1, 3, 5),
+            action_delta=0.5,
+            intervention_steps=3,
             stochastic_dim=3,
             draws=2,
         )
@@ -53,6 +55,11 @@ class SharedProbeBankTests(unittest.TestCase):
             ),
             "horizon_mask": np.ones((probes, horizon_count), np.float32),
             "maximum_replay_error": np.asarray([0.0], np.float64),
+            "candidate_pool_size": np.asarray([4], np.int32),
+            "selection_horizon": np.asarray([5], np.int32),
+            "selection_return_ranges": np.ones((probes,), np.float32),
+            "action_delta": np.asarray([0.5], np.float32),
+            "intervention_steps": np.asarray([3], np.int32),
         }
 
     def test_plan_is_deterministic_and_policy_independent(self) -> None:
@@ -60,16 +67,24 @@ class SharedProbeBankTests(unittest.TestCase):
         second = self.complete_bank()
         for name in first:
             np.testing.assert_array_equal(first[name], second[name])
+        replay = first["action_sequences"][:, 0]
+        lower_first_dimension = first["action_sequences"][:, 1]
+        self.assertTrue(
+            np.any(np.abs(lower_first_dimension[:, :3, 0] - replay[:, :3, 0]) > 0.0)
+        )
+        np.testing.assert_array_equal(lower_first_dimension[:, 3:], replay[:, 3:])
         manifest = shared_probe_manifest(
             first,
             task="dmc_reacher_easy",
             world_model_seed=211,
             dataset_sha256="dataset",
-            action_delta=0.1,
+            action_delta=0.5,
         )
         self.assertTrue(manifest["policy_independent"])
         self.assertIn("same_standard_normal", manifest["noise_rule"])
         self.assertEqual(manifest["candidate_count"], 5)
+        self.assertEqual(manifest["intervention_steps"], 3)
+        self.assertEqual(manifest["informative_states_at_selection_horizon"], 4)
 
     def test_one_digest_binds_every_arm_and_mutation_changes_it(self) -> None:
         bank = self.complete_bank()
@@ -79,7 +94,7 @@ class SharedProbeBankTests(unittest.TestCase):
             task="dmc_reacher_easy",
             world_model_seed=211,
             dataset_sha256="dataset",
-            action_delta=0.1,
+            action_delta=0.5,
         )
         arm_bindings = {
             arm: manifest["probe_bank_sha256"]
@@ -93,7 +108,7 @@ class SharedProbeBankTests(unittest.TestCase):
             task="dmc_reacher_easy",
             world_model_seed=211,
             dataset_sha256="dataset",
-            action_delta=0.1,
+            action_delta=0.5,
         )
         self.assertNotEqual(
             manifest["probe_bank_sha256"], changed["probe_bank_sha256"]
