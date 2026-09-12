@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-COMMIT=$(git rev-parse HEAD)
+COMMIT=${CAUSAL_RESULT_COMMIT:-$(git rev-parse HEAD)}
 SHORT_COMMIT=${COMMIT:0:12}
 REMOTE_SOURCE=/work2/ci72buri-dreamer_imf_neurips/causal-source-${SHORT_COMMIT}
 REMOTE_OUTPUT=/work2/ci72buri-dreamer_imf_neurips/causal-reacher-small/${COMMIT}
