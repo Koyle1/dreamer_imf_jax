@@ -100,6 +100,9 @@ LOSS_KEYS = {
     "imf_loss_v",
     "imf_shortcut",
     "imf_endpoint",
+    "causal_consistency",
+    "causal_observation",
+    "causal_reward",
 }
 METRIC_KEYS = {
     "horizons",
