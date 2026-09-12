@@ -607,12 +607,17 @@ def verify_preservation(arguments: argparse.Namespace) -> None:
         "source_status",
         "protocol_sha256",
         "matrix_sha256",
-        "stage_markers",
         "actor_completed_prefix_count",
         "actor_completed_prefix_manifest_sha256",
     ):
         if before.get(key) != after.get(key):
             raise ValueError(f"frozen pilot preservation mismatch in {key}")
+    before_markers = before.get("stage_markers", {})
+    after_markers = after.get("stage_markers", {})
+    if not isinstance(before_markers, Mapping) or not isinstance(after_markers, Mapping):
+        raise ValueError("preservation stage markers are malformed")
+    if any(after_markers.get(name) != digest for name, digest in before_markers.items()):
+        raise ValueError("a pre-existing authenticated stage marker changed")
     if before["source_status"]:
         raise ValueError("frozen source was already dirty before diagnostics")
     print("FROZEN_PILOT_PRESERVATION_VERIFIED")
