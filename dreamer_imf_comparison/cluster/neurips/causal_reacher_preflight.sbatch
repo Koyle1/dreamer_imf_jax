@@ -45,11 +45,15 @@ python "${RUNNER}" verify-manifest \
   --pilot-root "${CAUSAL_PILOT_ROOT}" \
   --output "${CAUSAL_OUTPUT_ROOT}"
 
-python -m unittest -q \
-  imf_dreamer_jax.tests.test_trajectory_world_model.TrajectoryObjectiveTests.test_disabled_causal_term_is_an_exact_noop \
-  imf_dreamer_jax.tests.test_trajectory_world_model.TrajectoryObjectiveTests.test_paired_predictions_use_exact_common_randomness \
-  imf_dreamer_jax.tests.test_trajectory_world_model.TrajectoryObjectiveTests.test_causal_loss_and_gradients_are_finite \
-  dreamer_imf_comparison.tests.test_causal_reacher_study
+python -m unittest discover -q \
+  -s "${CAUSAL_SOURCE_ROOT}/imf_dreamer_jax/tests" \
+  -p "test_trajectory_world_model.py"
+python -m unittest discover -q \
+  -s "${CAUSAL_SOURCE_ROOT}/dreamer_imf_comparison/tests" \
+  -p "test_policy_alignment_diagnostics.py"
+python -m unittest discover -q \
+  -s "${CAUSAL_SOURCE_ROOT}/dreamer_imf_comparison/tests" \
+  -p "test_causal_reacher_study.py"
 python -m unittest discover -q -s "${CAUSAL_SOURCE_ROOT}/imf_dreamer_jax/tests"
 python -m unittest discover -q -s "${CAUSAL_SOURCE_ROOT}/dreamer_imf_comparison/tests"
 
