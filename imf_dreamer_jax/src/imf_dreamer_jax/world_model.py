@@ -880,10 +880,10 @@ def reward_mtp_targets(
             valid = jnp.pad(valid_prefix, ((0, 0), (0, offset)))
         targets.append(target)
         masks.append(anchor_mask * valid)
-    return (
-        jax.lax.stop_gradient(jnp.stack(targets, axis=-1)),
-        jax.lax.stop_gradient(jnp.stack(masks, axis=-1)),
-    )
+    # Preserve the legacy supervised-loss derivative with respect to reward
+    # targets. Callers that need fixed labels can stop the input batch; model
+    # training itself differentiates only with respect to parameters.
+    return jnp.stack(targets, axis=-1), jnp.stack(masks, axis=-1)
 
 
 def reward_prediction_loss(
