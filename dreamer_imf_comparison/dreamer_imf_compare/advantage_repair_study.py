@@ -132,6 +132,21 @@ def build_manifest(
                 "checkpoint": str(checkpoint.resolve()),
                 "checkpoint_sha256": digest,
             }
+        causal_checkpoint = Path(worlds["causal_trajectory_imf"]["checkpoint"])
+        causal_dataset_directory = (
+            causal_checkpoint.parents[2] / "dataset" / f"seed-{seed}"
+        )
+        causal_probe = causal_dataset_directory / "causal_probes.npz"
+        causal_result_path = causal_dataset_directory / "result.json"
+        causal_result = read_json(causal_result_path)
+        if (
+            causal_result.get("status") != "complete"
+            or int(causal_result.get("world_model_seed", -1)) != seed
+            or causal_result.get("dataset_sha256") != source["dataset_sha256"]
+            or causal_result.get("probe_file_sha256")
+            != benchmark.file_sha256(causal_probe)
+        ):
+            raise ValueError("causal iMF source probe evidence is invalid")
         sources.append(
             {
                 "world_model_seed": seed,
@@ -139,6 +154,12 @@ def build_manifest(
                 "dataset_sha256": source["dataset_sha256"],
                 "test_probe_bank": str(test_bank),
                 "test_probe_bank_sha256": test_result["probe_bank_sha256"],
+                "causal_probe": str(causal_probe.resolve()),
+                "causal_probe_sha256": causal_result["probe_sha256"],
+                "causal_probe_file_sha256": causal_result["probe_file_sha256"],
+                "causal_probe_result_file_sha256": benchmark.file_sha256(
+                    causal_result_path
+                ),
                 "world_models": worlds,
             }
         )
@@ -407,6 +428,20 @@ def train_world_repair(
     if config.prior != "imf" or not config.imf_trajectory_enabled:
         raise ValueError("world repair source is not trajectory iMF")
     arrays = benchmark.load_npz(source["dataset"])
+    if arm == "causal_trajectory_imf":
+        causal_probe_path = Path(source["causal_probe"])
+        if (
+            benchmark.file_sha256(causal_probe_path)
+            != source["causal_probe_file_sha256"]
+        ):
+            raise ValueError("causal probe file digest mismatch")
+        causal_arrays = benchmark.load_npz(causal_probe_path)
+        if benchmark.array_sha256(causal_arrays) != source["causal_probe_sha256"]:
+            raise ValueError("causal probe payload digest mismatch")
+        overlap = set(arrays) & set(causal_arrays)
+        if overlap:
+            raise ValueError(f"causal probe fields overlap base dataset: {sorted(overlap)}")
+        arrays = {**arrays, **causal_arrays}
     updates = int(manifest["world_updates"])
     batch_size = 32
     sequence_length = 32
