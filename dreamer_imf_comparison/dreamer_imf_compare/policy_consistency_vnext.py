@@ -157,7 +157,7 @@ def build_manifest(
         "epistemic_penalty_scales": [float(value) for value in epistemic_scales],
         "shared_probe": {
             "states": 32,
-            "candidate_pool_size": 256,
+            "candidate_pool_size": 1024,
             "selection": "top_simulator_return_range_at_horizon_15_model_independent",
             "candidates": "replay_plus_coordinatewise_minus_plus_0.5_for_first_5_steps",
             "horizons": [1, 3, 5, 15],
@@ -260,7 +260,10 @@ def prepare_probe_bank(
         horizons=manifest["shared_probe"]["horizons"],
         action_delta=0.5,
         intervention_steps=5,
-        selection_pool_multiplier=8,
+        selection_pool_multiplier=(
+            manifest["shared_probe"]["candidate_pool_size"]
+            // manifest["shared_probe"]["states"]
+        ),
         minimum_informative_fraction=manifest["shared_probe"]["minimum_informative_fraction"],
         stochastic_dim=stochastic_dims.pop(),
         draws=manifest["shared_probe"]["draws"],

@@ -36,7 +36,7 @@ simulator returns, and standard-normal model draws. The same bank digest is
 required for shortcut forcing, original trajectory-iMF, and causal
 trajectory-iMF. No learned policy selects a state or action in this evaluation.
 To avoid a vacuous diagnostic on Reacher's large flat-reward region, 32 probes
-are selected from 256 deterministic replay locations by simulator return range
+are selected from 1,024 deterministic replay locations by simulator return range
 at horizon 15 before any checkpoint is loaded. At least half must be
 informative or the stage fails. This is a model-independent stratified
 action-sensitivity diagnostic, not an estimate over the natural state distribution.
