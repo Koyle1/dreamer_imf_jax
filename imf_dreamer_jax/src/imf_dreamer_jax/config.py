@@ -74,6 +74,10 @@ class DreamerConfig:
     imf_trajectory_corrupted_probability: float = 1.0 / 3.0
     imf_trajectory_suffix_probability: float = 1.0 / 3.0
     imf_trajectory_history_noise_max: float = 1.0
+    imf_causal_consistency_scale: float = 0.0
+    imf_causal_reward_scale: float = 1.0
+    imf_causal_huber_delta: float = 1.0
+    imf_causal_normalization_epsilon: float = 1e-3
     shortcut_training_k_max: int | None = None
     shortcut_sampling_steps: int = 4
     shortcut_bootstrap_ema_decay: float | None = 0.999
@@ -214,6 +218,8 @@ class DreamerConfig:
             "imf_shortcut_scale",
             "imf_signal_weight_floor",
             "imf_signal_weight_scale",
+            "imf_causal_consistency_scale",
+            "imf_causal_reward_scale",
             "actor_action_l2_scale",
             "reward_output_init_scale",
             "critic_output_init_scale",
@@ -241,6 +247,8 @@ class DreamerConfig:
             raise ValueError("trajectory iMF requires prior='imf'")
         if self.imf_trajectory_enabled and self.imf_noise_coupling != "independent":
             raise ValueError("trajectory iMF requires independent base noise")
+        if self.imf_causal_consistency_scale > 0.0 and not self.imf_trajectory_enabled:
+            raise ValueError("causal consistency requires trajectory iMF mode")
         trajectory_probabilities = (
             self.imf_trajectory_clean_probability,
             self.imf_trajectory_corrupted_probability,
@@ -267,6 +275,8 @@ class DreamerConfig:
         for name in (
             "imf_time_std",
             "imf_adaptive_epsilon",
+            "imf_causal_huber_delta",
+            "imf_causal_normalization_epsilon",
             "actor_init_scale",
             "actor_mean_bound",
             "actor_min_std",

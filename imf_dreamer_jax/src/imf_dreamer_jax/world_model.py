@@ -747,6 +747,139 @@ def _masked_mean(value: Array, mask: Array) -> Array:
     return jnp.sum(value * mask) / jnp.maximum(jnp.sum(mask), jnp.asarray(1.0, value.dtype))
 
 
+def _pseudo_huber(value: Array, delta: float) -> Array:
+    """Quadratic near zero and linear in the tails without a branch."""
+
+    delta_value = jnp.asarray(delta, dtype=value.dtype)
+    scaled = value / delta_value
+    return jnp.square(delta_value) * (jnp.sqrt(1.0 + jnp.square(scaled)) - 1.0)
+
+
+def trajectory_causal_consistency_loss(
+    params: Params,
+    sequence: SequenceStates,
+    batch: Batch,
+    loss_mask: Array,
+    key: Array,
+    config: DreamerConfig,
+) -> tuple[Array, Array, Array]:
+    """Match paired simulator action effects with coupled iMF samples.
+
+    Both branches start from the same posterior state and deliberately reuse
+    the same immutable JAX key. Stochastic sampling therefore cancels instead
+    of masquerading as an action effect. Stopped per-feature RMS scales make
+    the robust loss sensitive to effect direction without discarding magnitude.
+    """
+
+    required = (
+        "causal_actions_lower",
+        "causal_actions_upper",
+        "causal_observations_lower",
+        "causal_observations_upper",
+        "causal_rewards_lower",
+        "causal_rewards_upper",
+        "causal_mask",
+    )
+    missing = [name for name in required if name not in batch]
+    if missing:
+        raise KeyError(f"causal consistency batch is missing {missing}")
+    batch_size, steps = loss_mask.shape
+    action_shape = (batch_size, steps, config.action_dim)
+    observation_shape = (batch_size, steps, *config.observation_shape)
+    for name in ("causal_actions_lower", "causal_actions_upper"):
+        if batch[name].shape != action_shape:
+            raise ValueError(f"{name} must have shape {action_shape}")
+    for name in ("causal_observations_lower", "causal_observations_upper"):
+        if batch[name].shape != observation_shape:
+            raise ValueError(f"{name} must have shape {observation_shape}")
+    for name in ("causal_rewards_lower", "causal_rewards_upper", "causal_mask"):
+        if batch[name].shape != (batch_size, steps):
+            raise ValueError(f"{name} must have shape {(batch_size, steps)}")
+
+    previous = RSSMState(
+        jnp.concatenate(
+            (
+                jnp.zeros_like(sequence.states.deterministic[:, :1]),
+                sequence.states.deterministic[:, :-1],
+            ),
+            axis=1,
+        ),
+        jnp.concatenate(
+            (
+                jnp.zeros_like(sequence.states.stochastic[:, :1]),
+                sequence.states.stochastic[:, :-1],
+            ),
+            axis=1,
+        ),
+    )
+
+    def flatten(value: Array) -> Array:
+        return value.reshape((batch_size * steps, value.shape[-1]))
+
+    previous_flat = RSSMState(
+        flatten(previous.deterministic), flatten(previous.stochastic)
+    )
+
+    def paired_prediction(action: Array) -> tuple[Array, Array]:
+        deterministic = transition_deterministic(
+            params, previous_flat, flatten(action), config
+        )
+        # Calling the pure sampler with the same key is exact common randomness.
+        stochastic, _ = sample_prior(params, deterministic, key, config)
+        feature = jnp.concatenate((deterministic, stochastic), axis=-1)
+        observation = decode(params, feature, config).reshape(observation_shape)
+        reward = predict_reward(params, feature, config).reshape((batch_size, steps))
+        return observation, reward
+
+    lower_observation, lower_reward = paired_prediction(batch["causal_actions_lower"])
+    upper_observation, upper_reward = paired_prediction(batch["causal_actions_upper"])
+    predicted_observation_delta = upper_observation - lower_observation
+    predicted_reward_delta = upper_reward - lower_reward
+    target_observation_delta = jax.lax.stop_gradient(
+        preprocess_observation(batch["causal_observations_upper"])
+        - preprocess_observation(batch["causal_observations_lower"])
+    )
+    target_reward_delta = jax.lax.stop_gradient(
+        batch["causal_rewards_upper"] - batch["causal_rewards_lower"]
+    )
+
+    causal_mask = loss_mask * jnp.asarray(batch["causal_mask"], dtype=loss_mask.dtype)
+    masked_count = jnp.maximum(
+        jnp.sum(causal_mask), jnp.asarray(1.0, dtype=loss_mask.dtype)
+    )
+    observation_mask = causal_mask.reshape(
+        (*causal_mask.shape,) + (1,) * len(config.observation_shape)
+    )
+    observation_scale = jnp.sqrt(
+        jnp.sum(jnp.square(target_observation_delta) * observation_mask, axis=(0, 1))
+        / masked_count
+        + config.imf_causal_normalization_epsilon**2
+    )
+    reward_scale = jnp.sqrt(
+        jnp.sum(jnp.square(target_reward_delta) * causal_mask) / masked_count
+        + config.imf_causal_normalization_epsilon**2
+    )
+    observation_residual = (
+        predicted_observation_delta - target_observation_delta
+    ) / jax.lax.stop_gradient(observation_scale)
+    reward_residual = (
+        predicted_reward_delta - target_reward_delta
+    ) / jax.lax.stop_gradient(reward_scale)
+    observation_per_transition = jnp.mean(
+        _pseudo_huber(
+            observation_residual, config.imf_causal_huber_delta
+        ).reshape((batch_size, steps, -1)),
+        axis=-1,
+    )
+    observation_loss = _masked_mean(observation_per_transition, causal_mask)
+    reward_loss = _masked_mean(
+        _pseudo_huber(reward_residual, config.imf_causal_huber_delta),
+        causal_mask,
+    )
+    total = observation_loss + config.imf_causal_reward_scale * reward_loss
+    return total, observation_loss, reward_loss
+
+
 def _distance_consistency_loss(
     params: Params,
     sequence: SequenceStates,
@@ -941,7 +1074,11 @@ def world_model_loss(
         loss_mask = jnp.ones(actions.shape[:2], dtype=actions.dtype)
         if config.burn_in:
             loss_mask = loss_mask.at[:, : config.burn_in].set(0.0)
+    # Preserve the exact legacy RNG streams when the optional causal term is
+    # disabled; deriving a fourth key via a larger split would perturb all
+    # three existing streams even at a zero loss scale.
     sequence_key, prior_key, overshooting_key = jax.random.split(key, 3)
+    causal_key = jax.random.fold_in(key, 0xCA05A1)
     sequence = observe_sequence(
         params,
         observations,
@@ -981,6 +1118,9 @@ def world_model_loss(
     imf_loss_v = zero
     imf_endpoint = zero
     imf_shortcut = zero
+    causal_consistency = zero
+    causal_observation = zero
+    causal_reward = zero
     if config.prior == "gaussian":
         prior_distribution_value = DiagonalNormal(sequence.prior_mean, sequence.prior_std)
         prior = _masked_mean(
@@ -1146,6 +1286,19 @@ def world_model_loss(
         # intentionally absent from the trajectory objective, not hidden in it.
         imf_endpoint = zero
         imf_shortcut = zero
+        if config.imf_causal_consistency_scale > 0.0:
+            (
+                causal_consistency,
+                causal_observation,
+                causal_reward,
+            ) = trajectory_causal_consistency_loss(
+                params,
+                sequence,
+                batch,
+                loss_mask,
+                causal_key,
+                config,
+            )
     else:
         transport_noise = None
         if config.imf_noise_coupling == "posterior":
@@ -1214,6 +1367,7 @@ def world_model_loss(
         + config.prior_scale * prior
         + config.representation_scale * representation
         + config.overshooting_scale * overshooting
+        + config.imf_causal_consistency_scale * causal_consistency
     )
     return WorldModelLoss(
         total=total,
@@ -1229,6 +1383,9 @@ def world_model_loss(
         imf_shortcut=imf_shortcut,
         overshooting_distance_5=distance_5,
         overshooting_distance_15=distance_15,
+        causal_consistency=causal_consistency,
+        causal_observation=causal_observation,
+        causal_reward=causal_reward,
     )
 
 

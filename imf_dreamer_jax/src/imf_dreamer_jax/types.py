@@ -92,6 +92,9 @@ class WorldModelLoss(NamedTuple):
     imf_shortcut: Array
     overshooting_distance_5: Array
     overshooting_distance_15: Array
+    causal_consistency: Array
+    causal_observation: Array
+    causal_reward: Array
 
 
 class Imagination(NamedTuple):

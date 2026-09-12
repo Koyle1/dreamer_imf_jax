@@ -58,6 +58,31 @@ def make_batch(config: DreamerConfig, *, batch: int = 2, time: int = 6):
     }
 
 
+def add_causal_pairs(batch, config: DreamerConfig):
+    actions = batch["actions"]
+    lower_actions = jnp.clip(actions - 0.1, -1.0, 1.0)
+    upper_actions = jnp.clip(actions + 0.1, -1.0, 1.0)
+    observations = batch["observations"]
+    observation_effect = jnp.concatenate(
+        (
+            0.02 * jnp.ones_like(observations[..., :1]),
+            jnp.zeros_like(observations[..., 1:]),
+        ),
+        axis=-1,
+    )
+    result = dict(batch)
+    result.update(
+        causal_actions_lower=lower_actions,
+        causal_actions_upper=upper_actions,
+        causal_observations_lower=observations - observation_effect,
+        causal_observations_upper=observations + observation_effect,
+        causal_rewards_lower=batch["rewards"] - 0.01,
+        causal_rewards_upper=batch["rewards"] + 0.01,
+        causal_mask=jnp.ones(actions.shape[:2], dtype=jnp.float32),
+    )
+    return result
+
+
 class TrajectoryConfigurationTests(unittest.TestCase):
     def test_trajectory_mode_is_opt_in_and_method_name_is_distinct(self) -> None:
         legacy = DreamerConfig(
@@ -121,6 +146,11 @@ class TrajectoryConfigurationTests(unittest.TestCase):
             with self.subTest(history_noise_max=value):
                 with self.assertRaisesRegex(ValueError, r"\[0, 1\]"):
                     DreamerConfig(imf_trajectory_history_noise_max=value)
+        with self.assertRaisesRegex(ValueError, "requires trajectory iMF"):
+            DreamerConfig(imf_causal_consistency_scale=0.1)
+        for name in ("imf_causal_huber_delta", "imf_causal_normalization_epsilon"):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "positive"):
+                DreamerConfig(**{name: 0.0})
 
 
 class TrajectoryConditionTests(unittest.TestCase):
@@ -224,6 +254,56 @@ class TrajectoryConditionTests(unittest.TestCase):
 
 
 class TrajectoryObjectiveTests(unittest.TestCase):
+    def test_disabled_causal_term_is_an_exact_noop(self) -> None:
+        config = trajectory_config(imf_causal_consistency_scale=0.0)
+        params = init_world_model(config, jax.random.key(905))
+        batch = make_batch(config)
+        without_pairs = world_model_loss(params, batch, jax.random.key(906), config)
+        with_pairs = world_model_loss(
+            params, add_causal_pairs(batch, config), jax.random.key(906), config
+        )
+        for left, right in zip(without_pairs, with_pairs, strict=True):
+            np.testing.assert_array_equal(left, right)
+        np.testing.assert_array_equal(without_pairs.causal_consistency, 0.0)
+        np.testing.assert_array_equal(without_pairs.causal_observation, 0.0)
+        np.testing.assert_array_equal(without_pairs.causal_reward, 0.0)
+
+    def test_paired_predictions_use_exact_common_randomness(self) -> None:
+        config = trajectory_config(imf_causal_consistency_scale=0.1)
+        params = init_world_model(config, jax.random.key(907))
+        batch = make_batch(config)
+        identical = add_causal_pairs(batch, config)
+        identical["causal_actions_upper"] = identical["causal_actions_lower"]
+        identical["causal_observations_upper"] = identical[
+            "causal_observations_lower"
+        ]
+        identical["causal_rewards_upper"] = identical["causal_rewards_lower"]
+        losses = world_model_loss(params, identical, jax.random.key(908), config)
+        np.testing.assert_array_equal(losses.causal_consistency, 0.0)
+        np.testing.assert_array_equal(losses.causal_observation, 0.0)
+        np.testing.assert_array_equal(losses.causal_reward, 0.0)
+
+    def test_causal_loss_and_gradients_are_finite(self) -> None:
+        config = trajectory_config(imf_causal_consistency_scale=0.1)
+        params = init_world_model(config, jax.random.key(909))
+        batch = add_causal_pairs(make_batch(config), config)
+
+        def objective(model_params):
+            return world_model_loss(
+                model_params, batch, jax.random.key(910), config
+            ).total
+
+        value, gradients = jax.jit(jax.value_and_grad(objective))(params)
+        self.assertTrue(np.isfinite(float(value)))
+        self.assertTrue(
+            all(
+                np.isfinite(np.asarray(leaf)).all()
+                for leaf in jax.tree_util.tree_leaves(gradients)
+            )
+        )
+        losses = world_model_loss(params, batch, jax.random.key(910), config)
+        self.assertGreater(float(losses.causal_consistency), 0.0)
+
     def test_query_and_history_corruption_share_each_tokens_noise_path(self) -> None:
         config = trajectory_config(
             imf_trajectory_clean_probability=0.0,
