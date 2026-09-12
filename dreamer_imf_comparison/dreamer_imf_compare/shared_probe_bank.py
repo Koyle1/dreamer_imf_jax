@@ -37,6 +37,7 @@ def build_probe_plan(
     stochastic_dim: int = 16,
     draws: int = 8,
     episode_ids_key: str = "test_episode_ids",
+    minimum_anchor: int = 1,
 ) -> dict[str, np.ndarray]:
     """Choose states, candidates, suffixes, and model noise before evaluation."""
 
@@ -49,6 +50,8 @@ def build_probe_plan(
         raise ValueError("action_delta must lie in (0, 1]")
     if not 0 < intervention_steps <= ordered_horizons[-1]:
         raise ValueError("intervention_steps must lie in [1, maximum_horizon]")
+    if minimum_anchor < 1:
+        raise ValueError("minimum_anchor must be positive")
     observations = np.asarray(arrays["observations"])
     actions = np.asarray(arrays["actions"], dtype=np.float32)
     if episode_ids_key not in ("train_episode_ids", "test_episode_ids"):
@@ -60,7 +63,7 @@ def build_probe_plan(
     candidates = [
         (int(episode), int(anchor))
         for episode in test_ids
-        for anchor in range(1, actions.shape[1] - maximum_horizon + 1)
+        for anchor in range(minimum_anchor, actions.shape[1] - maximum_horizon + 1)
         if np.all(np.asarray(arrays["continuations"])[episode, anchor : anchor + maximum_horizon] > 0.0)
     ]
     if len(candidates) < probes:
@@ -124,6 +127,7 @@ def generate_shared_probe_bank(
     stochastic_dim: int = 16,
     draws: int = 8,
     episode_ids_key: str = "test_episode_ids",
+    minimum_anchor: int = 1,
 ) -> dict[str, np.ndarray]:
     """Replay exact simulator states and label every fixed candidate suffix."""
 
@@ -143,6 +147,7 @@ def generate_shared_probe_bank(
         stochastic_dim=stochastic_dim,
         draws=draws,
         episode_ids_key=episode_ids_key,
+        minimum_anchor=minimum_anchor,
     )
     episodes = np.asarray(plan["episode_ids"], dtype=np.int32)
     anchors = np.asarray(plan["anchors"], dtype=np.int32)

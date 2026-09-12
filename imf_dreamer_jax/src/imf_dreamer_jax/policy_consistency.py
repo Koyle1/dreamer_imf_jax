@@ -523,6 +523,7 @@ def policy_consistent_world_model_loss(
     *,
     advantage_normalization: Array | float = 1.0,
     shortcut_teacher_params: Params | None = None,
+    advantage_batch: Batch | None = None,
 ) -> PolicyConsistencyLoss:
     """Base world-model loss plus independently ablatable policy terms."""
 
@@ -540,24 +541,25 @@ def policy_consistent_world_model_loss(
         and objective.endpoint_scale == 0.0
     ):
         return PolicyConsistencyLoss(base.total, base, _zero_advantage(base.total.dtype), zero, zero)
-    sequence = observe_sequence(
-        params,
-        batch["observations"],
-        batch["actions"],
-        jax.random.fold_in(key, 0xA11CE),
-        config,
-        is_first=batch.get("is_first"),
-    )
     loss_mask = jnp.asarray(
         batch.get("loss_mask", jnp.ones(batch["actions"].shape[:2])),
         dtype=base.total.dtype,
     )
     advantage = _zero_advantage(base.total.dtype)
     if objective.advantage_consistency_scale > 0.0:
+        decision_batch = batch if advantage_batch is None else advantage_batch
+        decision_sequence = observe_sequence(
+            params,
+            decision_batch["observations"],
+            decision_batch["actions"],
+            jax.random.fold_in(key, 0xA11CE),
+            config,
+            is_first=decision_batch.get("is_first"),
+        )
         advantage = trajectory_advantage_consistency_loss(
             params,
-            sequence,
-            batch,
+            decision_sequence,
+            decision_batch,
             jax.random.fold_in(key, 0xAD0),
             config,
             objective,
@@ -566,9 +568,17 @@ def policy_consistent_world_model_loss(
     exposure = zero
     endpoint = zero
     if objective.exposure_meanflow_scale > 0.0 or objective.endpoint_scale > 0.0:
+        exposure_sequence = observe_sequence(
+            params,
+            batch["observations"],
+            batch["actions"],
+            jax.random.fold_in(key, 0xE11CE),
+            config,
+            is_first=batch.get("is_first"),
+        )
         exposure, endpoint = trajectory_exposure_loss(
             params,
-            sequence,
+            exposure_sequence,
             batch,
             loss_mask,
             jax.random.fold_in(key, 0xE0),
@@ -591,14 +601,30 @@ def train_policy_consistent_world_model(
     config: DreamerConfig,
     objective: PolicyConsistencyConfig,
     advantage_rms: RunningRMSState,
+    *,
+    advantage_batch: Batch | None = None,
+    trainable_world_subtrees: tuple[str, ...] | None = None,
 ) -> tuple[AgentState, PolicyConsistencyLoss, RunningRMSState]:
-    """One clipped Adam update with a persistent advantage RMS."""
+    """One clipped Adam update with a persistent advantage RMS.
+
+    ``trainable_world_subtrees`` supports causal localization experiments. A
+    frozen subtree's parameters and Adam moments are restored exactly after
+    the update, so zero gradients cannot leak momentum into frozen dynamics.
+    """
+
+    if trainable_world_subtrees is not None:
+        unknown = set(trainable_world_subtrees) - set(state.params.world_model)
+        if unknown or not trainable_world_subtrees:
+            raise ValueError(
+                "trainable_world_subtrees must be a nonempty subset of world parameters"
+            )
 
     next_rms = advantage_rms
     if objective.advantage_consistency_scale > 0.0:
-        targets = jax.lax.stop_gradient(batch["advantage_target_returns"])
+        decision_batch = batch if advantage_batch is None else advantage_batch
+        targets = jax.lax.stop_gradient(decision_batch["advantage_target_returns"])
         target_advantages = targets - jnp.mean(targets, axis=-2, keepdims=True)
-        mask = batch["advantage_mask"]
+        mask = decision_batch["advantage_mask"]
         if mask.shape == targets.shape[:2]:
             mask = mask[..., None]
         next_rms = update_running_rms(
@@ -619,12 +645,23 @@ def train_policy_consistent_world_model(
             objective,
             advantage_normalization=scale,
             shortcut_teacher_params=state.world_model_teacher,
+            advantage_batch=advantage_batch,
         )
         return details.total, details
 
     (_, details), gradients = jax.value_and_grad(loss_fn, has_aux=True)(
         state.params.world_model
     )
+    if trainable_world_subtrees is not None:
+        selected = frozenset(trainable_world_subtrees)
+        gradients = {
+            name: (
+                value
+                if name in selected
+                else jax.tree_util.tree_map(jnp.zeros_like, value)
+            )
+            for name, value in gradients.items()
+        }
     gradients, _ = clip_by_global_norm(gradients, config.grad_clip)
     model_params, optimizer = adam_update(
         state.params.world_model,
@@ -635,6 +672,28 @@ def train_policy_consistent_world_model(
         beta2=config.adam_beta2,
         epsilon=config.adam_epsilon,
     )
+    if trainable_world_subtrees is not None:
+        selected = frozenset(trainable_world_subtrees)
+        model_params = {
+            name: (
+                value if name in selected else state.params.world_model[name]
+            )
+            for name, value in model_params.items()
+        }
+        optimizer = optimizer._replace(
+            first_moment={
+                name: (
+                    value if name in selected else state.model_optimizer.first_moment[name]
+                )
+                for name, value in optimizer.first_moment.items()
+            },
+            second_moment={
+                name: (
+                    value if name in selected else state.model_optimizer.second_moment[name]
+                )
+                for name, value in optimizer.second_moment.items()
+            },
+        )
     params = AgentParams(model_params, state.params.actor, state.params.critic)
     updated = AgentState(
         params,
@@ -648,7 +707,8 @@ def train_policy_consistent_world_model(
 
 
 jit_train_policy_consistent_world_model = partial(
-    jax.jit, static_argnames=("config", "objective")
+    jax.jit,
+    static_argnames=("config", "objective", "trainable_world_subtrees"),
 )(train_policy_consistent_world_model)
 
 

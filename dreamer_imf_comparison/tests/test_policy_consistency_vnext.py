@@ -10,6 +10,7 @@ from dreamer_imf_compare.shared_probe_bank import (
     shared_probe_manifest,
     validate_shared_probe_bank,
 )
+from dreamer_imf_compare.advantage_repair_study import materialize_advantage_batch
 
 
 def arrays() -> dict[str, np.ndarray]:
@@ -120,6 +121,22 @@ class SharedProbeBankTests(unittest.TestCase):
             training["advantage_action_sequences"].shape, (4, 24, 5, 5, 2)
         )
         self.assertEqual(int(np.sum(training["advantage_mask"])), 12)
+
+    def test_train_probe_materializes_one_labeled_decision_per_row(self) -> None:
+        bank = self.complete_bank()
+        materialized = materialize_advantage_batch(
+            arrays(), bank, np.asarray([0, 1], np.int32), burn_in=1
+        )
+        self.assertEqual(materialized["observations"].shape, (2, 2, 3))
+        self.assertEqual(
+            materialized["advantage_action_sequences"].shape, (2, 2, 5, 5, 2)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(materialized["advantage_mask"][:, 0]), 0.0
+        )
+        self.assertEqual(
+            int(np.sum(np.asarray(materialized["advantage_mask"][:, 1]))), 6
+        )
 
 
 if __name__ == "__main__":

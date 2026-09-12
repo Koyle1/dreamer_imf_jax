@@ -236,6 +236,87 @@ class AdvantageConsistencyTests(unittest.TestCase):
         self.assertGreater(tree_delta(state.params.world_model, updated.params.world_model), 0.0)
         self.assertEqual(tree_delta(state.params.actor, updated.params.actor), 0.0)
 
+    def test_advantage_batch_can_be_separate_from_base_world_batch(self) -> None:
+        cfg = config()
+        state = create_agent(cfg, jax.random.key(105))
+        base = batch(cfg, batch_size=3, steps=6)
+        decision = batch(cfg, batch_size=2, steps=3)
+        decision.update(
+            {
+                "advantage_action_sequences": 0.2
+                * jax.random.normal(
+                    jax.random.key(106), (2, 3, 3, 5, cfg.action_dim)
+                ),
+                "advantage_target_returns": jax.random.normal(
+                    jax.random.key(107), (2, 3, 3, 3)
+                ),
+                "advantage_mask": jnp.ones((2, 3, 3)),
+            }
+        )
+        updated, losses, rms = jit_train_policy_consistent_world_model(
+            state,
+            base,
+            jax.random.key(108),
+            cfg,
+            PolicyConsistencyConfig(advantage_consistency_scale=0.1),
+            init_running_rms(),
+            advantage_batch=decision,
+        )
+        self.assertTrue(np.isfinite(float(losses.total)))
+        self.assertGreater(float(rms.count), 0.0)
+        self.assertGreater(tree_delta(state.params.world_model, updated.params.world_model), 0.0)
+
+    def test_reward_only_repair_freezes_dynamics_and_optimizer_moments(self) -> None:
+        cfg = config()
+        state = create_agent(cfg, jax.random.key(109))
+        data = batch(cfg, batch_size=2, steps=6)
+        data.update(
+            {
+                "advantage_action_sequences": 0.2
+                * jax.random.normal(
+                    jax.random.key(110), (2, 6, 3, 5, cfg.action_dim)
+                ),
+                "advantage_target_returns": jax.random.normal(
+                    jax.random.key(111), (2, 6, 3, 3)
+                ),
+                "advantage_mask": jnp.ones((2, 6, 3)),
+            }
+        )
+        updated, _, _ = jit_train_policy_consistent_world_model(
+            state,
+            data,
+            jax.random.key(112),
+            cfg,
+            PolicyConsistencyConfig(advantage_consistency_scale=0.1),
+            init_running_rms(),
+            trainable_world_subtrees=("reward",),
+        )
+        self.assertGreater(
+            tree_delta(state.params.world_model["reward"], updated.params.world_model["reward"]),
+            0.0,
+        )
+        for name in state.params.world_model:
+            if name == "reward":
+                continue
+            self.assertEqual(
+                tree_delta(state.params.world_model[name], updated.params.world_model[name]),
+                0.0,
+            )
+            self.assertEqual(
+                tree_delta(
+                    state.model_optimizer.first_moment[name],
+                    updated.model_optimizer.first_moment[name],
+                ),
+                0.0,
+            )
+            self.assertEqual(
+                tree_delta(
+                    state.model_optimizer.second_moment[name],
+                    updated.model_optimizer.second_moment[name],
+                ),
+                0.0,
+            )
+
 
 class EpistemicPessimismTests(unittest.TestCase):
     @classmethod
