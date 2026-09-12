@@ -2027,6 +2027,10 @@ def make_config(
         imf_causal_reward_scale=1.0,
         imf_causal_huber_delta=1.0,
         imf_causal_normalization_epsilon=1e-3,
+        reward_prediction_horizon=0,
+        reward_bins=1,
+        reward_symlog_min=-20.0,
+        reward_symlog_max=20.0,
     )
     common["overshooting_distances"] = tuple(common["overshooting_distances"])
     common["observation_shape"] = tuple(int(value) for value in observation_shape)
