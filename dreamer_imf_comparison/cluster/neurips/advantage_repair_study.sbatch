@@ -81,6 +81,18 @@ PY
     ARM_INDEX=$((SLURM_ARRAY_TASK_ID % 2))
     python "${RUNNER}" probe "${COMMON[@]}" --seed "${SEEDS[${SEED_INDEX}]}" --arm "${ARMS[${ARM_INDEX}]}"
     ;;
+  actor)
+    : "${SLURM_ARRAY_TASK_ID:?actor requires index 0..3}"
+    SEEDS=(211 223)
+    HORIZONS=(5 15)
+    SEED_INDEX=$((SLURM_ARRAY_TASK_ID / 2))
+    HORIZON_INDEX=$((SLURM_ARRAY_TASK_ID % 2))
+    python "${RUNNER}" actor "${COMMON[@]}" \
+      --seed "${SEEDS[${SEED_INDEX}]}" \
+      --arm trajectory_imf \
+      --horizon "${HORIZONS[${HORIZON_INDEX}]}" \
+      --epistemic-scale 0
+    ;;
   finalize)
     python "${RUNNER}" finalize "${COMMON[@]}"
     ;;

@@ -32,6 +32,7 @@ from .shared_probe_bank import (
 
 SCHEMA = "trajectory-imf-advantage-repair-study-v1"
 REPAIR_ARMS = ("trajectory_imf", "causal_trajectory_imf")
+ACTOR_ARMS = ("trajectory_imf",)
 WORLD_MODEL_SEEDS = (211, 223)
 VARIANTS = (
     "advantage_reward",
@@ -173,6 +174,7 @@ def build_manifest(
         "task": TASK,
         "world_model_seeds": list(WORLD_MODEL_SEEDS),
         "repair_arms": list(REPAIR_ARMS),
+        "actor_arms": list(ACTOR_ARMS),
         "variant": variant,
         "trainable_world_subtrees": (
             ["reward"] if variant == "advantage_reward" else "all"
@@ -599,12 +601,254 @@ def evaluate_world_repair(
     return result
 
 
+def train_repaired_actor(
+    baseline_root: str | Path,
+    output_root: str | Path,
+    seed: int,
+    arm: str,
+    horizon: int,
+    *,
+    epistemic_scale: float = 0.0,
+    evaluation_episodes: int = 5,
+    **settings: Any,
+) -> dict[str, Any]:
+    """Train the paired vNext actor against a frozen repaired world model."""
+
+    import jax
+    from imf_dreamer_jax import (
+        AgentParams,
+        AgentState,
+        create_agent,
+        diverse_imagination_starts,
+        jit_observe_sequence,
+        jit_train_actor_critic,
+        jit_train_behavior_cloning,
+        jit_train_replay_critic,
+        load_checkpoint,
+        save_checkpoint,
+        snapshot_behavior_prior,
+    )
+
+    if arm not in ACTOR_ARMS or horizon not in HORIZONS:
+        raise ValueError("actor cell is outside the frozen reward-repair design")
+    manifest = write_manifest(baseline_root, output_root, **settings)
+    if epistemic_scale not in manifest["epistemic_scales"]:
+        raise ValueError("epistemic scale is absent from the manifest")
+    source = _source_row(manifest, seed)
+    world_directory = Path(output_root) / "world_repair" / f"seed-{seed}-{arm}"
+    world_result = read_json(world_directory / "result.json")
+    world_checkpoint = world_directory / "checkpoint.pkl"
+    if (
+        world_result.get("status") != "complete"
+        or world_result.get("manifest_sha256") != manifest["manifest_sha256"]
+        or world_result.get("checkpoint_sha256")
+        != benchmark.file_sha256(world_checkpoint)
+    ):
+        raise ValueError("repaired actor source checkpoint is invalid")
+    tag = f"seed-{seed}-{arm}-h{horizon}-u{epistemic_scale:g}"
+    directory = Path(output_root) / "actor" / tag
+    result_path = directory / "result.json"
+    if result_path.is_file():
+        return read_json(result_path)
+
+    world_state, stored_config, _ = load_checkpoint(world_checkpoint)
+    config = replace(
+        stored_config,
+        actor_gradient="pmpo",
+        behavior_kl_scale=0.3,
+        critic_bins=51,
+        critic_output_init_scale=0.0,
+        imagination_horizon=horizon,
+    )
+    fresh = create_agent(
+        config,
+        benchmark.derive_jax_key(
+            "vnext-actor-init", TASK, seed, ACTOR_SEED, horizon, epistemic_scale
+        ),
+    )
+    frozen_world = world_state.params.world_model
+    state = AgentState(
+        AgentParams(frozen_world, fresh.params.actor, fresh.params.critic),
+        world_state.model_optimizer,
+        fresh.actor_optimizer,
+        fresh.critic_optimizer,
+        fresh.slow_critic,
+        world_state.world_model_teacher,
+    )
+    arrays = benchmark.load_npz(source["dataset"])
+    batch_size = 32
+    sequence_length = 32
+    actor_updates = int(manifest["actor_updates"])
+    preparation_updates = int(manifest["preparation_updates"])
+    total_schedule = benchmark._batch_schedule(
+        arrays,
+        task=TASK,
+        world_model_seed=benchmark.derive_seed(
+            "vnext-actor-batches", seed, ACTOR_SEED, horizon, epistemic_scale
+        ),
+        updates=preparation_updates + actor_updates,
+        batch_size=batch_size,
+        sequence_length=sequence_length,
+    )
+    posterior_key = benchmark.derive_jax_key(
+        "vnext-actor-posterior", seed, ACTOR_SEED, horizon, epistemic_scale
+    )
+    started = time.perf_counter()
+    latest_bc = math.nan
+    latest_replay_critic = math.nan
+    for update in range(preparation_updates):
+        replay = benchmark._materialize_batch(
+            arrays,
+            total_schedule,
+            update,
+            sequence_length=sequence_length,
+            burn_in=config.burn_in,
+        )
+        sequence = jit_observe_sequence(
+            state.params.world_model,
+            replay["observations"],
+            replay["actions"],
+            jax.random.fold_in(posterior_key, update),
+            config,
+            is_first=replay["is_first"],
+        )
+        features = sequence.states.feature[:, config.burn_in :]
+        actions = replay["actions"][:, config.burn_in :]
+        state, bc_loss = jit_train_behavior_cloning(
+            state,
+            features.reshape((-1, config.feature_dim)),
+            actions.reshape((-1, config.action_dim)),
+            config,
+        )
+        state, critic_loss = jit_train_replay_critic(
+            state,
+            sequence.states.feature,
+            replay["rewards"],
+            replay["continuations"],
+            config,
+            loss_mask=replay["loss_mask"],
+        )
+        latest_bc = float(bc_loss)
+        latest_replay_critic = float(critic_loss)
+    behavior_prior = snapshot_behavior_prior(state.params.actor)
+    start_key = benchmark.derive_jax_key(
+        "vnext-actor-start", seed, ACTOR_SEED, horizon, epistemic_scale
+    )
+    objective_key = benchmark.derive_jax_key(
+        "vnext-actor-objective", seed, ACTOR_SEED, horizon, epistemic_scale
+    )
+    latest = None
+    for update in range(actor_updates):
+        schedule_index = preparation_updates + update
+        replay = benchmark._materialize_batch(
+            arrays,
+            total_schedule,
+            schedule_index,
+            sequence_length=sequence_length,
+            burn_in=config.burn_in,
+        )
+        sequence = jit_observe_sequence(
+            state.params.world_model,
+            replay["observations"],
+            replay["actions"],
+            jax.random.fold_in(posterior_key, schedule_index),
+            config,
+            is_first=replay["is_first"],
+        )
+        starts = diverse_imagination_starts(
+            sequence.states,
+            config.burn_in,
+            jax.random.fold_in(start_key, update),
+        )
+        state, metrics = jit_train_actor_critic(
+            state,
+            starts,
+            jax.random.fold_in(objective_key, update),
+            config,
+            behavior_prior=behavior_prior,
+            reward_ensemble_params=None,
+            epistemic_penalty_scale=epistemic_scale,
+        )
+        latest = benchmark._metrics_dict(metrics)
+    if latest is None:
+        raise RuntimeError("actor repair performed no actor update")
+    world_delta = _tree_delta(frozen_world, state.params.world_model)
+    if world_delta != 0.0:
+        raise RuntimeError("actor repair mutated the frozen world model")
+    returns, traces = benchmark._evaluate_actor_policy(
+        state,
+        config,
+        task=TASK,
+        world_model_seed=seed,
+        actor_seed=ACTOR_SEED,
+        episodes=evaluation_episodes,
+        maximum_steps=1000,
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    trace_path = benchmark._write_npz_atomic(directory / "action_traces.npz", traces)
+    checkpoint_path = directory / "checkpoint.pkl"
+    save_checkpoint(
+        checkpoint_path,
+        state,
+        config,
+        metadata={
+            "stage": "advantage_reward_actor",
+            "source_world_model_checkpoint_sha256": world_result[
+                "checkpoint_sha256"
+            ],
+            "completed_updates": actor_updates,
+            "preparation_updates": preparation_updates,
+            "behavior_prior_frozen": True,
+            "epistemic_penalty_scale": epistemic_scale,
+        },
+    )
+    result = {
+        "schema_version": SCHEMA,
+        "stage": "actor",
+        "status": "complete",
+        "source_commit": manifest["source_commit"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "world_model_seed": seed,
+        "actor_seed": ACTOR_SEED,
+        "arm": arm,
+        "variant": manifest["variant"],
+        "imagination_horizon": horizon,
+        "epistemic_penalty_scale": epistemic_scale,
+        "world_model_checkpoint_sha256": world_result["checkpoint_sha256"],
+        "world_model_frozen": True,
+        "world_model_parameter_delta": world_delta,
+        "behavior_prior_frozen": True,
+        "preparation_updates": preparation_updates,
+        "actor_updates": actor_updates,
+        "final_behavior_cloning_loss": latest_bc,
+        "final_replay_critic_loss": latest_replay_critic,
+        "final_metrics": latest,
+        "episode_returns": [float(value) for value in returns],
+        "normalized_episode_returns": [float(value) / 1000.0 for value in returns],
+        "normalized_episode_return_mean": float(np.mean(returns) / 1000.0),
+        "checkpoint_sha256": benchmark.file_sha256(checkpoint_path),
+        "raw_action_traces_sha256": benchmark.file_sha256(trace_path),
+        "runtime_config": asdict(config),
+        "wall_seconds": time.perf_counter() - started,
+        "runtime": benchmark.runtime_fingerprint(),
+    }
+    write_json_atomic(result_path, result)
+    return result
+
+
 def finalize(baseline_root: str | Path, output_root: str | Path, **settings: Any) -> dict[str, Any]:
     manifest = write_manifest(baseline_root, output_root, **settings)
     output = Path(output_root)
     worlds = [read_json(path) for path in sorted(output.glob("world_repair/*/result.json"))]
     probes = [read_json(path) for path in sorted(output.glob("probe_evaluation/*/result.json"))]
+    actors = [read_json(path) for path in sorted(output.glob("actor/*/result.json"))]
     expected = len(WORLD_MODEL_SEEDS) * len(REPAIR_ARMS)
+    expected_actors = (
+        len(WORLD_MODEL_SEEDS)
+        * len(ACTOR_ARMS)
+        * len(HORIZONS)
+        * len(manifest["epistemic_scales"])
+    )
     groups = {}
     for arm in REPAIR_ARMS:
         rows = [row for row in probes if row["arm"] == arm]
@@ -622,17 +866,55 @@ def finalize(baseline_root: str | Path, output_root: str | Path, **settings: Any
             }
             for horizon in ("1", "3", "5", "15")
         } if rows else {}
+    actor_groups = []
+    for scale in manifest["epistemic_scales"]:
+        for horizon in HORIZONS:
+            for arm in ACTOR_ARMS:
+                rows = [
+                    row
+                    for row in actors
+                    if row["arm"] == arm
+                    and row["imagination_horizon"] == horizon
+                    and row["epistemic_penalty_scale"] == scale
+                ]
+                if rows:
+                    actor_groups.append(
+                        {
+                            "arm": arm,
+                            "imagination_horizon": horizon,
+                            "epistemic_penalty_scale": scale,
+                            "cells": len(rows),
+                            "mean_normalized_return": float(
+                                np.mean(
+                                    [row["normalized_episode_return_mean"] for row in rows]
+                                )
+                            ),
+                            "per_seed": {
+                                str(row["world_model_seed"]): row[
+                                    "normalized_episode_return_mean"
+                                ]
+                                for row in rows
+                            },
+                        }
+                    )
     report = {
         "schema_version": SCHEMA,
         "stage": "final",
-        "status": "complete" if len(worlds) == expected and len(probes) == expected else "partial",
+        "status": "complete" if (
+            len(worlds) == expected
+            and len(probes) == expected
+            and len(actors) == expected_actors
+        ) else "partial",
         "source_commit": manifest["source_commit"],
         "manifest_sha256": manifest["manifest_sha256"],
         "completed_world_cells": len(worlds),
         "expected_world_cells": expected,
         "completed_probe_cells": len(probes),
         "expected_probe_cells": expected,
+        "completed_actor_cells": len(actors),
+        "expected_actor_cells": expected_actors,
         "probe_groups": groups,
+        "actor_groups": actor_groups,
         "interpretation": manifest["interpretation"],
     }
     write_json_atomic(output / "report.json", report)
@@ -640,6 +922,7 @@ def finalize(baseline_root: str | Path, output_root: str | Path, **settings: Any
 
 
 __all__ = [
+    "ACTOR_ARMS",
     "REPAIR_ARMS",
     "SCHEMA",
     "VARIANTS",
@@ -650,5 +933,6 @@ __all__ = [
     "materialize_advantage_batch",
     "prepare_train_probe_bank",
     "train_world_repair",
+    "train_repaired_actor",
     "write_manifest",
 ]

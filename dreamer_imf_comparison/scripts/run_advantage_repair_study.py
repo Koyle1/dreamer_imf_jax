@@ -19,13 +19,16 @@ def scales(value: str) -> tuple[float, ...]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "stage", choices=("manifest", "train-probe-bank", "world", "probe", "finalize")
+        "stage",
+        choices=("manifest", "train-probe-bank", "world", "probe", "actor", "finalize"),
     )
     parser.add_argument("--baseline-root", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--variant", choices=study.VARIANTS, default="advantage_reward")
     parser.add_argument("--seed", type=int, choices=study.WORLD_MODEL_SEEDS)
     parser.add_argument("--arm", choices=study.REPAIR_ARMS)
+    parser.add_argument("--horizon", type=int, choices=(5, 15))
+    parser.add_argument("--epistemic-scale", type=float, default=0.0)
     parser.add_argument("--world-updates", type=int, default=1000)
     parser.add_argument("--actor-updates", type=int, default=3000)
     parser.add_argument("--preparation-updates", type=int, default=500)
@@ -57,6 +60,18 @@ def main() -> None:
             parser.error("--seed and --arm are required")
         result = study.evaluate_world_repair(
             args.baseline_root, args.output_root, args.seed, args.arm, **settings
+        )
+    elif args.stage == "actor":
+        if args.seed is None or args.arm is None or args.horizon is None:
+            parser.error("--seed, --arm, and --horizon are required")
+        result = study.train_repaired_actor(
+            args.baseline_root,
+            args.output_root,
+            args.seed,
+            args.arm,
+            args.horizon,
+            epistemic_scale=args.epistemic_scale,
+            **settings,
         )
     else:
         result = study.finalize(args.baseline_root, args.output_root, **settings)
