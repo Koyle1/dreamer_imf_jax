@@ -188,7 +188,19 @@ def write_manifest(
     if path.is_file():
         existing = read_json(path)
         if existing != expected:
-            raise ValueError("existing advantage-repair manifest differs")
+            differing = sorted(
+                key
+                for key in set(existing) | set(expected)
+                if existing.get(key) != expected.get(key)
+            )
+            details = {
+                key: {"existing": existing.get(key), "expected": expected.get(key)}
+                for key in differing
+            }
+            raise ValueError(
+                "existing advantage-repair manifest differs: "
+                + json.dumps(details, sort_keys=True)
+            )
         return existing
     output.mkdir(parents=True, exist_ok=True)
     write_json_atomic(path, expected)
