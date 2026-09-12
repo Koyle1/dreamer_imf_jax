@@ -23,6 +23,7 @@ from .types import (
     RSSMState,
     WorldModelLoss,
 )
+from .uncertainty import pessimistic_rewards
 from .world_model import (
     initial_state,
     init_world_model,
@@ -569,6 +570,42 @@ def _fixed_denominator_weighted_mean(values: Array, weights: Array) -> Array:
     return jnp.mean(values * weights)
 
 
+def sign_only_pmpo_objective(
+    log_probs: Array,
+    advantages: Array,
+    weights: Array,
+    *,
+    positive_weight: float = 1.0,
+    negative_weight: float = 1.0,
+) -> Array:
+    """Dreamer 4 PMPO objective using only advantage signs.
+
+    Positive and negative sets are normalized separately, so rescaling an
+    advantage without crossing zero cannot change the objective. Empty sets
+    contribute zero and never create a division by zero.
+    """
+
+    if log_probs.shape != advantages.shape or log_probs.shape != weights.shape:
+        raise ValueError("PMPO log_probs, advantages, and weights must match")
+    if positive_weight < 0.0 or negative_weight < 0.0:
+        raise ValueError("PMPO set weights must be nonnegative")
+    total_set_weight = positive_weight + negative_weight
+    if total_set_weight <= 0.0:
+        raise ValueError("at least one PMPO set weight must be positive")
+    positive = (advantages >= 0.0).astype(log_probs.dtype)
+    negative = 1.0 - positive
+
+    def set_mean(mask: Array) -> Array:
+        mass = jnp.sum(weights * mask)
+        mean = jnp.sum(log_probs * weights * mask) / jnp.maximum(mass, 1e-8)
+        return jnp.where(mass > 0.0, mean, 0.0)
+
+    return (
+        (positive_weight / total_set_weight) * set_mean(positive)
+        - (negative_weight / total_set_weight) * set_mean(negative)
+    )
+
+
 def _ema(target: Params, source: Params, fraction: float) -> Params:
     return jax.tree_util.tree_map(
         lambda old, new: (1.0 - fraction) * old + fraction * new,
@@ -589,6 +626,82 @@ def _warmup_learning_rate(base: float, optimizer_step: Array, warmup_steps: int)
     return jnp.asarray(base, dtype=jnp.float32) * fraction
 
 
+def train_replay_critic(
+    state: AgentState,
+    features: Array,
+    rewards: Array,
+    continuations: Array,
+    config: DreamerConfig,
+    *,
+    loss_mask: Array | None = None,
+) -> tuple[AgentState, Array]:
+    """Ground the critic on real replay returns, freezing actor and model."""
+
+    if features.ndim != 3 or features.shape[-1] != config.feature_dim:
+        raise ValueError("features must have shape [batch, time, feature_dim]")
+    if rewards.shape != features.shape[:2] or continuations.shape != rewards.shape:
+        raise ValueError("rewards and continuations must match feature leading axes")
+    if loss_mask is None:
+        loss_mask = jnp.ones_like(rewards)
+    elif loss_mask.shape != rewards.shape:
+        raise ValueError("loss_mask must match rewards")
+    features = jax.lax.stop_gradient(features)
+    rewards = jax.lax.stop_gradient(rewards)
+    continuations = jax.lax.stop_gradient(continuations)
+    loss_mask = jax.lax.stop_gradient(jnp.asarray(loss_mask, dtype=rewards.dtype))
+    slow_critic = state.params.critic if state.slow_critic is None else state.slow_critic
+    stopped_values = jax.lax.stop_gradient(critic(slow_critic, features, config))
+    value_path = jnp.concatenate((stopped_values, stopped_values[:, -1:]), axis=1)
+    targets = jax.lax.stop_gradient(
+        lambda_returns(
+            rewards,
+            value_path,
+            continuations,
+            discount=config.discount,
+            lambda_=config.lambda_,
+        )
+    )
+
+    def objective(critic_params: Params) -> Array:
+        if config.critic_bins == 1:
+            per_step = jnp.square(critic(critic_params, features, config) - targets)
+        else:
+            logits = critic_logits(critic_params, features, config)
+            labels = two_hot_symlog(targets, config)
+            per_step = -jnp.sum(
+                labels * jax.nn.log_softmax(logits, axis=-1), axis=-1
+            )
+        return jnp.sum(per_step * loss_mask) / jnp.maximum(jnp.sum(loss_mask), 1.0)
+
+    loss, gradients = jax.value_and_grad(objective)(state.params.critic)
+    gradients, _ = clip_by_global_norm(gradients, config.grad_clip)
+    critic_params, critic_optimizer = adam_update(
+        state.params.critic,
+        gradients,
+        state.critic_optimizer,
+        learning_rate=_warmup_learning_rate(
+            config.critic_learning_rate,
+            state.critic_optimizer.step,
+            config.actor_critic_warmup_steps,
+        ),
+        beta1=config.adam_beta1,
+        beta2=config.adam_beta2,
+        epsilon=config.adam_epsilon,
+    )
+    updated_slow_critic = _ema(
+        slow_critic, critic_params, config.slow_critic_fraction
+    )
+    params = AgentParams(state.params.world_model, state.params.actor, critic_params)
+    return AgentState(
+        params,
+        state.model_optimizer,
+        state.actor_optimizer,
+        critic_optimizer,
+        updated_slow_critic,
+        state.world_model_teacher,
+    ), loss
+
+
 def train_actor_critic(
     state: AgentState,
     start: RSSMState,
@@ -596,6 +709,8 @@ def train_actor_critic(
     config: DreamerConfig,
     *,
     behavior_prior: Params | None = None,
+    reward_ensemble_params: Params | None = None,
+    epistemic_penalty_scale: float = 0.0,
 ) -> tuple[AgentState, ActorCriticMetrics]:
     """Update a stable actor and critic from imagined trajectories.
 
@@ -606,6 +721,12 @@ def train_actor_critic(
     advantage is normalized by the current imagined-return scale.
     """
 
+    if epistemic_penalty_scale < 0.0:
+        raise ValueError("epistemic_penalty_scale must be nonnegative")
+    if epistemic_penalty_scale > 0.0 and reward_ensemble_params is None:
+        raise ValueError(
+            "reward_ensemble_params is required for epistemic pessimism"
+        )
     start = jax.tree_util.tree_map(jax.lax.stop_gradient, start)
     actor_key, critic_rollout_key = jax.random.split(key)
     slow_critic = (
@@ -618,8 +739,16 @@ def train_actor_critic(
         params = AgentParams(state.params.world_model, actor_params, state.params.critic)
         imagined = imagine(params, start, actor_key, config)
         target_values = critic(slow_critic, imagined.features, config)
+        imagined_rewards = imagined.rewards
+        if epistemic_penalty_scale > 0.0:
+            imagined_rewards, _ = pessimistic_rewards(
+                imagined_rewards,
+                jax.lax.stop_gradient(imagined.features[:, 1:]),
+                reward_ensemble_params,
+                penalty_scale=epistemic_penalty_scale,
+            )
         returns = lambda_returns(
-            imagined.rewards,
+            imagined_rewards,
             target_values,
             imagined.continuations,
             discount=config.discount,
@@ -647,36 +776,17 @@ def train_actor_critic(
             )
             if config.actor_gradient == "reinforce":
                 policy_weights = advantage
+                reward_objective = _fixed_denominator_weighted_mean(
+                    imagined.log_probs * policy_weights, weights
+                )
             else:
-                positive = (advantage >= 0.0).astype(advantage.dtype)
-                negative = 1.0 - positive
-                positive_scores = positive * jnp.exp(
-                    jnp.clip(
-                        advantage / config.pmpo_positive_temperature,
-                        -20.0,
-                        20.0,
-                    )
+                reward_objective = sign_only_pmpo_objective(
+                    imagined.log_probs,
+                    advantage,
+                    weights,
+                    positive_weight=config.pmpo_positive_weight,
+                    negative_weight=config.pmpo_negative_weight,
                 )
-                negative_scores = negative * jnp.exp(
-                    jnp.clip(
-                        -advantage / config.pmpo_negative_temperature,
-                        -20.0,
-                        20.0,
-                    )
-                )
-                positive_scores /= jnp.maximum(
-                    jnp.mean(positive_scores), 1e-8
-                )
-                negative_scores /= jnp.maximum(
-                    jnp.mean(negative_scores), 1e-8
-                )
-                policy_weights = jax.lax.stop_gradient(
-                    config.pmpo_positive_weight * positive_scores
-                    - config.pmpo_negative_weight * negative_scores
-                )
-            reward_objective = _fixed_denominator_weighted_mean(
-                imagined.log_probs * policy_weights, weights
-            )
         else:
             reward_objective = _fixed_denominator_weighted_mean(
                 returns / return_scale, weights
@@ -736,9 +846,17 @@ def train_actor_critic(
     rollout_params = AgentParams(state.params.world_model, actor_params, state.params.critic)
     imagined = imagine(rollout_params, start, critic_rollout_key, config)
     target_values = critic(slow_critic, imagined.features, config)
+    imagined_rewards = imagined.rewards
+    if epistemic_penalty_scale > 0.0:
+        imagined_rewards, _ = pessimistic_rewards(
+            imagined_rewards,
+            jax.lax.stop_gradient(imagined.features[:, 1:]),
+            reward_ensemble_params,
+            penalty_scale=epistemic_penalty_scale,
+        )
     targets = jax.lax.stop_gradient(
         lambda_returns(
-            imagined.rewards,
+            imagined_rewards,
             target_values,
             imagined.continuations,
             discount=config.discount,
@@ -830,8 +948,13 @@ jit_imagine = partial(jax.jit, static_argnames=("config", "horizon"))(imagine)
 jit_train_behavior_cloning = partial(jax.jit, static_argnames=("config",))(
     train_behavior_cloning
 )
+jit_train_replay_critic = partial(jax.jit, static_argnames=("config",))(
+    train_replay_critic
+)
 jit_train_world_model = partial(jax.jit, static_argnames=("config",))(train_world_model)
-jit_train_actor_critic = partial(jax.jit, static_argnames=("config",))(train_actor_critic)
+jit_train_actor_critic = partial(
+    jax.jit, static_argnames=("config", "epistemic_penalty_scale")
+)(train_actor_critic)
 
 
 __all__ = [
@@ -850,18 +973,21 @@ __all__ = [
     "jit_act",
     "jit_imagine",
     "jit_train_behavior_cloning",
+    "jit_train_replay_critic",
     "jit_train_actor_critic",
     "jit_train_world_model",
     "lambda_returns",
     "loss_bearing_imagination_starts",
     "sample_actor",
     "snapshot_behavior_prior",
+    "sign_only_pmpo_objective",
     "squashed_normal_entropy_sample",
     "symexp",
     "symlog",
     "tanh_normal_log_prob",
     "train_actor_critic",
     "train_behavior_cloning",
+    "train_replay_critic",
     "train_world_model",
     "two_hot_symlog",
 ]

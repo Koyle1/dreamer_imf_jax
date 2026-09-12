@@ -1,5 +1,8 @@
 # Trajectory iMF comparison harness
 
+The policy-consistency interventions and their gated Reacher protocol are
+documented in [POLICY_CONSISTENCY_VNEXT.md](POLICY_CONSISTENCY_VNEXT.md).
+
 This directory contains the registered comparison between a trajectory-wise
 Improved MeanFlow dynamics objective and the paper-derived
 Equation-(7)-style shortcut-forcing objective. It also includes Gaussian RSSM,

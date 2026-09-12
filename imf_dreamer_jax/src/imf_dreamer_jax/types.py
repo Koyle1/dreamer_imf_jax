@@ -121,6 +121,42 @@ class ActorCriticMetrics(NamedTuple):
     slow_critic_delta: Array
 
 
+class RunningRMSState(NamedTuple):
+    """Online root-mean-square state used by policy-aligned objectives."""
+
+    mean_square: Array
+    count: Array
+
+
+class AdvantageConsistencyLoss(NamedTuple):
+    """Decomposed short-horizon, action-advantage consistency loss."""
+
+    total: Array
+    magnitude: Array
+    ranking: Array
+    flat: Array
+    predicted_advantages: Array
+    target_advantages: Array
+    informative_pair_fraction: Array
+
+
+class BootstrapRewardEnsembleState(NamedTuple):
+    """Independent bootstrap reward heads and their joint optimizer state."""
+
+    params: PyTree
+    optimizer: PyTree
+
+
+class PolicyConsistencyLoss(NamedTuple):
+    """World-model objective with optional decision and exposure terms."""
+
+    total: Array
+    base: WorldModelLoss
+    advantage: AdvantageConsistencyLoss
+    exposure_meanflow: Array
+    endpoint: Array
+
+
 class AgentParams(NamedTuple):
     world_model: PyTree
     actor: PyTree
