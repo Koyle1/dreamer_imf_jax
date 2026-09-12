@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -26,17 +27,25 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 if str(REPOSITORY) not in sys.path:
     sys.path.insert(0, str(REPOSITORY))
 
-from dreamer_imf_compare.policy_alignment_diagnostics import (  # noqa: E402
-    ARM_NAMES,
-    PRESERVATION_SCHEMA,
-    REPORT_SCHEMA,
-    actor_number_summary,
-    aggregate_metric_rows,
-    canonical_sha256,
-    imagined_real_alignment,
-    validate_report,
-    verify_metric_coverage,
+# Verification subcommands remain dependency-light and do not import the full
+# comparison package. Execution imports JAX and dm_control lazily in ``run``.
+DIAGNOSTIC_MODULE = REPOSITORY / "dreamer_imf_compare" / "policy_alignment_diagnostics.py"
+DIAGNOSTIC_SPEC = importlib.util.spec_from_file_location(
+    "policy_alignment_diagnostics", DIAGNOSTIC_MODULE
 )
+if DIAGNOSTIC_SPEC is None or DIAGNOSTIC_SPEC.loader is None:
+    raise ImportError(f"cannot load diagnostic module {DIAGNOSTIC_MODULE}")
+diagnostics = importlib.util.module_from_spec(DIAGNOSTIC_SPEC)
+DIAGNOSTIC_SPEC.loader.exec_module(diagnostics)
+
+ARM_NAMES = diagnostics.ARM_NAMES
+PRESERVATION_SCHEMA = diagnostics.PRESERVATION_SCHEMA
+REPORT_SCHEMA = diagnostics.REPORT_SCHEMA
+actor_number_summary = diagnostics.actor_number_summary
+aggregate_metric_rows = diagnostics.aggregate_metric_rows
+imagined_real_alignment = diagnostics.imagined_real_alignment
+validate_report = diagnostics.validate_report
+verify_metric_coverage = diagnostics.verify_metric_coverage
 
 
 def read_json(path: str | Path) -> Any:
