@@ -230,10 +230,6 @@
       "imf_trajectory_corrupted_probability": 0.3333333333333333,
       "imf_trajectory_suffix_probability": 0.3333333333333333,
       "imf_trajectory_history_noise_max": 1.0,
-      "imf_causal_consistency_scale": 0.0,
-      "imf_causal_reward_scale": 1.0,
-      "imf_causal_huber_delta": 1.0,
-      "imf_causal_normalization_epsilon": 0.001,
       "shortcut_sampling_steps": 4,
       "shortcut_bootstrap_ema_decay": 0.999,
       "shortcut_intermediate_clip": 4.0,
@@ -294,7 +290,7 @@
     "resolution_contract": {
       "pilot_candidate_configs_are_complete_and_executable": true,
       "confirmatory_execution_requires_immutable_selection_manifest": true,
-      "resolved_config_must_contain_exactly_all_83_non_task_shape_DreamerConfig_fields": true,
+      "resolved_config_must_contain_exactly_all_79_non_task_shape_DreamerConfig_fields": true,
       "selected_values_are_substituted_before_DreamerConfig_construction": true,
       "unresolved_placeholders_or_unknown_keys_are_fatal": true,
       "resolved_config_and_sha256_are_retained_per_run": true

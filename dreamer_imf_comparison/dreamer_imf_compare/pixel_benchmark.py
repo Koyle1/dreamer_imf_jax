@@ -595,6 +595,14 @@ def resolved_config(
             "dreamer_config_non_task_shape_common"
         ]
     )
+    # Preserve the frozen parent protocol identity while explicitly disabling
+    # the later causal-consistency extension for every legacy pixel arm.
+    common.update(
+        imf_causal_consistency_scale=0.0,
+        imf_causal_reward_scale=1.0,
+        imf_causal_huber_delta=1.0,
+        imf_causal_normalization_epsilon=1e-3,
+    )
     common["overshooting_distances"] = tuple(common["overshooting_distances"])
     common.update(protocol["profiles"][profile]["model_overrides"])
     common["burn_in"] = int(protocol["profiles"][profile]["burn_in"])

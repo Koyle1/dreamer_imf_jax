@@ -2019,6 +2019,15 @@ def make_config(
     common = dict(
         protocol["canonical_executable_config"]["dreamer_config_non_task_shape_common"]
     )
+    # These fields were added after the matched-objective protocol was frozen.
+    # Resolve them explicitly to a no-op rather than changing that protocol's
+    # identity or silently relying on future library defaults.
+    common.update(
+        imf_causal_consistency_scale=0.0,
+        imf_causal_reward_scale=1.0,
+        imf_causal_huber_delta=1.0,
+        imf_causal_normalization_epsilon=1e-3,
+    )
     common["overshooting_distances"] = tuple(common["overshooting_distances"])
     common["observation_shape"] = tuple(int(value) for value in observation_shape)
     common["action_dim"] = int(action_dim)

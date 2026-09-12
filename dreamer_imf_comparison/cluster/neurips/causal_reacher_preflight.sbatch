@@ -21,7 +21,7 @@ module purge
 module load Python/3.12.3-GCCcore-13.3.0
 source "${ENV_ROOT}/bin/activate"
 
-export PYTHONPATH="${CAUSAL_SOURCE_ROOT}/imf_dreamer_jax/src:${CAUSAL_SOURCE_ROOT}/dreamer_imf_comparison"
+export PYTHONPATH="${CAUSAL_SOURCE_ROOT}:${CAUSAL_SOURCE_ROOT}/imf_dreamer_jax/src:${CAUSAL_SOURCE_ROOT}/dreamer_imf_comparison"
 export JAX_ENABLE_X64=0
 export JAX_PLATFORM_NAME=gpu
 export JAX_ENABLE_COMPILATION_CACHE=true
