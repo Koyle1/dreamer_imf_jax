@@ -12,7 +12,7 @@ from .fidelity import IMFNoiseCoupling
 PriorKind = Literal["gaussian", "imf", "shortcut"]
 ActorGradient = Literal["reinforce", "dynamics", "pmpo"]
 ImaginationStartMode = Literal["all", "one_per_sequence"]
-RewardLoss = Literal["mse", "binary_cross_entropy"]
+RewardLoss = Literal["mse", "binary_cross_entropy", "symexp_twohot"]
 
 
 def _positive_int(name: str, value: int) -> None:
@@ -49,6 +49,10 @@ class DreamerConfig:
     reward_initial_value: float = 0.0
     reward_output_init_scale: float = 0.0
     reward_loss: RewardLoss = "mse"
+    reward_prediction_horizon: int = 0
+    reward_bins: int = 1
+    reward_symlog_min: float = -20.0
+    reward_symlog_max: float = 20.0
     continuation_scale: float = 1.0
     overshooting_horizon: int = 1
     burn_in: int = 0
@@ -130,6 +134,7 @@ class DreamerConfig:
             "overshooting_horizon",
             "imagination_horizon",
             "critic_bins",
+            "reward_bins",
             "imf_sampling_steps",
             "shortcut_sampling_steps",
         ):
@@ -182,8 +187,36 @@ class DreamerConfig:
             value = getattr(self, name)
             if value is not None and (not math.isfinite(value) or value <= 0.0):
                 raise ValueError(f"{name} must be None or finite and positive")
-        if self.reward_loss not in ("mse", "binary_cross_entropy"):
-            raise ValueError("reward_loss must be 'mse' or 'binary_cross_entropy'")
+        if self.reward_loss not in ("mse", "binary_cross_entropy", "symexp_twohot"):
+            raise ValueError(
+                "reward_loss must be 'mse', 'binary_cross_entropy', or 'symexp_twohot'"
+            )
+        if (
+            not isinstance(self.reward_prediction_horizon, int)
+            or isinstance(self.reward_prediction_horizon, bool)
+            or self.reward_prediction_horizon < 0
+        ):
+            raise ValueError("reward_prediction_horizon must be a nonnegative integer")
+        if self.reward_loss == "symexp_twohot":
+            if self.reward_bins <= 1:
+                raise ValueError("symexp_twohot reward loss requires reward_bins > 1")
+            if self.reward_min is not None or self.reward_max is not None:
+                raise ValueError("symexp_twohot reward loss uses symlog support, not reward bounds")
+        elif self.reward_bins != 1:
+            raise ValueError("scalar reward losses require reward_bins == 1")
+        if (
+            not math.isfinite(self.reward_symlog_min)
+            or not math.isfinite(self.reward_symlog_max)
+            or self.reward_symlog_min >= 0.0
+            or self.reward_symlog_max <= 0.0
+            or not math.isclose(
+                -self.reward_symlog_min,
+                self.reward_symlog_max,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError("reward symlog support must be finite and symmetric around zero")
         if (self.reward_min is None) != (self.reward_max is None):
             raise ValueError("reward_min and reward_max must either both be set or both be None")
         if self.reward_min is not None:
@@ -350,6 +383,12 @@ class DreamerConfig:
     @property
     def feature_dim(self) -> int:
         return self.deterministic_dim + self.stochastic_dim
+
+    @property
+    def reward_head_output_dim(self) -> int:
+        """Number of logits emitted by the flattened multi-token reward head."""
+
+        return (self.reward_prediction_horizon + 1) * self.reward_bins
 
     @property
     def method_name(self) -> str:

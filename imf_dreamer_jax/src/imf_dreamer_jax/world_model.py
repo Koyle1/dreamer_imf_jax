@@ -37,6 +37,34 @@ from .types import (
 Batch = Mapping[str, Array]
 
 
+def init_reward_head(config: DreamerConfig, key: Array) -> Params:
+    """Initialize the flattened offset-by-support reward prediction head."""
+
+    reward = init_mlp(
+        key,
+        config.feature_dim,
+        config.hidden_dim,
+        config.reward_head_output_dim,
+        output_gain=config.reward_output_init_scale,
+    )
+    reward_layers = list(reward["layers"])
+    reward_output = dict(reward_layers[-1])
+    if config.reward_loss == "symexp_twohot":
+        # Uniform logits are the neutral categorical initialization used by
+        # distributional Dreamer heads.
+        reward_bias = 0.0
+    elif config.reward_min is None:
+        reward_bias = config.reward_initial_value
+    else:
+        fraction = (config.reward_initial_value - config.reward_min) / (
+            config.reward_max - config.reward_min
+        )
+        reward_bias = math.log(fraction) - math.log1p(-fraction)
+    reward_output["bias"] = jnp.full_like(reward_output["bias"], reward_bias)
+    reward_layers[-1] = reward_output
+    return {"layers": tuple(reward_layers)}
+
+
 def init_world_model(config: DreamerConfig, key: Array) -> Params:
     """Initialize all recurrent world-model parameters."""
 
@@ -50,25 +78,7 @@ def init_world_model(config: DreamerConfig, key: Array) -> Params:
         prior_key,
         _,
     ) = jax.random.split(key, 8)
-    reward = init_mlp(
-        reward_key,
-        config.feature_dim,
-        config.hidden_dim,
-        1,
-        output_gain=config.reward_output_init_scale,
-    )
-    reward_layers = list(reward["layers"])
-    reward_output = dict(reward_layers[-1])
-    if config.reward_min is None:
-        reward_bias = config.reward_initial_value
-    else:
-        fraction = (config.reward_initial_value - config.reward_min) / (
-            config.reward_max - config.reward_min
-        )
-        reward_bias = math.log(fraction) - math.log1p(-fraction)
-    reward_output["bias"] = jnp.full_like(reward_output["bias"], reward_bias)
-    reward_layers[-1] = reward_output
-    reward = {"layers": tuple(reward_layers)}
+    reward = init_reward_head(config, reward_key)
 
     params: Params = {
         "encoder": init_mlp(
@@ -698,15 +708,90 @@ def predict_reward_logits(params: Params, feature: Array) -> Array:
     return mlp(params["reward"], feature)[..., 0]
 
 
+def reward_support(config: DreamerConfig, *, dtype: jnp.dtype = jnp.float32) -> Array:
+    """Return the symlog support for a categorical reward head."""
+
+    if config.reward_loss != "symexp_twohot" or config.reward_bins <= 1:
+        raise ValueError("reward support requires a symexp_twohot reward head")
+    return jnp.linspace(
+        config.reward_symlog_min,
+        config.reward_symlog_max,
+        config.reward_bins,
+        dtype=dtype,
+    )
+
+
+def two_hot_reward(target: Array, config: DreamerConfig) -> Array:
+    """Encode rewards by linear interpolation on the configured symlog support."""
+
+    support = reward_support(config, dtype=target.dtype)
+    transformed = jnp.clip(
+        jnp.sign(target) * jnp.log1p(jnp.abs(target)),
+        config.reward_symlog_min,
+        config.reward_symlog_max,
+    )
+    width = support[1] - support[0]
+    position = (transformed - support[0]) / width
+    lower = jnp.floor(position).astype(jnp.int32)
+    upper = jnp.minimum(lower + 1, config.reward_bins - 1)
+    upper_weight = position - lower.astype(position.dtype)
+    lower_weight = 1.0 - upper_weight
+    encoded = (
+        jax.nn.one_hot(lower, config.reward_bins, dtype=target.dtype)
+        * lower_weight[..., None]
+    )
+    encoded += (
+        jax.nn.one_hot(upper, config.reward_bins, dtype=target.dtype)
+        * upper_weight[..., None]
+    )
+    return encoded
+
+
+def predict_reward_offset_logits(
+    params: Params, feature: Array, config: DreamerConfig
+) -> Array:
+    """Return logits as ``[..., offset, support]`` for offsets zero through L."""
+
+    raw = mlp(params["reward"], feature)
+    expected = config.reward_head_output_dim
+    if raw.shape[-1] != expected:
+        raise ValueError(
+            f"reward output dimension {raw.shape[-1]} does not match configured {expected}"
+        )
+    return raw.reshape(
+        (*raw.shape[:-1], config.reward_prediction_horizon + 1, config.reward_bins)
+    )
+
+
+def predict_reward_offsets(
+    params: Params, feature: Array, config: DreamerConfig
+) -> Array:
+    """Decode all reward offsets to scalar expectations."""
+
+    logits = predict_reward_offset_logits(params, feature, config)
+    if config.reward_loss == "symexp_twohot":
+        mean_symlog = jnp.sum(
+            jax.nn.softmax(logits, axis=-1)
+            * reward_support(config, dtype=logits.dtype),
+            axis=-1,
+        )
+        return jnp.sign(mean_symlog) * jnp.expm1(jnp.abs(mean_symlog))
+    raw = logits[..., 0]
+    if config.reward_min is None:
+        return raw
+    return config.reward_min + (
+        config.reward_max - config.reward_min
+    ) * jax.nn.sigmoid(raw)
+
+
 def predict_reward(
     params: Params, feature: Array, config: DreamerConfig | None = None
 ) -> Array:
     """Predict reward, optionally constrained to the configured finite support."""
 
-    raw = predict_reward_logits(params, feature)
-    if config is None or config.reward_min is None:
-        return raw
-    return config.reward_min + (config.reward_max - config.reward_min) * jax.nn.sigmoid(raw)
+    if config is None:
+        return predict_reward_logits(params, feature)
+    return predict_reward_offsets(params, feature, config)[..., 0]
 
 
 def predict_continuation_logits(params: Params, feature: Array) -> Array:
@@ -745,6 +830,94 @@ def _masked_mean(value: Array, mask: Array) -> Array:
         value = jnp.mean(value, axis=tuple(range(2, value.ndim)))
     mask = jnp.asarray(mask, dtype=value.dtype)
     return jnp.sum(value * mask) / jnp.maximum(jnp.sum(mask), jnp.asarray(1.0, value.dtype))
+
+
+def reward_mtp_targets(
+    rewards: Array,
+    continuations: Array,
+    is_first: Array,
+    loss_mask: Array,
+    horizon: int,
+) -> tuple[Array, Array]:
+    """Build future reward targets without crossing padding or episode boundaries.
+
+    Offset zero is the reward aligned with the current latent.  Offset ``n``
+    is valid only when the target is in bounds, every intervening transition
+    continues, and no intervening token starts a new episode.
+    """
+
+    rewards = jnp.asarray(rewards)
+    if rewards.ndim != 2:
+        raise ValueError("rewards must have shape [batch, time]")
+    if continuations.shape != rewards.shape or is_first.shape != rewards.shape:
+        raise ValueError("continuations and is_first must match rewards")
+    if loss_mask.shape != rewards.shape:
+        raise ValueError("loss_mask must match rewards")
+    if not isinstance(horizon, int) or isinstance(horizon, bool) or horizon < 0:
+        raise ValueError("horizon must be a nonnegative integer")
+    batch, time = rewards.shape
+    targets: list[Array] = []
+    masks: list[Array] = []
+    anchor_mask = jnp.asarray(loss_mask, dtype=rewards.dtype)
+    continuation = jnp.asarray(continuations, dtype=rewards.dtype)
+    first = jnp.asarray(is_first, dtype=jnp.bool_)
+    for offset in range(horizon + 1):
+        if offset >= time:
+            target = jnp.zeros_like(rewards)
+            valid = jnp.zeros_like(rewards)
+        else:
+            target = jnp.pad(
+                rewards[:, offset:], ((0, 0), (0, offset))
+            )
+            valid_prefix = jnp.ones((batch, time - offset), dtype=rewards.dtype)
+            for step in range(offset):
+                valid_prefix = valid_prefix * continuation[
+                    :, step : step + time - offset
+                ]
+                valid_prefix = valid_prefix * (~first[
+                    :, step + 1 : step + 1 + time - offset
+                ]).astype(rewards.dtype)
+            valid = jnp.pad(valid_prefix, ((0, 0), (0, offset)))
+        targets.append(target)
+        masks.append(anchor_mask * valid)
+    return (
+        jax.lax.stop_gradient(jnp.stack(targets, axis=-1)),
+        jax.lax.stop_gradient(jnp.stack(masks, axis=-1)),
+    )
+
+
+def reward_prediction_loss(
+    params: Params,
+    feature: Array,
+    rewards: Array,
+    continuations: Array,
+    is_first: Array,
+    loss_mask: Array,
+    config: DreamerConfig,
+) -> Array:
+    """Terminal-safe scalar or categorical multi-token reward loss."""
+
+    if feature.shape[:2] != rewards.shape:
+        raise ValueError("reward features must begin with [batch, time]")
+    targets, masks = reward_mtp_targets(
+        rewards,
+        continuations,
+        is_first,
+        loss_mask,
+        config.reward_prediction_horizon,
+    )
+    logits = predict_reward_offset_logits(params, feature, config)
+    if config.reward_loss == "symexp_twohot":
+        labels = two_hot_reward(targets, config)
+        per_target = -jnp.sum(labels * jax.nn.log_softmax(logits, axis=-1), axis=-1)
+    elif config.reward_loss == "binary_cross_entropy":
+        normalized = (targets - config.reward_min) / (config.reward_max - config.reward_min)
+        per_target = _binary_cross_entropy_with_logits(logits[..., 0], normalized)
+    else:
+        prediction = predict_reward_offsets(params, feature, config)
+        per_target = jnp.square(prediction - targets)
+    denominator = jnp.maximum(jnp.sum(masks), jnp.asarray(1.0, masks.dtype))
+    return jnp.sum(per_target * masks) / denominator
 
 
 def _pseudo_huber(value: Array, delta: float) -> Array:
@@ -1092,20 +1265,15 @@ def world_model_loss(
     reconstruction = _masked_mean(
         jnp.square(decode(params, feature, config) - targets), loss_mask
     )
-    if config.reward_loss == "binary_cross_entropy":
-        normalized_rewards = (rewards - config.reward_min) / (
-            config.reward_max - config.reward_min
-        )
-        reward = _masked_mean(
-            _binary_cross_entropy_with_logits(
-                predict_reward_logits(params, feature), normalized_rewards
-            ),
-            loss_mask,
-        )
-    else:
-        reward = _masked_mean(
-            jnp.square(predict_reward(params, feature, config) - rewards), loss_mask
-        )
+    reward = reward_prediction_loss(
+        params,
+        feature,
+        rewards,
+        continuations,
+        is_first,
+        loss_mask,
+        config,
+    )
     continuation = _masked_mean(
         _binary_cross_entropy_with_logits(
             predict_continuation_logits(params, feature), continuations
