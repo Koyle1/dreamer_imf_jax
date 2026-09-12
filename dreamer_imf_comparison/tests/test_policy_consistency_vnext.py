@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
+from unittest import mock
 
 import numpy as np
 
@@ -11,6 +13,7 @@ from dreamer_imf_compare.shared_probe_bank import (
     validate_shared_probe_bank,
 )
 from dreamer_imf_compare.advantage_repair_study import materialize_advantage_batch
+from dreamer_imf_compare import advantage_repair_study
 
 
 def arrays() -> dict[str, np.ndarray]:
@@ -137,6 +140,21 @@ class SharedProbeBankTests(unittest.TestCase):
         self.assertEqual(
             int(np.sum(np.asarray(materialized["advantage_mask"][:, 1]))), 6
         )
+
+    def test_repair_manifest_round_trip_canonicalizes_tuples(self) -> None:
+        manifest = {
+            "objective": {"advantage_horizons": (1, 3, 5)},
+            "epistemic_scales": (0.0,),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                advantage_repair_study, "build_manifest", return_value=manifest
+            ):
+                first = advantage_repair_study.write_manifest("unused", directory)
+                second = advantage_repair_study.write_manifest("unused", directory)
+        self.assertEqual(first, second)
+        self.assertEqual(first["objective"]["advantage_horizons"], [1, 3, 5])
+        self.assertEqual(first["epistemic_scales"], [0.0])
 
 
 if __name__ == "__main__":

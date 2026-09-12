@@ -41,6 +41,12 @@ VARIANTS = (
 )
 
 
+def _json_native(value: Any) -> Any:
+    """Canonicalize tuples and scalar containers before persistence/comparison."""
+
+    return json.loads(json.dumps(value, sort_keys=True))
+
+
 def _git_commit() -> str:
     root = Path(__file__).resolve().parents[2]
     return subprocess.check_output(
@@ -174,6 +180,7 @@ def build_manifest(
             "fine_tuning_not_matched_compute_superiority_evidence": True,
         },
     }
+    manifest = _json_native(manifest)
     return {**manifest, "manifest_sha256": benchmark.object_sha256(manifest)}
 
 
@@ -182,7 +189,7 @@ def write_manifest(
     output_root: str | Path,
     **settings: Any,
 ) -> dict[str, Any]:
-    expected = build_manifest(baseline_root, **settings)
+    expected = _json_native(build_manifest(baseline_root, **settings))
     output = Path(output_root)
     path = output / "manifest.json"
     if path.is_file():
