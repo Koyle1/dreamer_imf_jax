@@ -16,7 +16,7 @@ from .config import DreamerConfig
 from .types import AgentState
 
 
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
 
 
 def save_checkpoint(
@@ -68,4 +68,3 @@ def load_checkpoint(
     config = DreamerConfig(**payload["config"])
     state = jax.tree_util.tree_map(jnp.asarray, payload["state"])
     return state, config, dict(payload.get("metadata", {}))
-

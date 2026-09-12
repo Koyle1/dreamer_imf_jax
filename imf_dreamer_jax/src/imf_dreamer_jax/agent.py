@@ -329,6 +329,12 @@ def create_agent(config: DreamerConfig, key: Array) -> AgentState:
         init_adam(params.actor),
         init_adam(params.critic),
         params.critic,
+        (
+            params.world_model
+            if config.prior == "shortcut"
+            and config.shortcut_bootstrap_ema_decay is not None
+            else None
+        ),
     )
 
 
@@ -460,7 +466,13 @@ def train_world_model(
     """Run one clipped Adam update of the recurrent world model."""
 
     def objective(model_params: Params):
-        losses = world_model_loss(model_params, batch, key, config)
+        losses = world_model_loss(
+            model_params,
+            batch,
+            key,
+            config,
+            shortcut_teacher_params=state.world_model_teacher,
+        )
         return losses.total, losses
 
     (_, losses), gradients = jax.value_and_grad(objective, has_aux=True)(
@@ -476,6 +488,17 @@ def train_world_model(
         beta2=config.adam_beta2,
         epsilon=config.adam_epsilon,
     )
+    world_model_teacher = state.world_model_teacher
+    if config.prior == "shortcut" and config.shortcut_bootstrap_ema_decay is not None:
+        if world_model_teacher is None:
+            world_model_teacher = state.params.world_model
+        world_model_teacher = _ema(
+            world_model_teacher,
+            model_params,
+            1.0 - config.shortcut_bootstrap_ema_decay,
+        )
+    elif config.prior != "shortcut":
+        world_model_teacher = None
     params = AgentParams(model_params, state.params.actor, state.params.critic)
     return AgentState(
         params,
@@ -483,6 +506,7 @@ def train_world_model(
         state.actor_optimizer,
         state.critic_optimizer,
         state.slow_critic,
+        world_model_teacher,
     ), losses
 
 
@@ -515,6 +539,7 @@ def train_behavior_cloning(
         actor_optimizer,
         state.critic_optimizer,
         state.slow_critic,
+        state.world_model_teacher,
     ), loss
 
 
@@ -773,6 +798,7 @@ def train_actor_critic(
         actor_optimizer,
         critic_optimizer,
         updated_slow_critic,
+        state.world_model_teacher,
     )
     actor_imagined, actor_returns, return_scale = actor_auxiliary
     actor_weights = _discount_weights(

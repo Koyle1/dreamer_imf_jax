@@ -97,6 +97,9 @@ DREAMER_CONFIG_NON_TASK_SHAPE_FIELDS = (
     "imf_trajectory_history_noise_max",
     "shortcut_training_k_max",
     "shortcut_sampling_steps",
+    "shortcut_bootstrap_ema_decay",
+    "shortcut_intermediate_clip",
+    "shortcut_support_safe_bootstrap",
     "shortcut_sampling_clip",
     "imagination_horizon",
     "discount",
@@ -172,7 +175,10 @@ FROZEN_DREAMER_CONFIG_COMMON = {
     "imf_trajectory_suffix_probability": 1.0 / 3.0,
     "imf_trajectory_history_noise_max": 1.0,
     "shortcut_sampling_steps": 4,
-    "shortcut_sampling_clip": 10.0,
+    "shortcut_bootstrap_ema_decay": 0.999,
+    "shortcut_intermediate_clip": 4.0,
+    "shortcut_support_safe_bootstrap": True,
+    "shortcut_sampling_clip": None,
     "imagination_horizon": 15,
     "discount": 0.99,
     "lambda_": 0.95,
@@ -456,7 +462,10 @@ def _validate_claim_and_source(protocol: Mapping[str, Any]) -> None:
             "pilot_selected_training_k_max_from_{4,8,16}",
             "primary_clean_observed_prefix_then_unmodified_generated_history",
             "state_observations_and_current_library_architecture",
-            "custom_clipped_Adam_without_weight_decay_or_world_model_EMA",
+            "custom_clipped_Adam_without_weight_decay_with_shortcut_bootstrap_EMA_teacher",
+            "bounded_shortcut_bootstrap_intermediate_at_absolute_value_4",
+            "support_safe_finest_tokens_without_below_training_support_teacher_queries",
+            "unclipped_shortcut_generation_with_fail_closed_divergence_gate",
         ],
         "source.declared_reimplementation_choices",
     )
@@ -564,6 +573,9 @@ def _validate_shortcut_arm(arm: Mapping[str, Any]) -> None:
             "two_half_steps",
             "target_stop_gradient",
             "target_expression",
+            "teacher",
+            "intermediate_clip",
+            "support_safe_composition",
         },
         "arms.shortcut_forcing.bootstrap",
     )
@@ -577,8 +589,23 @@ def _validate_shortcut_arm(arm: Mapping[str, Any]) -> None:
     _bool(bootstrap["target_stop_gradient"], True, "shortcut bootstrap target_stop_gradient")
     _equal(
         bootstrap["target_expression"],
-        "stop_gradient((b1+b2)/2)",
+        "x_target=z_tau+(1-tau)*stop_gradient((b1+b2)/2)",
         "shortcut bootstrap target_expression",
+    )
+    _equal(
+        bootstrap["teacher"],
+        "ema_parameters_decay_0.999_updated_after_student",
+        "shortcut bootstrap teacher",
+    )
+    _equal(
+        _finite(bootstrap["intermediate_clip"], "shortcut intermediate clip"),
+        4.0,
+        "shortcut intermediate clip",
+    )
+    _equal(
+        bootstrap["support_safe_composition"],
+        "finest_tokens_keep_z_tau_and_teacher_step_never_below_1_over_k_max",
+        "shortcut support-safe composition",
     )
 
     loss = _mapping(arm["loss"], "arms.shortcut_forcing.loss")
@@ -858,12 +885,16 @@ def _validate_shared_controls(protocol: Mapping[str, Any]) -> None:
     _equal(optimization["optimizer"], "library_custom_global_norm_clipped_Adam", "shared optimizer")
     _equal(optimization["gradient_clipping"], "global_norm_before_Adam_moment_updates", "shared gradient clipping")
     _equal(_finite(optimization["weight_decay"], "shared weight decay"), 0.0, "shared weight decay")
-    _bool(optimization["world_model_ema_enabled"], False, "world-model EMA")
-    _equal(optimization["world_model_ema_use"], "none", "world-model EMA use")
+    _bool(optimization["world_model_ema_enabled"], True, "world-model EMA")
+    _equal(
+        optimization["world_model_ema_use"],
+        "shortcut_bootstrap_teacher_only_not_evaluation_or_actor_rollout",
+        "world-model EMA use",
+    )
     _bool(optimization["slow_critic_ema_is_not_world_model_ema"], True, "slow critic distinction")
     _equal(
         optimization["shortcut_bootstrap_teacher"],
-        "stop_gradient_of_live_parameters_not_ema",
+        "stop_gradient_of_ema_parameters_decay_0.999",
         "shortcut bootstrap teacher",
     )
     sensitivity = _mapping(shared["end_to_end_sensitivity"], "end_to_end_sensitivity")
@@ -1019,7 +1050,7 @@ def _validate_canonical_executable_config(protocol: Mapping[str, Any]) -> None:
         {
             "pilot_candidate_configs_are_complete_and_executable",
             "confirmatory_execution_requires_immutable_selection_manifest",
-            "resolved_config_must_contain_exactly_all_76_non_task_shape_DreamerConfig_fields",
+            "resolved_config_must_contain_exactly_all_79_non_task_shape_DreamerConfig_fields",
             "selected_values_are_substituted_before_DreamerConfig_construction",
             "unresolved_placeholders_or_unknown_keys_are_fatal",
             "resolved_config_and_sha256_are_retained_per_run",
@@ -1066,7 +1097,11 @@ def _validate_canonical_executable_config(protocol: Mapping[str, Any]) -> None:
     _equal(optimizer["gradient_transform"], "global_norm_clip_at_DreamerConfig.grad_clip_before_first_and_second_moment_updates", "optimizer clipping")
     _equal(optimizer["update"], "bias_corrected_Adam_parameter_minus_lr_mhat_over_(sqrt(vhat)+epsilon)", "Adam update")
     _equal(optimizer["weight_decay"], 0.0, "optimizer weight decay")
-    _bool(optimizer["world_model_ema"], False, "optimizer world-model EMA")
+    _equal(
+        optimizer["world_model_ema"],
+        "shortcut_bootstrap_teacher_only_decay_0.999",
+        "optimizer world-model EMA",
+    )
     _equal(optimizer["slow_critic_update"], "slow=(1-slow_critic_fraction)*slow+slow_critic_fraction*online_after_each_critic_update", "slow critic update")
 
     losses = _mapping(executable["loss_semantics"], "loss semantics")
@@ -1090,7 +1125,7 @@ def _validate_canonical_executable_config(protocol: Mapping[str, Any]) -> None:
     _equal(actor["start_context"], "one_uniform_post_burn_in_posterior_state_per_replay_sequence", "actor start context")
     _equal(actor["start_count_per_actor_update"], batch["batch_size"], "actor start count")
     _equal(actor["imagination_horizon"], common["imagination_horizon"], "actor horizon")
-    _equal(actor["sampler_by_arm"], {"shortcut_forcing": "stochastic_4_step_shortcut_sampler_with_clean_prediction_clip_10", "trajectory_imf": "stochastic_1_step_iMF_sampler"}, "actor samplers")
+    _equal(actor["sampler_by_arm"], {"shortcut_forcing": "stochastic_4_step_shortcut_sampler_without_output_clipping", "trajectory_imf": "stochastic_1_step_iMF_sampler"}, "actor samplers")
     _equal(actor["behavior_prior"], "disabled", "actor behavior prior")
     _equal(actor["real_environment_evaluation_action"], "deterministic_tanh_of_actor_mean", "actor evaluation action")
     _bool(actor["extra_generated_history_corruption"], False, "actor generated-history corruption")

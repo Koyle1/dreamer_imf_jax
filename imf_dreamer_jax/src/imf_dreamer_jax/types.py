@@ -136,6 +136,7 @@ class AgentState(NamedTuple):
     actor_optimizer: AdamState
     critic_optimizer: AdamState
     slow_critic: PyTree | None = None
+    world_model_teacher: PyTree | None = None
 
 
 class PredictiveMoments(NamedTuple):

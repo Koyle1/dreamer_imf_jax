@@ -14,8 +14,14 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import imf_dreamer_jax.world_model as world_model_module
-from imf_dreamer_jax.agent import create_agent, imagine, jit_train_actor_critic
+from imf_dreamer_jax.agent import (
+    create_agent,
+    imagine,
+    jit_train_actor_critic,
+    train_world_model,
+)
 from imf_dreamer_jax.config import DreamerConfig
+from imf_dreamer_jax.shortcut import shortcut_forcing_loss
 from imf_dreamer_jax.world_model import (
     init_world_model,
     initial_state,
@@ -137,6 +143,10 @@ class ShortcutConfigurationTests(unittest.TestCase):
             shortcut_config(shortcut_sampling_clip=0.0)
         with self.assertRaisesRegex(ValueError, "shortcut_sampling_clip"):
             shortcut_config(shortcut_sampling_clip=float("inf"))
+        with self.assertRaisesRegex(ValueError, "shortcut_intermediate_clip"):
+            shortcut_config(shortcut_intermediate_clip=0.0)
+        with self.assertRaisesRegex(ValueError, "shortcut_bootstrap_ema_decay"):
+            shortcut_config(shortcut_bootstrap_ema_decay=1.0)
 
     def test_signal_time_and_step_size_must_be_supplied_as_a_pair(self) -> None:
         config = shortcut_config()
@@ -231,6 +241,7 @@ class ShortcutContextTests(unittest.TestCase):
         np.testing.assert_allclose(changed[:, 3:], baseline[:, 3:], rtol=0.0, atol=0.0)
 
     def test_equation_seven_rebuilds_context_for_z_prime_and_midpoint(self) -> None:
+        config = replace(self.config, shortcut_support_safe_bootstrap=False)
         real_conditions = world_model_module.shortcut_deterministic_conditions
         calls: list[tuple[jax.Array, jax.Array, jax.Array]] = []
 
@@ -244,7 +255,7 @@ class ShortcutContextTests(unittest.TestCase):
             side_effect=record,
         ):
             world_model_loss(
-                self.params, self.batch, jax.random.key(1218), self.config
+                self.params, self.batch, jax.random.key(1218), config
             )
 
         self.assertEqual(len(calls), 3)
@@ -265,7 +276,7 @@ class ShortcutContextTests(unittest.TestCase):
             second_step,
             self.batch["actions"],
             self.batch["is_first"],
-            self.config,
+            config,
         )
         stale = real_conditions(
             self.params,
@@ -274,9 +285,120 @@ class ShortcutContextTests(unittest.TestCase):
             second_step,
             self.batch["actions"],
             self.batch["is_first"],
-            self.config,
+            config,
         )
         self.assertGreater(float(jnp.max(jnp.abs(rebuilt - stale))), 1e-6)
+
+
+class ShortcutStabilityRepairTests(unittest.TestCase):
+    def test_ema_teacher_updates_after_student(self) -> None:
+        config = shortcut_config(shortcut_bootstrap_ema_decay=0.9)
+        state = create_agent(config, jax.random.key(1240))
+        self.assertIsNotNone(state.world_model_teacher)
+        old_teacher = state.world_model_teacher
+        updated, _ = train_world_model(
+            state, make_batch(config), jax.random.key(1241), config
+        )
+        expected = jax.tree_util.tree_map(
+            lambda old, new: 0.9 * old + 0.1 * new,
+            old_teacher,
+            updated.params.world_model,
+        )
+        for actual, wanted in zip(
+            jax.tree_util.tree_leaves(updated.world_model_teacher),
+            jax.tree_util.tree_leaves(expected),
+            strict=True,
+        ):
+            np.testing.assert_allclose(actual, wanted, rtol=2e-6, atol=2e-6)
+        self.assertGreater(
+            sum(
+                float(jnp.sum(jnp.abs(new - old)))
+                for new, old in zip(
+                    jax.tree_util.tree_leaves(updated.params.world_model),
+                    jax.tree_util.tree_leaves(old_teacher),
+                    strict=True,
+                )
+            ),
+            0.0,
+        )
+
+    def test_bootstrap_intermediate_is_bounded(self) -> None:
+        targets = jnp.zeros((1, 3, 2), dtype=jnp.float32)
+        noise = jnp.ones_like(targets)
+
+        def explosive_teacher(z, tau, step):
+            del tau, step
+            return z + 1e6
+
+        details = shortcut_forcing_loss(
+            lambda z, tau, step: z,
+            targets,
+            k_max=4,
+            teacher_predict_clean=explosive_teacher,
+            intermediate_clip=4.0,
+            noise=noise,
+            tau=jnp.zeros((1, 3, 1), dtype=jnp.float32),
+            step_size=jnp.ones((1, 3, 1), dtype=jnp.float32),
+            return_details=True,
+        )
+        self.assertLessEqual(float(jnp.max(jnp.abs(details.intermediate))), 4.0)
+
+    def test_stable_x_space_bootstrap_matches_velocity_form(self) -> None:
+        targets = jax.random.normal(jax.random.key(1242), (2, 4, 3))
+        noise = jax.random.normal(jax.random.key(1243), targets.shape)
+        tau = jnp.full((2, 4, 1), 0.5, dtype=jnp.float32)
+        step = jnp.full((2, 4, 1), 0.5, dtype=jnp.float32)
+
+        def predictor(z, signal_time, step_size):
+            return 0.7 * z + 0.2 * signal_time - 0.3 * step_size
+
+        details = shortcut_forcing_loss(
+            predictor,
+            targets,
+            k_max=4,
+            support_safe_bootstrap=False,
+            noise=noise,
+            tau=tau,
+            step_size=step,
+            reduction="none",
+            return_details=True,
+        )
+        velocity_form = jnp.square(1.0 - tau[..., 0]) * jnp.sum(
+            jnp.square(
+                details.prediction_velocity - details.bootstrap_target_velocity
+            ),
+            axis=-1,
+        )
+        np.testing.assert_allclose(
+            details.bootstrap_loss, velocity_form, rtol=2e-6, atol=2e-6
+        )
+
+    def test_finest_tokens_never_request_below_minimum_step(self) -> None:
+        requested_steps: list[np.ndarray] = []
+
+        def teacher(z, tau, step):
+            del tau
+            requested_steps.append(np.asarray(step))
+            return z
+
+        details = shortcut_forcing_loss(
+            lambda z, tau, step: z,
+            jnp.zeros((1, 4, 2), dtype=jnp.float32),
+            k_max=4,
+            teacher_predict_clean=teacher,
+            noise=jnp.ones((1, 4, 2), dtype=jnp.float32),
+            tau=jnp.asarray([[[0.0], [0.5], [0.0], [0.75]]]),
+            step_size=jnp.asarray([[[1.0], [0.5], [0.25], [0.25]]]),
+            return_details=True,
+        )
+        self.assertEqual(len(requested_steps), 2)
+        for step in requested_steps:
+            self.assertGreaterEqual(float(step.min()), 0.25)
+        finest = np.asarray(details.is_finest[..., 0])
+        np.testing.assert_array_equal(
+            np.asarray(details.intermediate)[finest],
+            np.asarray(details.corrupted)[finest],
+        )
 
 
 class ShortcutObjectiveAndSamplingTests(unittest.TestCase):

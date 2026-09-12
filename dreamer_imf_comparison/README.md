@@ -22,6 +22,11 @@ An engineering smoke only validates execution. It is never scientific
 evidence. This repository does not claim to reproduce the unreleased official
 Dreamer 4 implementation; the shortcut objective is the declared comparator.
 
+Before a claim run, `run_shortcut_stability_study.py` can execute the 2^3
+EMA-teacher × bounded-intermediate × support-safe-composition diagnostic on
+the six archived pilot stress seeds. Its 48 cells are explicitly engineering
+evidence: they gate unstable implementations but cannot support superiority.
+
 The harness is monorepo-only research tooling, not a self-contained PyPI
 distribution. Its `pyproject.toml` supports editable imports from this checkout;
 the registered scripts, protocols, documents, dependency lock, and cluster

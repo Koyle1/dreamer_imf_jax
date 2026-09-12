@@ -76,7 +76,10 @@ class DreamerConfig:
     imf_trajectory_history_noise_max: float = 1.0
     shortcut_training_k_max: int | None = None
     shortcut_sampling_steps: int = 4
-    shortcut_sampling_clip: float = 10.0
+    shortcut_bootstrap_ema_decay: float | None = 0.999
+    shortcut_intermediate_clip: float | None = 4.0
+    shortcut_support_safe_bootstrap: bool = True
+    shortcut_sampling_clip: float | None = None
     imagination_horizon: int = 5
     discount: float = 0.99
     lambda_: float = 0.95
@@ -162,6 +165,19 @@ class DreamerConfig:
             raise ValueError(
                 "shortcut_training_k_max is valid only when prior='shortcut'"
             )
+        if not isinstance(self.shortcut_support_safe_bootstrap, bool):
+            raise ValueError("shortcut_support_safe_bootstrap must be boolean")
+        if self.shortcut_bootstrap_ema_decay is not None and (
+            not math.isfinite(self.shortcut_bootstrap_ema_decay)
+            or not 0.0 <= self.shortcut_bootstrap_ema_decay < 1.0
+        ):
+            raise ValueError(
+                "shortcut_bootstrap_ema_decay must be None or finite in [0, 1)"
+            )
+        for name in ("shortcut_intermediate_clip", "shortcut_sampling_clip"):
+            value = getattr(self, name)
+            if value is not None and (not math.isfinite(value) or value <= 0.0):
+                raise ValueError(f"{name} must be None or finite and positive")
         if self.reward_loss not in ("mse", "binary_cross_entropy"):
             raise ValueError("reward_loss must be 'mse' or 'binary_cross_entropy'")
         if (self.reward_min is None) != (self.reward_max is None):
@@ -259,7 +275,6 @@ class DreamerConfig:
             "behavior_cloning_learning_rate",
             "pmpo_positive_temperature",
             "pmpo_negative_temperature",
-            "shortcut_sampling_clip",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:

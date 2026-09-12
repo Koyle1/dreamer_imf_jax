@@ -132,7 +132,7 @@ from .world_model import (
     world_model_parameter_counts,
 )
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 __all__ = [
     "CHECKPOINT_VERSION",

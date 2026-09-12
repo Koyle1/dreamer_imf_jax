@@ -54,6 +54,7 @@ class ShortcutForcingLossDetails(NamedTuple):
     prediction: Array
     prediction_velocity: Array
     bootstrap_target_velocity: Array
+    bootstrap_target_clean: Array
     first_prediction: Array
     first_velocity: Array
     intermediate: Array
@@ -247,6 +248,9 @@ def shortcut_forcing_loss(
     key: Array | None = None,
     *,
     k_max: int,
+    teacher_predict_clean: PredictClean | None = None,
+    intermediate_clip: float | None = None,
+    support_safe_bootstrap: bool = True,
     noise: Array | None = None,
     tau: Array | float | None = None,
     step_size: Array | float | None = None,
@@ -267,6 +271,13 @@ def shortcut_forcing_loss(
     ``tau`` and ``step_size`` must either both be supplied or both omitted.  If
     omitted, they are sampled from :func:`sample_shortcut_schedule`.  ``key``
     is required whenever either the schedule or Gaussian noise is sampled.
+    ``teacher_predict_clean`` defaults to the online predictor for compatibility;
+    training loops should normally supply an exponential-moving-average teacher.
+    ``intermediate_clip`` bounds only the stopped bootstrap trajectory, never the
+    clean-data target.  With ``support_safe_bootstrap=True``, finest-level tokens
+    remain unchanged during teacher composition so no call receives a step below
+    ``1/k_max`` and those unused predictions cannot corrupt later causal context.
+
     In particular, the second teacher evaluation receives the complete
     ``intermediate`` sequence and midpoint times, allowing a block-causal model
     to rebuild every token's context from the updated prefix.  The callable
@@ -278,6 +289,12 @@ def shortcut_forcing_loss(
     _validate_sequence("targets", targets)
     if reduction not in ("none", "mean", "sum"):
         raise ValueError("reduction must be 'none', 'mean', or 'sum'")
+    if not isinstance(support_safe_bootstrap, bool):
+        raise ValueError("support_safe_bootstrap must be boolean")
+    if intermediate_clip is not None and (
+        not math.isfinite(intermediate_clip) or intermediate_clip <= 0.0
+    ):
+        raise ValueError("intermediate_clip must be finite and positive")
     if (tau is None) != (step_size is None):
         raise ValueError("tau and step_size must both be supplied or both omitted")
     if key is None and (noise is None or tau is None):
@@ -317,25 +334,47 @@ def shortcut_forcing_loss(
         predict_clean, corrupted, tau_column, step_column
     )
 
+    teacher = predict_clean if teacher_predict_clean is None else teacher_predict_clean
     half_step = step_column / 2.0
+    if support_safe_bootstrap:
+        active_bootstrap = ~is_finest
+        finest_step = jnp.asarray(1.0 / k_max, dtype=targets.dtype)
+        teacher_step = jnp.where(active_bootstrap, half_step, finest_step)
+    else:
+        active_bootstrap = jnp.ones_like(is_finest, dtype=jnp.bool_)
+        teacher_step = half_step
     first_prediction = _predict_checked(
-        predict_clean, corrupted, tau_column, half_step
+        teacher, corrupted, tau_column, teacher_step
     )
     first_velocity = (first_prediction - corrupted) / (1.0 - tau_column)
-    intermediate = corrupted + first_velocity * half_step
-    midpoint_tau = tau_column + half_step
+    proposed_intermediate = corrupted + first_velocity * half_step
+    if intermediate_clip is not None:
+        proposed_intermediate = jnp.clip(
+            proposed_intermediate, -intermediate_clip, intermediate_clip
+        )
+    intermediate = jnp.where(
+        active_bootstrap, proposed_intermediate, corrupted
+    )
+    midpoint_tau = jnp.where(
+        active_bootstrap, tau_column + half_step, tau_column
+    )
     second_prediction = _predict_checked(
-        predict_clean, intermediate, midpoint_tau, half_step
+        teacher, intermediate, midpoint_tau, teacher_step
     )
     second_velocity = (second_prediction - intermediate) / (1.0 - midpoint_tau)
     bootstrap_target_velocity = jax.lax.stop_gradient(
         (first_velocity + second_velocity) / 2.0
     )
     prediction_velocity = (prediction - corrupted) / (1.0 - tau_column)
+    bootstrap_target_clean = jax.lax.stop_gradient(
+        corrupted + (1.0 - tau_column) * bootstrap_target_velocity
+    )
 
     flow_loss = jnp.sum(jnp.square(prediction - targets), axis=-1)
-    bootstrap_loss = jnp.square(1.0 - tau_column[..., 0]) * jnp.sum(
-        jnp.square(prediction_velocity - bootstrap_target_velocity), axis=-1
+    # This is algebraically identical to the paper's scaled velocity-space
+    # expression but avoids dividing the trainable student output by 1-tau.
+    bootstrap_loss = jnp.sum(
+        jnp.square(prediction - bootstrap_target_clean), axis=-1
     )
     branch_loss = jnp.where(is_finest[..., 0], flow_loss, bootstrap_loss)
     ramp_weights = 0.9 * tau_column[..., 0] + 0.1
@@ -365,6 +404,7 @@ def shortcut_forcing_loss(
         prediction=prediction,
         prediction_velocity=prediction_velocity,
         bootstrap_target_velocity=bootstrap_target_velocity,
+        bootstrap_target_clean=bootstrap_target_clean,
         first_prediction=first_prediction,
         first_velocity=first_velocity,
         intermediate=intermediate,

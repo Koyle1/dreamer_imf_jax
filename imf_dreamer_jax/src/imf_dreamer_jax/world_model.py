@@ -915,6 +915,8 @@ def world_model_loss(
     batch: Batch,
     key: Array,
     config: DreamerConfig,
+    *,
+    shortcut_teacher_params: Params | None = None,
 ) -> WorldModelLoss:
     required = ("observations", "actions", "rewards", "continuations")
     if any(name not in batch for name in required):
@@ -1011,6 +1013,23 @@ def world_model_loss(
                 config,
             )
 
+        teacher_params = (
+            params if shortcut_teacher_params is None else shortcut_teacher_params
+        )
+
+        def teacher_predict_clean(
+            latent_sequence: Array, signal_times: Array, step_sizes: Array
+        ) -> Array:
+            return shortcut_predict_clean_sequence(
+                teacher_params,
+                latent_sequence,
+                signal_times,
+                step_sizes,
+                actions,
+                is_first,
+                config,
+            )
+
         objective_noise = jax.random.normal(
             jax.random.fold_in(prior_key, 0),
             target_stochastic.shape,
@@ -1034,6 +1053,9 @@ def world_model_loss(
             target_stochastic,
             None,
             k_max=config.shortcut_training_k_max,
+            teacher_predict_clean=teacher_predict_clean,
+            intermediate_clip=config.shortcut_intermediate_clip,
+            support_safe_bootstrap=config.shortcut_support_safe_bootstrap,
             noise=objective_noise,
             tau=shortcut_schedule.tau,
             step_size=shortcut_schedule.step_size,

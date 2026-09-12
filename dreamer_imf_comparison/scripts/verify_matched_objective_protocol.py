@@ -105,7 +105,19 @@ def verify_contract() -> None:
     optimization = protocol["shared_world_model"]["optimization"]
     _require(optimization["optimizer"] == "library_custom_global_norm_clipped_Adam", "optimizer contract drifted")
     _require(optimization["weight_decay"] == 0.0, "unimplemented weight decay entered the protocol")
-    _require(not optimization["world_model_ema_enabled"], "unimplemented world-model EMA entered the protocol")
+    _require(optimization["world_model_ema_enabled"], "shortcut bootstrap EMA teacher is disabled")
+    _require(
+        optimization["world_model_ema_use"]
+        == "shortcut_bootstrap_teacher_only_not_evaluation_or_actor_rollout",
+        "shortcut EMA teacher escaped its registered use",
+    )
+    shortcut_common = protocol["canonical_executable_config"][
+        "dreamer_config_non_task_shape_common"
+    ]
+    _require(shortcut_common["shortcut_bootstrap_ema_decay"] == 0.999, "shortcut EMA decay drifted")
+    _require(shortcut_common["shortcut_intermediate_clip"] == 4.0, "shortcut intermediate bound drifted")
+    _require(shortcut_common["shortcut_support_safe_bootstrap"], "below-support shortcut bootstrap was enabled")
+    _require(shortcut_common["shortcut_sampling_clip"] is None, "sampling clip masks shortcut divergence")
 
     executable = protocol["canonical_executable_config"]
     _require(executable["training_batch"] == {

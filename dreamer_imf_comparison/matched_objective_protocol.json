@@ -23,7 +23,10 @@
       "pilot_selected_training_k_max_from_{4,8,16}",
       "primary_clean_observed_prefix_then_unmodified_generated_history",
       "state_observations_and_current_library_architecture",
-      "custom_clipped_Adam_without_weight_decay_or_world_model_EMA"
+      "custom_clipped_Adam_without_weight_decay_with_shortcut_bootstrap_EMA_teacher",
+      "bounded_shortcut_bootstrap_intermediate_at_absolute_value_4",
+      "support_safe_finest_tokens_without_below_training_support_teacher_queries",
+      "unclipped_shortcut_generation_with_fail_closed_divergence_gate"
     ]
   },
   "arm_order": [
@@ -54,7 +57,10 @@
         "nonfinest_target": "two_sequential_half_steps",
         "two_half_steps": true,
         "target_stop_gradient": true,
-        "target_expression": "stop_gradient((b1+b2)/2)"
+        "target_expression": "x_target=z_tau+(1-tau)*stop_gradient((b1+b2)/2)",
+        "teacher": "ema_parameters_decay_0.999_updated_after_student",
+        "intermediate_clip": 4.0,
+        "support_safe_composition": "finest_tokens_keep_z_tau_and_teacher_step_never_below_1_over_k_max"
       },
       "loss": {
         "coordinate_space": "x_space",
@@ -161,10 +167,10 @@
       "optimizer": "library_custom_global_norm_clipped_Adam",
       "gradient_clipping": "global_norm_before_Adam_moment_updates",
       "weight_decay": 0.0,
-      "world_model_ema_enabled": false,
-      "world_model_ema_use": "none",
+      "world_model_ema_enabled": true,
+      "world_model_ema_use": "shortcut_bootstrap_teacher_only_not_evaluation_or_actor_rollout",
       "slow_critic_ema_is_not_world_model_ema": true,
-      "shortcut_bootstrap_teacher": "stop_gradient_of_live_parameters_not_ema"
+      "shortcut_bootstrap_teacher": "stop_gradient_of_ema_parameters_decay_0.999"
     },
     "end_to_end_sensitivity": {
       "enabled": false,
@@ -225,7 +231,10 @@
       "imf_trajectory_suffix_probability": 0.3333333333333333,
       "imf_trajectory_history_noise_max": 1.0,
       "shortcut_sampling_steps": 4,
-      "shortcut_sampling_clip": 10.0,
+      "shortcut_bootstrap_ema_decay": 0.999,
+      "shortcut_intermediate_clip": 4.0,
+      "shortcut_support_safe_bootstrap": true,
+      "shortcut_sampling_clip": null,
       "imagination_horizon": 15,
       "discount": 0.99,
       "lambda_": 0.95,
@@ -281,7 +290,7 @@
     "resolution_contract": {
       "pilot_candidate_configs_are_complete_and_executable": true,
       "confirmatory_execution_requires_immutable_selection_manifest": true,
-      "resolved_config_must_contain_exactly_all_76_non_task_shape_DreamerConfig_fields": true,
+      "resolved_config_must_contain_exactly_all_79_non_task_shape_DreamerConfig_fields": true,
       "selected_values_are_substituted_before_DreamerConfig_construction": true,
       "unresolved_placeholders_or_unknown_keys_are_fatal": true,
       "resolved_config_and_sha256_are_retained_per_run": true
@@ -307,7 +316,7 @@
       "gradient_transform": "global_norm_clip_at_DreamerConfig.grad_clip_before_first_and_second_moment_updates",
       "update": "bias_corrected_Adam_parameter_minus_lr_mhat_over_(sqrt(vhat)+epsilon)",
       "weight_decay": 0.0,
-      "world_model_ema": false,
+      "world_model_ema": "shortcut_bootstrap_teacher_only_decay_0.999",
       "slow_critic_update": "slow=(1-slow_critic_fraction)*slow+slow_critic_fraction*online_after_each_critic_update"
     },
     "loss_semantics": {
@@ -324,7 +333,7 @@
       "start_context": "one_uniform_post_burn_in_posterior_state_per_replay_sequence",
       "start_count_per_actor_update": 32,
       "imagination_horizon": 15,
-      "sampler_by_arm": {"shortcut_forcing": "stochastic_4_step_shortcut_sampler_with_clean_prediction_clip_10", "trajectory_imf": "stochastic_1_step_iMF_sampler"},
+      "sampler_by_arm": {"shortcut_forcing": "stochastic_4_step_shortcut_sampler_without_output_clipping", "trajectory_imf": "stochastic_1_step_iMF_sampler"},
       "behavior_prior": "disabled",
       "real_environment_evaluation_action": "deterministic_tanh_of_actor_mean",
       "extra_generated_history_corruption": false

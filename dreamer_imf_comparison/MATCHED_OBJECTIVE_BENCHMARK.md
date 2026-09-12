@@ -18,11 +18,16 @@ frozen conditions.
 
 - `shortcut_forcing`: x-space clean-target prediction, independent token signal levels and step
   sizes, the power-of-two schedule, stopped-gradient two-half-step bootstrap target, the published
-  ramp weight, and 4-NFE primary generation. Generated clean-latent predictions use an explicit
-  sampling-only `[-10, 10]` safety envelope; the training objective remains unchanged. This avoids
-  recursive off-support latent explosions while leaving ordinary posterior-scale predictions
-  untouched. The paper does not disclose training `K_max`; the pilot therefore sweeps `4, 8, 16`
-  instead of silently guessing it.
+  ramp weight, and 4-NFE primary generation. The bootstrap teacher is an EMA of the online model,
+  composed intermediate states are bounded to `[-4, 4]`, and finest-level tokens never request a
+  half-step below the trained support. The equivalent bootstrap regression is computed directly
+  in x-space. Generation is deliberately unclipped so divergence remains observable. The paper
+  does not disclose training `K_max`; the pilot therefore sweeps `4, 8, 16` instead of silently
+  guessing it.
+
+Every world-model checkpoint must contain finite parameters and metrics. Shortcut training fails
+closed if its observed prior loss exceeds `1000`; such a cell cannot advance to rollout or actor
+training.
 - `trajectory_imf`: predicted-marginal-velocity iMF regression, independent per-token query
   intervals, separately sampled history-exposure times, shared query/history Gaussian noise, the
   clean/corrupted/teacher-corrupted-suffix context mixture, and 1-NFE primary generation.

@@ -162,8 +162,11 @@ class MatchedObjectiveProtocolTests(unittest.TestCase):
         optimization = self.protocol["shared_world_model"]["optimization"]
         self.assertEqual(optimization["optimizer"], "library_custom_global_norm_clipped_Adam")
         self.assertEqual(optimization["weight_decay"], 0.0)
-        self.assertFalse(optimization["world_model_ema_enabled"])
-        self.assertEqual(optimization["shortcut_bootstrap_teacher"], "stop_gradient_of_live_parameters_not_ema")
+        self.assertTrue(optimization["world_model_ema_enabled"])
+        self.assertEqual(
+            optimization["shortcut_bootstrap_teacher"],
+            "stop_gradient_of_ema_parameters_decay_0.999",
+        )
         self.assert_invalid(lambda p: p["parameter_matching"].__setitem__("report_active_parameters", False))
         self.assert_invalid(
             lambda p: p["parameter_matching"].__setitem__(
@@ -172,7 +175,7 @@ class MatchedObjectiveProtocolTests(unittest.TestCase):
         )
         self.assert_invalid(
             lambda p: p["shared_world_model"]["optimization"].__setitem__(
-                "world_model_ema_enabled", True
+                "world_model_ema_enabled", False
             )
         )
 

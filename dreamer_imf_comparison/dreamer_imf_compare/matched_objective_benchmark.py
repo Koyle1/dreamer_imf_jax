@@ -55,6 +55,7 @@ ANALYSIS_SCHEMA = "matched-objective-analysis-v1"
 ARTIFACT_SCHEMA = "matched-objective-artifacts-v1"
 ROLLOUT_REPLAY_ABSOLUTE_TOLERANCE = 1e-6
 ROLLOUT_REPLAY_RELATIVE_TOLERANCE = 1e-6
+SHORTCUT_PRIOR_LOSS_CEILING = 1_000.0
 
 STAGE_ORDER = ("dataset", "compute_plan", "world_model", "rollout", "actor")
 # Execution details absent from the statistical protocol live in one hashed
@@ -87,6 +88,10 @@ EXECUTION_SPEC: dict[str, Any] = {
     "dataset": {
         "smoke_episodes": 5,
         "smoke_native_steps_per_episode": 40,
+    },
+    "world_model_health": {
+        "finite_parameters_and_metrics_required": True,
+        "shortcut_max_checkpoint_prior_loss": SHORTCUT_PRIOR_LOSS_CEILING,
     },
     "smoke_overrides_are_engineering_only": True,
 }
@@ -138,6 +143,7 @@ _COMPARISON_SOURCE_BASENAMES = (
     "neurips_controls.py",
     "pixel_benchmark.py",
     "protocol.py",
+    "shortcut_stability_study.py",
 )
 _COMPARISON_SCRIPT_BASENAMES = (
     "generate_matched_objective_matrix.py",
@@ -145,12 +151,14 @@ _COMPARISON_SCRIPT_BASENAMES = (
     "run_matched_objective_diagnostics.py",
     "run_neurips_controls.py",
     "run_pixel_benchmark.py",
+    "run_shortcut_stability_study.py",
     "verify_matched_objective_benchmark.py",
     "verify_matched_objective_protocol.py",
     "verify_neurips_controls.py",
     "verify_neurips_core.py",
     "verify_neurips_report.py",
     "verify_pixel_benchmark.py",
+    "verify_shortcut_stability_study.py",
     "verify_smoke_idempotence.py",
     "verify_trajectory_imf_novelty.py",
     "verify_trajectory_imf_theory.py",
@@ -168,6 +176,7 @@ _COMPARISON_TEST_BASENAMES = (
     "test_neurips_verifiers.py",
     "test_pixel_benchmark.py",
     "test_rollout_replay_validation.py",
+    "test_shortcut_stability_study.py",
     "test_trajectory_imf_theory.py",
 )
 _CLUSTER_SOURCE_BASENAMES = (
@@ -192,6 +201,8 @@ _CLUSTER_SOURCE_BASENAMES = (
     "runtime_environment.sh",
     "stage_array.sbatch",
     "stage_verify.sbatch",
+    "shortcut_stability_array.sbatch",
+    "shortcut_stability_verify.sbatch",
     "submit.py",
     "supplementary.py",
     "supplementary_plan.json",
@@ -491,6 +502,8 @@ def _source_files(root: Path) -> list[str]:
         "dreamer_imf_comparison/scripts/*pixel*.py",
         "dreamer_imf_comparison/scripts/verify_smoke_idempotence.py",
         "dreamer_imf_comparison/scripts/*trajectory_imf*.py",
+        "dreamer_imf_comparison/dreamer_imf_compare/shortcut_stability_study.py",
+        "dreamer_imf_comparison/scripts/*shortcut_stability*.py",
         "dreamer_imf_comparison/cluster/neurips/**/*.py",
         "dreamer_imf_comparison/cluster/neurips/**/*.sh",
         "dreamer_imf_comparison/cluster/neurips/**/*.sbatch",
@@ -501,6 +514,7 @@ def _source_files(root: Path) -> list[str]:
         "dreamer_imf_comparison/tests/test_trajectory_imf*.py",
         "dreamer_imf_comparison/tests/test_rollout_replay_validation.py",
         "dreamer_imf_comparison/tests/test_cluster_*.py",
+        "dreamer_imf_comparison/tests/test_shortcut_stability_study.py",
         "imf_dreamer_jax/tests/__init__.py",
         "dreamer_imf_comparison/tests/__init__.py",
         "imf_dreamer_jax/pyproject.toml",
@@ -4027,6 +4041,21 @@ def validate_world_result(
         raise ValueError("world-model runtime config digest mismatch")
     if not math.isfinite(float(result.get("wall_seconds", math.nan))):
         raise ValueError("world-model wall time is non-finite")
+    final_metrics = result.get("final_metrics")
+    if not isinstance(final_metrics, Mapping) or not final_metrics:
+        raise ValueError("world-model final metrics are missing")
+    if not all(math.isfinite(float(value)) for value in final_metrics.values()):
+        raise ValueError("world-model final metrics are non-finite")
+    maximum_prior = float(result.get("maximum_checkpoint_prior_loss", math.nan))
+    if not math.isfinite(maximum_prior) or maximum_prior < 0.0:
+        raise ValueError("world-model checkpoint prior-loss maximum is invalid")
+    if result.get("world_model_parameters_finite") is not True:
+        raise ValueError("world-model parameters are non-finite")
+    if cell.get("arm") == "shortcut_forcing" and (
+        float(final_metrics.get("prior", math.inf)) > SHORTCUT_PRIOR_LOSS_CEILING
+        or maximum_prior > SHORTCUT_PRIOR_LOSS_CEILING
+    ):
+        raise ValueError("shortcut world model exceeded the registered divergence ceiling")
     if protocol is not None or matrix is not None or output_root is not None:
         if protocol is None or matrix is None or output_root is None:
             raise ValueError("strong world validation requires protocol, matrix, and output root")
@@ -4085,6 +4114,13 @@ def validate_world_result(
             "world_model_parameter_sha256"
         ):
             raise ValueError("world-model checkpoint parameter digest mismatch")
+        teacher_digest = (
+            None
+            if state.world_model_teacher is None
+            else _tree_digest(state.world_model_teacher)
+        )
+        if teacher_digest != result.get("world_model_teacher_parameter_sha256"):
+            raise ValueError("world-model EMA teacher checkpoint digest mismatch")
         compute_cell = _dependency_cell(matrix, cell, "compute_plan")
         compute = read_json(_cell_result_path(output_root, compute_cell))
         allocation = compute["tracks"][cell["budget_track"]]["allocations"][
@@ -4224,6 +4260,7 @@ def run_world_model_cell(
     start_update = 0
     accumulated_wall = 0.0
     latest = None
+    maximum_checkpoint_prior_loss = 0.0
     initialization_key = derive_jax_key(
         "world-init", cell["task"], cell["world_model_seed"]
     )
@@ -4249,6 +4286,12 @@ def run_world_model_cell(
         start_update = int(metadata.get("completed_updates", -1))
         accumulated_wall = float(metadata.get("wall_seconds", 0.0))
         latest = metadata.get("last_metrics")
+        maximum_checkpoint_prior_loss = float(
+            metadata.get(
+                "maximum_checkpoint_prior_loss",
+                (latest or {}).get("prior", 0.0),
+            )
+        )
     else:
         state = initial_agent
     if not 0 <= start_update <= updates:
@@ -4268,6 +4311,25 @@ def run_world_model_cell(
         latest = _metrics_dict(metrics)
         completed = update + 1
         if completed % checkpoint_every == 0 or completed == updates:
+            prior_loss = float(latest["prior"])
+            maximum_checkpoint_prior_loss = max(
+                maximum_checkpoint_prior_loss, prior_loss
+            )
+            prior_parameters_finite = all(
+                np.isfinite(np.asarray(leaf)).all()
+                for leaf in jax.tree_util.tree_leaves(state.params.world_model["prior"])
+            )
+            if not prior_parameters_finite:
+                raise FloatingPointError(
+                    "world-model prior parameters became non-finite"
+                )
+            if (
+                config.prior == "shortcut"
+                and maximum_checkpoint_prior_loss > SHORTCUT_PRIOR_LOSS_CEILING
+            ):
+                raise FloatingPointError(
+                    "shortcut prior loss exceeded the registered divergence ceiling"
+                )
             save_checkpoint(
                 checkpoint_path,
                 state,
@@ -4278,6 +4340,7 @@ def run_world_model_cell(
                     "dataset_sha256": dataset_result["dataset_sha256"],
                     "completed_updates": completed,
                     "last_metrics": latest,
+                    "maximum_checkpoint_prior_loss": maximum_checkpoint_prior_loss,
                     "wall_seconds": accumulated_wall + time.perf_counter() - started,
                 },
             )
@@ -4285,6 +4348,12 @@ def run_world_model_cell(
         raise RuntimeError("world-model cell completed no optimizer update")
     total_wall = accumulated_wall + time.perf_counter() - started
     counts = compute["arms"][cell["arm"]]["parameters"]
+    world_model_parameters_finite = all(
+        np.isfinite(np.asarray(leaf)).all()
+        for leaf in jax.tree_util.tree_leaves(state.params.world_model)
+    )
+    if not world_model_parameters_finite:
+        raise FloatingPointError("world-model parameters are non-finite")
     result = {
         **_result_identity(cell, WORLD_SCHEMA),
         "matrix_sha256": matrix["matrix_sha256"],
@@ -4308,6 +4377,13 @@ def run_world_model_cell(
         ],
         "shared_initial_world_parameter_sha256": shared_initial_sha256,
         "world_model_parameter_sha256": _tree_digest(state.params.world_model),
+        "world_model_teacher_parameter_sha256": (
+            None
+            if state.world_model_teacher is None
+            else _tree_digest(state.world_model_teacher)
+        ),
+        "world_model_parameters_finite": world_model_parameters_finite,
+        "maximum_checkpoint_prior_loss": maximum_checkpoint_prior_loss,
         "final_metrics": latest,
         "compiler_flops_per_update": float(allocation["flops_per_update"]),
         "realized_compiler_flops": float(allocation["flops_per_update"]) * updates,
@@ -5439,6 +5515,7 @@ def run_actor_cell(
         fresh.actor_optimizer,
         fresh.critic_optimizer,
         fresh.slow_critic,
+        world_state.world_model_teacher,
     )
     allocation = compute["tracks"][cell["budget_track"]]["allocations"][cell["arm"]]["actor"]
     updates = int(allocation["updates"])

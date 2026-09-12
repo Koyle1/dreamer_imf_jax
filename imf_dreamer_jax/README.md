@@ -26,6 +26,14 @@ and explicit scaling of the gradient through the recurrent condition. Their
 defaults reproduce the 0.3 objective, so existing configurations and
 checkpoints remain valid.
 
+Version 0.5 repairs shortcut-forcing self-distillation at its source. Shortcut
+training now uses a post-update EMA bootstrap teacher, bounds only the stopped
+intermediate bootstrap trajectory, never asks the teacher for a step below the
+trained support, and evaluates the algebraically equivalent bootstrap loss
+directly in x-space. Sampling is unclipped by default so an unstable model
+cannot be made to look healthy at evaluation time. This state-layout change
+increments the checkpoint format to version 2.
+
 The package also exposes an experimental **trajectory iMF** objective. Each
 trajectory token has its own query times and history-corruption time, and the
 RSSM is trained with one mixture of clean-context, corrupted-context, and

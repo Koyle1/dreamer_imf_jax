@@ -1501,6 +1501,7 @@ def train_trajectory_control(
             state.actor_optimizer,
             state.critic_optimizer,
             state.slow_critic,
+            state.world_model_teacher,
         ),
         losses,
     )
@@ -1553,6 +1554,7 @@ def train_temporal_increment(
             state.actor_optimizer,
             state.critic_optimizer,
             state.slow_critic,
+            state.world_model_teacher,
         ),
         losses,
     )
@@ -3234,6 +3236,7 @@ def run_actor_cell(
         fresh.actor_optimizer,
         fresh.critic_optimizer,
         fresh.slow_critic,
+        world_state.world_model_teacher,
     )
     allocation = _allocation(compute, cell, "actor")
     updates = int(allocation["updates"])
