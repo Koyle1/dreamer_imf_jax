@@ -53,10 +53,9 @@ HORIZONS=(5 15)
 case "${MTP_STAGE}" in
   preflight)
     python "${RUNNER}" manifest "${COMMON[@]}"
-    python -m pytest \
-      "${MTP_SOURCE_ROOT}/imf_dreamer_jax/tests/test_reward_head_mtp.py" \
-      "${MTP_SOURCE_ROOT}/dreamer_imf_comparison/tests/test_reward_head_mtp_study.py" \
-      -q -s
+    python -m unittest \
+      imf_dreamer_jax.tests.test_reward_head_mtp \
+      dreamer_imf_comparison.tests.test_reward_head_mtp_study
     python - <<'PY'
 import jax
 assert len(jax.devices()) == 1 and jax.devices()[0].platform == "gpu"
