@@ -64,6 +64,7 @@ def complete_report():
                 "arm": ARMS[0],
                 "world_model_seed": 1,
                 "actor_seed": 2,
+                "evaluation_episode": 0,
                 "candidate_id": "candidate-1",
                 "raw_path": "cells/actor-1/diagnostics.npz",
                 "raw_sha256": "2" * 64,
@@ -117,6 +118,7 @@ def test_action_ranking_detects_perfect_and_reversed_controls():
     reversed_result = action_ranking_metrics(-true, true)
     assert perfect["pairwise_accuracy"] == 1.0
     assert perfect["top1_accuracy"] == 1.0
+    assert perfect["simulator_tie_fraction"] == 0.0
     assert perfect["mean_simulator_regret"] == 0.0
     assert reversed_result["pairwise_accuracy"] == 0.0
     assert reversed_result["top1_accuracy"] == 0.0
@@ -132,6 +134,24 @@ def test_gradient_fidelity_detects_aligned_and_opposed_controls():
     assert aligned["median_model_to_simulator_norm_ratio"] == pytest.approx(2.0)
     assert opposed["mean_cosine_similarity"] == pytest.approx(-1.0)
     assert opposed["component_sign_accuracy"] == 0.0
+    assert aligned["mean_model_gradient_norm"] > aligned["mean_simulator_gradient_norm"]
+
+
+def test_degenerate_action_and_gradient_controls_are_reported_not_scored():
+    model_returns = np.array([[0.0, 1.0, 2.0], [3.0, 1.0, -1.0]])
+    tied_returns = np.zeros_like(model_returns)
+    ranking = action_ranking_metrics(model_returns, tied_returns)
+    assert ranking["informative_states"] == 0
+    assert ranking["simulator_tie_fraction"] == 1.0
+    assert ranking["top1_accuracy"] is None
+    assert ranking["mean_predicted_return_range"] > 0.0
+
+    model_gradients = np.ones((2, 2))
+    zero_gradients = np.zeros((2, 2))
+    gradients = gradient_fidelity_metrics(model_gradients, zero_gradients)
+    assert gradients["nonzero_vector_pairs"] == 0
+    assert gradients["simulator_nonzero_states"] == 0
+    assert gradients["hallucinated_nonzero_fraction"] == 1.0
 
 
 def test_imagined_real_alignment_and_constant_negative_control():

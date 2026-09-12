@@ -168,8 +168,11 @@ def _model_action_gradient_function():
     import jax.numpy as jnp
     from dreamer_imf_compare import matched_objective_benchmark as benchmark
 
-    def objective(action, params, start, suffix, noise, discount, config):
-        actions = jnp.concatenate([action[None, None], suffix[None]], axis=1)
+    def objective(offset, params, start, baseline, persistence, noise, discount, config):
+        mask = (
+            jnp.arange(baseline.shape[0], dtype=jnp.int32) < persistence
+        ).astype(baseline.dtype)[:, None]
+        actions = jnp.clip(baseline + mask * offset[None], -1.0, 1.0)[None]
         _, rewards, continuations = benchmark.open_loop_samples_with_continuation(
             params, start, actions, noise, config
         )
@@ -202,13 +205,18 @@ def _simulate_open_loop(
     return float(total), first
 
 
-def _candidate_actions(action: np.ndarray, delta: float) -> np.ndarray:
-    values = [np.asarray(action, dtype=np.float32).copy()]
-    for dimension in range(action.size):
+def _candidate_action_sequences(
+    baseline: np.ndarray, delta: float, persistence: int
+) -> np.ndarray:
+    base = np.asarray(baseline, dtype=np.float32)
+    if base.ndim != 2 or not 1 <= persistence <= base.shape[0]:
+        raise ValueError("action persistence must be within the branch horizon")
+    values = [base.copy()]
+    for dimension in range(base.shape[1]):
         for direction in (-1.0, 1.0):
-            candidate = np.asarray(action, dtype=np.float32).copy()
-            candidate[dimension] = np.clip(
-                candidate[dimension] + direction * delta, -1.0, 1.0
+            candidate = base.copy()
+            candidate[:persistence, dimension] = np.clip(
+                candidate[:persistence, dimension] + direction * delta, -1.0, 1.0
             )
             values.append(candidate)
     return np.stack(values)
@@ -217,34 +225,38 @@ def _candidate_actions(action: np.ndarray, delta: float) -> np.ndarray:
 def _finite_difference_gradient(
     environment: Any,
     snapshot: Any,
-    action: np.ndarray,
-    suffix: np.ndarray,
+    baseline: np.ndarray,
+    persistence: int,
     *,
     epsilon: float,
     discount: float,
 ) -> np.ndarray:
-    gradient = np.zeros_like(action, dtype=np.float64)
-    for dimension in range(action.size):
-        lower = np.asarray(action, dtype=np.float32).copy()
-        upper = np.asarray(action, dtype=np.float32).copy()
-        lower[dimension] = np.clip(lower[dimension] - epsilon, -1.0, 1.0)
-        upper[dimension] = np.clip(upper[dimension] + epsilon, -1.0, 1.0)
-        denominator = float(upper[dimension] - lower[dimension])
-        if denominator <= 0.0:
-            raise ValueError("finite-difference action interval collapsed")
+    base = np.asarray(baseline, dtype=np.float32)
+    if base.ndim != 2 or not 1 <= persistence <= base.shape[0]:
+        raise ValueError("action persistence must be within the branch horizon")
+    gradient = np.zeros(base.shape[1], dtype=np.float64)
+    for dimension in range(base.shape[1]):
+        lower = base.copy()
+        upper = base.copy()
+        lower[:persistence, dimension] = np.clip(
+            lower[:persistence, dimension] - epsilon, -1.0, 1.0
+        )
+        upper[:persistence, dimension] = np.clip(
+            upper[:persistence, dimension] + epsilon, -1.0, 1.0
+        )
         lower_return, _ = _simulate_open_loop(
             environment,
             snapshot,
-            np.concatenate([lower[None], suffix], axis=0),
+            lower,
             discount=discount,
         )
         upper_return, _ = _simulate_open_loop(
             environment,
             snapshot,
-            np.concatenate([upper[None], suffix], axis=0),
+            upper,
             discount=discount,
         )
-        gradient[dimension] = (upper_return - lower_return) / denominator
+        gradient[dimension] = (upper_return - lower_return) / (2.0 * epsilon)
     environment.restore(snapshot)
     return gradient
 
@@ -258,6 +270,7 @@ def _diagnose_actor_cell(
     episode: int,
     states_per_cell: int,
     horizon: int,
+    action_persistence: int,
     draws: int,
     action_delta: float,
     finite_difference_epsilon: float,
@@ -279,11 +292,21 @@ def _diagnose_actor_cell(
     if result.get("checkpoint_sha256") != file_sha256(actor_directory / "checkpoint.pkl"):
         raise ValueError("actor checkpoint digest differs from the authenticated result")
     traces = np.load(actor_directory / "action_traces.npz")
-    actions = np.asarray(traces["actions"][episode], dtype=np.float32)
-    length = int(np.asarray(traces["lengths"])[episode])
-    evaluation_seed = int(np.asarray(traces["evaluation_seeds"])[episode])
+    episode_index = int(episode)
+    if episode_index == -1:
+        episode_returns = np.asarray(
+            result["normalized_episode_returns"], dtype=np.float64
+        )
+        episode_index = int(np.argmax(episode_returns))
+    if not 0 <= episode_index < len(traces["actions"]):
+        raise ValueError("diagnostic episode is outside retained actor traces")
+    actions = np.asarray(traces["actions"][episode_index], dtype=np.float32)
+    length = int(np.asarray(traces["lengths"])[episode_index])
+    evaluation_seed = int(np.asarray(traces["evaluation_seeds"])[episode_index])
     if length <= horizon + 8:
         raise ValueError("actor trace is too short for policy-alignment diagnostics")
+    if not 1 <= action_persistence <= horizon:
+        raise ValueError("action persistence must be within the counterfactual horizon")
     sample_steps = np.linspace(
         max(8, int(config.burn_in)), length - horizon - 1, states_per_cell, dtype=np.int32
     )
@@ -320,7 +343,7 @@ def _diagnose_actor_cell(
             cell["task"],
             cell["world_model_seed"],
             cell["actor_seed"],
-            episode,
+            episode_index,
         )
         for step in range(int(sample_steps[-1]) + 1):
             policy_action, belief = jit_act(
@@ -340,13 +363,12 @@ def _diagnose_actor_cell(
             if step in sample_set:
                 snapshot = environment.snapshot()
                 suffix = actions[step + 1 : step + horizon]
-                candidates = _candidate_actions(host_action, action_delta)
-                branch_actions = np.repeat(
-                    np.concatenate([host_action[None], suffix], axis=0)[None],
-                    candidates.shape[0],
-                    axis=0,
+                baseline_actions = np.concatenate(
+                    [host_action[None], suffix], axis=0
                 )
-                branch_actions[:, 0] = candidates
+                branch_actions = _candidate_action_sequences(
+                    baseline_actions, action_delta, action_persistence
+                )
                 random = np.random.default_rng(
                     benchmark.derive_seed("policy-alignment", cell["cell_id"], episode, step)
                 )
@@ -355,9 +377,9 @@ def _diagnose_actor_cell(
                 ).astype(np.float32)
                 noise = np.broadcast_to(
                     shared_noise,
-                    (draws, horizon, candidates.shape[0], config.stochastic_dim),
+                    (draws, horizon, branch_actions.shape[0], config.stochastic_dim),
                 ).copy()
-                start = _repeat_state(belief, candidates.shape[0])
+                start = _repeat_state(belief, branch_actions.shape[0])
                 obs_samples, reward_samples, continuation_samples = sampler(
                     state.params.world_model,
                     start,
@@ -386,10 +408,11 @@ def _diagnose_actor_cell(
                 environment.restore(snapshot)
                 single_noise = jnp.asarray(shared_noise)
                 model_gradient = gradient_function(
-                    jnp.asarray(host_action),
+                    jnp.zeros_like(jnp.asarray(host_action)),
                     state.params.world_model,
                     belief,
-                    jnp.asarray(suffix),
+                    jnp.asarray(baseline_actions),
+                    int(action_persistence),
                     single_noise,
                     float(discount),
                     config,
@@ -397,8 +420,8 @@ def _diagnose_actor_cell(
                 simulator_gradient = _finite_difference_gradient(
                     environment,
                     snapshot,
-                    host_action,
-                    suffix,
+                    baseline_actions,
+                    action_persistence,
                     epsilon=finite_difference_epsilon,
                     discount=discount,
                 )
@@ -438,6 +461,7 @@ def _diagnose_actor_cell(
         "model_gradients": np.stack(model_gradients),
         "simulator_gradients": np.stack(simulator_gradients),
         "action_replay_max_abs_error": np.asarray(action_replay_max_error),
+        "evaluation_episode": np.asarray(episode_index, dtype=np.int32),
     }
     raw_directory = output_root / "cells" / cell["cell_id"]
     raw_directory.mkdir(parents=True, exist_ok=True)
@@ -455,6 +479,7 @@ def _diagnose_actor_cell(
         "arm": cell["arm"],
         "world_model_seed": int(cell["world_model_seed"]),
         "actor_seed": int(cell["actor_seed"]),
+        "evaluation_episode": episode_index,
         "candidate_id": cell["candidate_id"],
         "raw_path": str(raw_path.relative_to(output_root)),
         "raw_sha256": file_sha256(raw_path),
@@ -515,6 +540,7 @@ def run_diagnostics(arguments: argparse.Namespace) -> None:
             episode=arguments.episode,
             states_per_cell=arguments.states_per_cell,
             horizon=arguments.horizon,
+            action_persistence=arguments.action_persistence,
             draws=arguments.draws,
             action_delta=arguments.action_delta,
             finite_difference_epsilon=arguments.finite_difference_epsilon,
@@ -535,6 +561,7 @@ def run_diagnostics(arguments: argparse.Namespace) -> None:
             "cells_per_task_arm": arguments.cells_per_group,
             "states_per_cell": arguments.states_per_cell,
             "counterfactual_horizon": arguments.horizon,
+            "action_persistence": arguments.action_persistence,
             "predictive_draws": arguments.draws,
             "action_delta": arguments.action_delta,
             "finite_difference_epsilon": arguments.finite_difference_epsilon,
@@ -671,6 +698,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--states-per-cell", type=int, default=4)
     run.add_argument("--episode", type=int, default=0)
     run.add_argument("--horizon", type=int, default=5)
+    run.add_argument("--action-persistence", type=int, default=1)
     run.add_argument("--draws", type=int, default=8)
     run.add_argument("--action-delta", type=float, default=0.25)
     run.add_argument("--finite-difference-epsilon", type=float, default=0.05)

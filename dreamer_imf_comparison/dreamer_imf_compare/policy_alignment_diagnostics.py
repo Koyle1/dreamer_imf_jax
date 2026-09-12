@@ -17,7 +17,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 
-REPORT_SCHEMA = "trajectory-imf-policy-alignment-diagnostics-v1"
+REPORT_SCHEMA = "trajectory-imf-policy-alignment-diagnostics-v2"
 PRESERVATION_SCHEMA = "frozen-pilot-preservation-v1"
 METRIC_NAMES = (
     "actor_visited_model_error",
@@ -155,8 +155,14 @@ def action_ranking_metrics(
     comparable = 0
     state_correlations: list[float] = []
     top1 = 0
+    informative_states = 0
     regrets: list[float] = []
+    predicted_ranges: list[float] = []
+    simulator_ranges: list[float] = []
     for model_row, true_row in zip(predicted, actual, strict=True):
+        predicted_ranges.append(float(np.ptp(model_row)))
+        simulator_range = float(np.ptp(true_row))
+        simulator_ranges.append(simulator_range)
         for left in range(true_row.size):
             for right in range(left + 1, true_row.size):
                 truth = float(true_row[left] - true_row[right])
@@ -169,19 +175,35 @@ def action_ranking_metrics(
         if value is not None:
             state_correlations.append(value)
         predicted_best = int(np.argmax(model_row))
-        true_best = int(np.argmax(true_row))
-        top1 += int(predicted_best == true_best)
-        regrets.append(float(true_row[true_best] - true_row[predicted_best]))
+        true_best_value = float(np.max(true_row))
+        if simulator_range > tie_tolerance:
+            informative_states += 1
+            top1 += int(
+                true_best_value - float(true_row[predicted_best]) <= tie_tolerance
+            )
+        regrets.append(true_best_value - float(true_row[predicted_best]))
     return {
         "states": int(predicted.shape[0]),
         "candidates_per_state": int(predicted.shape[1]),
+        "informative_states": int(informative_states),
+        "simulator_tie_fraction": float(
+            1.0 - informative_states / predicted.shape[0]
+        ),
         "comparable_pairs": int(comparable),
         "pairwise_accuracy": None if comparable == 0 else float(correct / comparable),
         "mean_state_spearman": (
             None if not state_correlations else _finite(np.mean(state_correlations), "rank correlation")
         ),
-        "top1_accuracy": float(top1 / predicted.shape[0]),
+        "top1_accuracy": (
+            None if informative_states == 0 else float(top1 / informative_states)
+        ),
         "mean_simulator_regret": _finite(np.mean(regrets), "simulator regret"),
+        "mean_predicted_return_range": _finite(
+            np.mean(predicted_ranges), "predicted return range"
+        ),
+        "mean_simulator_return_range": _finite(
+            np.mean(simulator_ranges), "simulator return range"
+        ),
     }
 
 
@@ -201,10 +223,24 @@ def gradient_fidelity_metrics(
     sign_correct = 0
     sign_total = 0
     norm_ratios: list[float] = []
+    model_norms: list[float] = []
+    simulator_norms: list[float] = []
+    model_nonzero = 0
+    simulator_nonzero = 0
+    hallucinated_nonzero = 0
+    missed_nonzero = 0
     for model_row, true_row in zip(model, actual, strict=True):
         model_norm = float(np.linalg.norm(model_row))
         true_norm = float(np.linalg.norm(true_row))
-        if model_norm > nonzero_tolerance and true_norm > nonzero_tolerance:
+        model_norms.append(model_norm)
+        simulator_norms.append(true_norm)
+        model_active = model_norm > nonzero_tolerance
+        simulator_active = true_norm > nonzero_tolerance
+        model_nonzero += int(model_active)
+        simulator_nonzero += int(simulator_active)
+        hallucinated_nonzero += int(model_active and not simulator_active)
+        missed_nonzero += int(simulator_active and not model_active)
+        if model_active and simulator_active:
             cosines.append(float(np.dot(model_row, true_row) / (model_norm * true_norm)))
             norm_ratios.append(model_norm / true_norm)
         mask = np.abs(true_row) > nonzero_tolerance
@@ -213,7 +249,17 @@ def gradient_fidelity_metrics(
     return {
         "states": int(model.shape[0]),
         "action_dimensions": int(model.shape[1]),
+        "model_nonzero_states": int(model_nonzero),
+        "simulator_nonzero_states": int(simulator_nonzero),
         "nonzero_vector_pairs": int(len(cosines)),
+        "mean_model_gradient_norm": _finite(
+            np.mean(model_norms), "model gradient norm"
+        ),
+        "mean_simulator_gradient_norm": _finite(
+            np.mean(simulator_norms), "simulator gradient norm"
+        ),
+        "hallucinated_nonzero_fraction": float(hallucinated_nonzero / model.shape[0]),
+        "missed_nonzero_fraction": float(missed_nonzero / model.shape[0]),
         "mean_cosine_similarity": None if not cosines else _finite(np.mean(cosines), "cosine"),
         "median_cosine_similarity": None if not cosines else _finite(np.median(cosines), "median cosine"),
         "component_sign_accuracy": None if sign_total == 0 else float(sign_correct / sign_total),
@@ -393,6 +439,7 @@ def validate_report(report: Mapping[str, Any], *, forbidden_root: str | None = N
             "arm",
             "world_model_seed",
             "actor_seed",
+            "evaluation_episode",
             "candidate_id",
             "raw_path",
             "raw_sha256",

@@ -61,6 +61,9 @@ def main() -> None:
     reversed_result = diagnostics.action_ranking_metrics(-truth, truth)
     require(perfect["pairwise_accuracy"] == 1.0, "perfect ranking")
     require(reversed_result["pairwise_accuracy"] == 0.0, "reversed ranking control")
+    tied_result = diagnostics.action_ranking_metrics(truth, np.zeros_like(truth))
+    require(tied_result["top1_accuracy"] is None, "tied ranking must be undefined")
+    require(tied_result["simulator_tie_fraction"] == 1.0, "tied ranking fraction")
 
     true_gradient = np.array([[1.0, 2.0], [-2.0, 1.0]])
     aligned = diagnostics.gradient_fidelity_metrics(2.0 * true_gradient, true_gradient)
@@ -68,6 +71,13 @@ def main() -> None:
     require(abs(aligned["mean_cosine_similarity"] - 1.0) < 1e-12, "aligned gradient")
     require(abs(opposed["mean_cosine_similarity"] + 1.0) < 1e-12, "opposed gradient")
     require(opposed["component_sign_accuracy"] == 0.0, "gradient sign control")
+    hallucinated = diagnostics.gradient_fidelity_metrics(
+        true_gradient, np.zeros_like(true_gradient)
+    )
+    require(
+        hallucinated["hallucinated_nonzero_fraction"] == 1.0,
+        "hallucinated gradient control",
+    )
 
     records = []
     for index, value in enumerate((0.1, 0.2, 0.4)):
