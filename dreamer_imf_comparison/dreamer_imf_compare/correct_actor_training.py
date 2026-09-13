@@ -25,9 +25,10 @@ from .artifacts import read_json, write_json_atomic
 from . import matched_objective_benchmark as benchmark
 from .matched_objective_protocol import (
     ARM_ORDER,
-    canonical_task_id,
     validate_matched_objective_protocol,
 )
+
+canonical_task_id = benchmark.canonical_task_id
 
 
 SCHEMA = "trajectory-imf-correct-actor-training-v1"
