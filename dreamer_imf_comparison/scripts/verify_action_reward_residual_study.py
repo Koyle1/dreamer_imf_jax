@@ -17,6 +17,7 @@ from dreamer_imf_compare import matched_objective_benchmark as benchmark
 
 def _settings(manifest: dict) -> dict:
     return {
+        "centered_root": manifest["centered_residual_root"],
         "residual_updates": manifest["residual_updates"],
         "actor_updates": manifest["actor_updates"],
         "preparation_updates": manifest["preparation_updates"],
@@ -36,8 +37,16 @@ def verify_manifest(root: Path) -> dict:
         or manifest["world_model_seeds"] != list(study.WORLD_MODEL_SEEDS)
         or manifest["imagination_horizons"] != list(study.HORIZONS)
         or manifest["trainable_world_subtrees"] != ["reward_action_residual"]
+        or set(manifest["objective"]) != {
+            "horizons", "huber_delta", "normalization_epsilon"
+        }
+        or manifest.get("objective_identity")
+        != "centered_pseudo_huber_plus_exact_missing_component_equals_uncentered_pseudo_huber"
+        or manifest.get("normalization_basis")
+        != "centered_target_return_running_rms"
         or manifest["interpretation"]["trajectory_model_frozen"] is not True
         or manifest["interpretation"]["base_reward_head_frozen"] is not True
+        or manifest["interpretation"].get("single_loss_term") is not True
     ):
         raise ValueError("manifest design or freeze contract is invalid")
     for source in manifest["source_artifacts"]:
@@ -50,6 +59,12 @@ def verify_manifest(root: Path) -> dict:
         for path, digest in checks:
             if benchmark.file_sha256(path) != digest:
                 raise ValueError(f"source artifact digest changed: {path}")
+    centered_report = Path(manifest["centered_residual_root"]) / "report.json"
+    if (
+        benchmark.file_sha256(centered_report)
+        != manifest["centered_residual_report_file_sha256"]
+    ):
+        raise ValueError("centered residual reference digest changed")
     print("ACTION_REWARD_RESIDUAL_MANIFEST_VERIFIED")
     return manifest
 
@@ -151,6 +166,8 @@ def verify_results(root: Path) -> dict:
         or report.get("completed_evaluation_cells") != len(study.WORLD_MODEL_SEEDS)
         or report.get("completed_actor_cells") != len(study.WORLD_MODEL_SEEDS) * len(study.HORIZONS)
         or set(report.get("matched_deltas", {})) != {"reward", "probe", "actor"}
+        or report.get("centered_residual_reference")
+        != manifest["centered_residual_reference"]
     ):
         raise ValueError("final report is incomplete")
     for horizon in study.HORIZONS:
@@ -163,6 +180,26 @@ def verify_results(root: Path) -> dict:
         )
         if not _close(measured, recorded):
             raise ValueError(f"actor aggregation mismatch at horizon {horizon}")
+        base = next(
+            row for row in manifest["base_mtp_reference"]["actor_groups"]
+            if row["imagination_horizon"] == horizon
+        )["mean_normalized_return"]
+        shortcut = next(
+            row for row in manifest["shortcut_reference"]["actor_groups"]
+            if row["imagination_horizon"] == horizon
+        )["mean_normalized_return"]
+        centered = next(
+            row for row in manifest["centered_residual_reference"]["actor_groups"]
+            if row["imagination_horizon"] == horizon
+        )["mean_normalized_return"]
+        deltas = report["matched_deltas"]["actor"][str(horizon)]
+        for name, reference in (
+            ("versus_base_mtp", base),
+            ("versus_shortcut", shortcut),
+            ("versus_centered_residual", centered),
+        ):
+            if not _close(deltas[name], measured - reference):
+                raise ValueError(f"actor delta mismatch for {name}, horizon {horizon}")
     for horizon in ("1", "3", "5", "15"):
         measured = float(np.mean([
             row["metrics_by_horizon"][horizon]["pairwise_accuracy"]
@@ -170,6 +207,32 @@ def verify_results(root: Path) -> dict:
         ]))
         if not _close(measured, report["probe_groups"][horizon]["pairwise_accuracy_mean"]):
             raise ValueError(f"probe aggregation mismatch at horizon {horizon}")
+        measured_regret = float(np.mean([
+            row["metrics_by_horizon"][horizon]["mean_simulator_regret"]
+            for row in evaluation_rows
+        ]))
+        deltas = report["matched_deltas"]["probe"][horizon]
+        base = manifest["base_mtp_reference"]["probe_groups"][horizon]
+        centered = manifest["centered_residual_reference"]["probe_groups"][horizon]
+        if (
+            not _close(
+                deltas["pairwise_accuracy_versus_base_mtp"],
+                measured - base["pairwise_accuracy_mean"],
+            )
+            or not _close(
+                deltas["regret_versus_base_mtp"],
+                measured_regret - base["mean_simulator_regret"],
+            )
+            or not _close(
+                deltas["pairwise_accuracy_versus_centered_residual"],
+                measured - centered["pairwise_accuracy_mean"],
+            )
+            or not _close(
+                deltas["regret_versus_centered_residual"],
+                measured_regret - centered["mean_simulator_regret"],
+            )
+        ):
+            raise ValueError(f"probe delta mismatch at horizon {horizon}")
     for context in ("posterior", "corrupted", "generated"):
         measured = float(np.mean([
             row["reward_context_metrics"][context]["mse"]
@@ -177,6 +240,32 @@ def verify_results(root: Path) -> dict:
         ]))
         if not _close(measured, report["reward_groups"][context]["mean_mse"]):
             raise ValueError(f"reward aggregation mismatch for {context}")
+        measured_calibration = float(np.mean([
+            row["reward_context_metrics"][context][
+                "offset_zero_mean_calibration_error"
+            ]
+            for row in evaluation_rows
+        ]))
+        deltas = report["matched_deltas"]["reward"][context]
+        base = manifest["base_mtp_reference"]["reward_groups"][context]
+        centered = manifest["centered_residual_reference"]["reward_groups"][context]
+        if (
+            not _close(deltas["mse_versus_base_mtp"], measured - base["mean_mse"])
+            or not _close(
+                deltas["calibration_versus_base_mtp"],
+                measured_calibration - base["mean_offset_zero_calibration_error"],
+            )
+            or not _close(
+                deltas["mse_versus_centered_residual"],
+                measured - centered["mean_mse"],
+            )
+            or not _close(
+                deltas["calibration_versus_centered_residual"],
+                measured_calibration
+                - centered["mean_offset_zero_calibration_error"],
+            )
+        ):
+            raise ValueError(f"reward delta mismatch for {context}")
     print("ACTION_REWARD_RESIDUAL_RESULTS_VERIFIED")
     return report
 

@@ -15,6 +15,7 @@ def main() -> None:
         "stage", choices=("manifest", "preflight", "residual", "evaluation", "actor", "finalize")
     )
     parser.add_argument("--mtp-root", required=True)
+    parser.add_argument("--centered-root", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--seed", type=int, choices=study.WORLD_MODEL_SEEDS)
     parser.add_argument("--horizon", type=int, choices=study.HORIZONS)
@@ -24,6 +25,7 @@ def main() -> None:
     parser.add_argument("--evaluation-episodes", type=int, default=5)
     args = parser.parse_args()
     settings = {
+        "centered_root": args.centered_root,
         "residual_updates": args.residual_updates,
         "actor_updates": args.actor_updates,
         "preparation_updates": args.preparation_updates,

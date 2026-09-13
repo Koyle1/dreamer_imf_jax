@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=imf-action-residual
+#SBATCH --job-name=imf-action-raw
 #SBATCH --account=dep_inin_dat
 #SBATCH --partition=gpu-l40s
 #SBATCH --gres=gpu:1
@@ -13,6 +13,7 @@ set -euo pipefail
 : "${AR_SOURCE_ROOT:?AR_SOURCE_ROOT is required}"
 : "${AR_OUTPUT_ROOT:?AR_OUTPUT_ROOT is required}"
 : "${AR_MTP_ROOT:?AR_MTP_ROOT is required}"
+: "${AR_CENTERED_ROOT:?AR_CENTERED_ROOT is required}"
 : "${AR_SOURCE_COMMIT:?AR_SOURCE_COMMIT is required}"
 : "${AR_STAGE:?AR_STAGE is required}"
 
@@ -37,6 +38,7 @@ test -z "$(git -C "${AR_SOURCE_ROOT}" status --porcelain)"
 RUNNER=${AR_SOURCE_ROOT}/dreamer_imf_comparison/scripts/run_action_reward_residual_study.py
 COMMON=(
   --mtp-root "${AR_MTP_ROOT}"
+  --centered-root "${AR_CENTERED_ROOT}"
   --output-root "${AR_OUTPUT_ROOT}"
   --residual-updates "${AR_RESIDUAL_UPDATES:-1000}"
   --actor-updates "${AR_ACTOR_UPDATES:-3000}"

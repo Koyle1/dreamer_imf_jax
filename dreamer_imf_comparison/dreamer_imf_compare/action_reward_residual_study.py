@@ -21,7 +21,8 @@ from .policy_consistency_vnext import ACTOR_SEED, HORIZONS, TASK, _tree_delta
 from .shared_probe_bank import evaluate_shared_probe_bank
 
 
-SCHEMA = "trajectory-imf-action-reward-residual-study-v1"
+SCHEMA = "trajectory-imf-action-reward-residual-study-v2"
+CENTERED_SCHEMA = "trajectory-imf-action-reward-residual-study-v1"
 WORLD_MODEL_SEEDS = mtp.WORLD_MODEL_SEEDS
 
 
@@ -50,6 +51,7 @@ def build_manifest(
     mtp_root: str | Path,
     output_root: str | Path | None = None,
     *,
+    centered_root: str | Path,
     residual_updates: int = 1000,
     actor_updates: int = 3000,
     preparation_updates: int = 500,
@@ -59,12 +61,27 @@ def build_manifest(
     if min(residual_updates, actor_updates, preparation_updates, evaluation_episodes) <= 0:
         raise ValueError("update and evaluation counts must be positive")
     base = Path(mtp_root).resolve(strict=True)
+    centered = Path(centered_root).resolve(strict=True)
     base_manifest = read_json(base / "manifest.json")
     base_report = read_json(base / "report.json")
+    centered_manifest = read_json(centered / "manifest.json")
+    centered_report = read_json(centered / "report.json")
     if base_report.get("status") != "complete":
         raise ValueError("source reward-head MTP study is incomplete")
     if base_manifest.get("manifest_sha256") != base_report.get("manifest_sha256"):
         raise ValueError("source reward-head MTP manifest/report mismatch")
+    if (
+        centered_manifest.get("schema_version") != CENTERED_SCHEMA
+        or centered_report.get("schema_version") != CENTERED_SCHEMA
+        or centered_report.get("status") != "complete"
+        or centered_manifest.get("manifest_sha256")
+        != centered_report.get("manifest_sha256")
+        or centered_report.get("completed_residual_cells") != len(WORLD_MODEL_SEEDS)
+        or centered_report.get("completed_evaluation_cells") != len(WORLD_MODEL_SEEDS)
+        or centered_report.get("completed_actor_cells")
+        != len(WORLD_MODEL_SEEDS) * len(HORIZONS)
+    ):
+        raise ValueError("centered residual reference is incomplete or incompatible")
     if residual_updates > int(base_manifest["reward_updates"]):
         raise ValueError("residual updates exceed the authenticated source schedule")
     sources = []
@@ -119,6 +136,11 @@ def build_manifest(
         "evaluation_episodes": int(evaluation_episodes),
         "trainable_world_subtrees": ["reward_action_residual"],
         "objective": asdict(objective),
+        "objective_identity": (
+            "centered_pseudo_huber_plus_exact_missing_component"
+            "_equals_uncentered_pseudo_huber"
+        ),
+        "normalization_basis": "centered_target_return_running_rms",
         "mtp_root": str(base),
         "mtp_manifest_sha256": base_manifest["manifest_sha256"],
         "mtp_report_file_sha256": benchmark.file_sha256(base / "report.json"),
@@ -132,12 +154,23 @@ def build_manifest(
             ],
         },
         "shortcut_reference": base_report["frozen_shortcut_reference"],
+        "centered_residual_root": str(centered),
+        "centered_residual_manifest_sha256": centered_manifest["manifest_sha256"],
+        "centered_residual_report_file_sha256": benchmark.file_sha256(
+            centered / "report.json"
+        ),
+        "centered_residual_reference": {
+            "reward_groups": centered_report["reward_groups"],
+            "probe_groups": centered_report["probe_groups"],
+            "actor_groups": centered_report["actor_groups"],
+        },
         "interpretation": {
             "claim_eligible": False,
-            "evidence_class": "exploratory_two_seed_reacher_action_residual",
+            "evidence_class": "exploratory_two_seed_reacher_raw_residual_return",
             "trajectory_model_frozen": True,
             "base_reward_head_frozen": True,
             "matched_actor_protocol": True,
+            "single_loss_term": True,
         },
     }
     manifest = _json_native(manifest)
@@ -189,13 +222,9 @@ def record_preflight(
 def _residual_metrics(details: Any, rms: Any) -> dict[str, float]:
     metrics = {
         "total": float(np.asarray(details.total)),
-        "centered_return": float(np.asarray(details.centered_return)),
-        "output_l2": float(np.asarray(details.output_l2)),
+        "uncentered_return": float(np.asarray(details.uncentered_return)),
         "advantage_running_rms": float(
             np.sqrt(float(np.asarray(rms.mean_square)) + 1e-6)
-        ),
-        "informative_pair_fraction": float(
-            np.asarray(details.advantage.informative_pair_fraction)
         ),
     }
     if not np.isfinite(np.asarray(list(metrics.values()))).all():
@@ -715,6 +744,7 @@ def finalize(
                 }
             )
     base = manifest["base_mtp_reference"]
+    centered = manifest["centered_residual_reference"]
     actor_deltas = {}
     for row in actor_groups:
         horizon = row["imagination_horizon"]
@@ -726,9 +756,17 @@ def finalize(
             item for item in manifest["shortcut_reference"]["actor_groups"]
             if item["imagination_horizon"] == horizon
         )
+        centered_actor = next(
+            item for item in centered["actor_groups"]
+            if item["imagination_horizon"] == horizon
+        )
         actor_deltas[str(horizon)] = {
             "versus_base_mtp": row["mean_normalized_return"] - base_actor["mean_normalized_return"],
             "versus_shortcut": row["mean_normalized_return"] - shortcut_actor["mean_normalized_return"],
+            "versus_centered_residual": (
+                row["mean_normalized_return"]
+                - centered_actor["mean_normalized_return"]
+            ),
         }
     probe_deltas = {
         horizon: {
@@ -739,6 +777,14 @@ def finalize(
             "regret_versus_base_mtp": (
                 probe_groups[horizon]["mean_simulator_regret"]
                 - base["probe_groups"][horizon]["mean_simulator_regret"]
+            ),
+            "pairwise_accuracy_versus_centered_residual": (
+                probe_groups[horizon]["pairwise_accuracy_mean"]
+                - centered["probe_groups"][horizon]["pairwise_accuracy_mean"]
+            ),
+            "regret_versus_centered_residual": (
+                probe_groups[horizon]["mean_simulator_regret"]
+                - centered["probe_groups"][horizon]["mean_simulator_regret"]
             ),
         }
         for horizon in probe_groups
@@ -752,6 +798,16 @@ def finalize(
             "calibration_versus_base_mtp": (
                 reward_groups[context]["mean_offset_zero_calibration_error"]
                 - base["reward_groups"][context]["mean_offset_zero_calibration_error"]
+            ),
+            "mse_versus_centered_residual": (
+                reward_groups[context]["mean_mse"]
+                - centered["reward_groups"][context]["mean_mse"]
+            ),
+            "calibration_versus_centered_residual": (
+                reward_groups[context]["mean_offset_zero_calibration_error"]
+                - centered["reward_groups"][context][
+                    "mean_offset_zero_calibration_error"
+                ]
             ),
         }
         for context in reward_groups
@@ -778,6 +834,7 @@ def finalize(
         },
         "base_mtp_reference": base,
         "shortcut_reference": manifest["shortcut_reference"],
+        "centered_residual_reference": centered,
         "aggregate_cell_wall_seconds": float(sum(
             float(row.get("wall_seconds", 0.0))
             for row in residual_rows + actor_rows

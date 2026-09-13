@@ -92,6 +92,7 @@ from .reward_residual import (
     action_reward_residual_loss,
     attach_action_reward_residual,
     jit_train_action_reward_residual,
+    residual_return_regression_loss,
     train_action_reward_residual,
 )
 from .shortcut import (
@@ -310,6 +311,7 @@ __all__ = [
     "reward_head_loss",
     "reward_mtp_targets",
     "reward_prediction_loss",
+    "residual_return_regression_loss",
     "reward_support",
     "sample_imf_one_step",
     "sample_imf_steps",

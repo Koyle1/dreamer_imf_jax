@@ -16,6 +16,7 @@ from imf_dreamer_jax import (
     predict_action_reward_residual,
     predict_reward,
     predict_transition_reward,
+    residual_return_regression_loss,
     train_action_reward_residual,
 )
 from imf_dreamer_jax.nn import tree_global_norm
@@ -124,6 +125,52 @@ class ActionRewardResidualTests(unittest.TestCase):
         )
         self.assertEqual(float(tree_global_norm(gradients)), 0.0)
 
+    def test_uncentered_loss_is_exact_and_breaks_translation_nullspace(self) -> None:
+        target = jnp.asarray(
+            [[[-1.0, 0.5], [0.0, -0.5], [2.0, 1.5]]], dtype=jnp.float32
+        )
+        error = jnp.asarray(
+            [[[0.25, -0.5], [0.75, 0.25], [-0.5, 1.0]]], dtype=jnp.float32
+        )
+        predicted = target + error
+        scale = 1.7
+        delta = 0.8
+        actual = residual_return_regression_loss(
+            predicted,
+            target,
+            mask=jnp.ones((1, 2)),
+            normalization_scale=scale,
+            huber_delta=delta,
+        )
+        normalized = np.asarray(error) / scale
+        direct = delta**2 * (np.sqrt(1.0 + np.square(normalized / delta)) - 1.0)
+        self.assertAlmostEqual(float(actual), float(np.mean(direct)), places=7)
+
+        centered_error = error - jnp.mean(error, axis=-2, keepdims=True)
+        shifted_error = error + 2.0
+        np.testing.assert_allclose(
+            np.asarray(
+                shifted_error - jnp.mean(shifted_error, axis=-2, keepdims=True)
+            ),
+            np.asarray(centered_error),
+            atol=1e-7,
+        )
+        shifted = residual_return_regression_loss(
+            target + shifted_error,
+            target,
+            normalization_scale=scale,
+            huber_delta=delta,
+        )
+        self.assertNotAlmostEqual(float(shifted), float(actual), places=6)
+
+    def test_squared_center_and_mean_terms_equal_raw_error(self) -> None:
+        error = np.asarray([1.5, -0.25, 2.0, 0.75], dtype=np.float64)
+        mean = np.mean(error)
+        centered = np.mean(np.square(error - mean))
+        gauge = np.square(mean)
+        raw = np.mean(np.square(error))
+        self.assertAlmostEqual(centered + gauge, raw, places=14)
+
     def test_training_changes_only_the_residual_and_its_moments(self) -> None:
         cfg = config()
         source = create_agent(cfg, jax.random.key(30))
@@ -131,7 +178,7 @@ class ActionRewardResidualTests(unittest.TestCase):
         initial = state
         rms = init_running_rms()
         data = decision_batch(cfg)
-        objective = ActionRewardResidualConfig(output_l2_scale=1e-4)
+        objective = ActionRewardResidualConfig()
         details = None
         for update in range(3):
             state, details, rms = train_action_reward_residual(

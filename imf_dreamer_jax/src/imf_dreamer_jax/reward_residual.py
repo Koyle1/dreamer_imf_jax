@@ -15,12 +15,11 @@ from .config import DreamerConfig
 from .nn import Params, clip_by_global_norm
 from .optim import adam_update
 from .policy_consistency import (
-    PolicyConsistencyConfig,
+    model_candidate_returns,
     running_rms_value,
-    trajectory_advantage_consistency_loss,
     update_running_rms,
 )
-from .types import AdamState, AdvantageConsistencyLoss, AgentParams, AgentState, RunningRMSState
+from .types import AdamState, AgentParams, AgentState, RunningRMSState
 from .world_model import init_action_reward_residual, observe_sequence
 
 
@@ -29,13 +28,11 @@ Batch = Mapping[str, Array]
 
 @dataclass(frozen=True)
 class ActionRewardResidualConfig:
-    """Minimal centered-return objective for the causal reward residual."""
+    """Exact uncentered return objective for the causal reward residual."""
 
     horizons: tuple[int, ...] = (1, 3, 5)
     huber_delta: float = 1.0
-    tie_tolerance: float = 1e-4
     normalization_epsilon: float = 1e-3
-    output_l2_scale: float = 1e-4
 
     def __post_init__(self) -> None:
         horizons = tuple(self.horizons)
@@ -50,31 +47,11 @@ class ActionRewardResidualConfig:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive")
-        for name in ("tie_tolerance", "output_l2_scale"):
-            value = getattr(self, name)
-            if not math.isfinite(value) or value < 0.0:
-                raise ValueError(f"{name} must be finite and nonnegative")
-
-    def advantage_objective(self) -> PolicyConsistencyConfig:
-        # Centered magnitude regression already penalizes wrong ordering and
-        # flat targets. Avoid redundant rank and flat loss terms.
-        return PolicyConsistencyConfig(
-            advantage_consistency_scale=1.0,
-            advantage_horizons=self.horizons,
-            advantage_magnitude_scale=1.0,
-            advantage_ranking_scale=0.0,
-            advantage_flat_scale=0.0,
-            advantage_huber_delta=self.huber_delta,
-            advantage_tie_tolerance=self.tie_tolerance,
-            advantage_normalization_epsilon=self.normalization_epsilon,
-        )
 
 
 class ActionRewardResidualLoss(NamedTuple):
     total: Array
-    centered_return: Array
-    output_l2: Array
-    advantage: AdvantageConsistencyLoss
+    uncentered_return: Array
 
 
 def attach_action_reward_residual(
@@ -110,13 +87,52 @@ def attach_action_reward_residual(
     )
 
 
-def _output_projection_l2(residual: Params) -> Array:
-    output = residual["layers"][-1]
-    numerator = jnp.sum(jnp.square(output["weight"])) + jnp.sum(
-        jnp.square(output["bias"])
+def _pseudo_huber(value: Array, delta: float) -> Array:
+    scaled = value / delta
+    return delta**2 * (jnp.sqrt(1.0 + jnp.square(scaled)) - 1.0)
+
+
+def residual_return_regression_loss(
+    predicted_returns: Array,
+    target_returns: Array,
+    *,
+    mask: Array | None = None,
+    normalization_scale: Array | float = 1.0,
+    huber_delta: float = 1.0,
+) -> Array:
+    """Regress absolute candidate returns with one robust loss.
+
+    Unlike a candidate-centered objective, this loss has no translation
+    nullspace.  It is exactly the centered pseudo-Huber objective plus the
+    algebraic difference between uncentered and centered pseudo-Huber losses;
+    evaluating the simplified expression avoids two cancelling terms.
+    """
+
+    predicted = jnp.asarray(predicted_returns)
+    target = jax.lax.stop_gradient(jnp.asarray(target_returns))
+    if predicted.shape != target.shape or predicted.ndim < 3:
+        raise ValueError(
+            "predicted_returns and target_returns must share [..., candidate, horizon]"
+        )
+    if predicted.shape[-2] < 2:
+        raise ValueError("residual return regression requires at least two candidates")
+    if not math.isfinite(huber_delta) or huber_delta <= 0.0:
+        raise ValueError("huber_delta must be finite and positive")
+    scale = jax.lax.stop_gradient(
+        jnp.maximum(jnp.asarray(normalization_scale), 1e-8)
     )
-    count = output["weight"].size + output["bias"].size
-    return numerator / count
+    per_horizon = jnp.mean(
+        _pseudo_huber((predicted - target) / scale, huber_delta), axis=-2
+    )
+    horizon_shape = predicted.shape[:-2] + (predicted.shape[-1],)
+    if mask is None:
+        horizon_mask = jnp.ones(horizon_shape, dtype=predicted.dtype)
+    else:
+        horizon_mask = jnp.broadcast_to(
+            jnp.asarray(mask, dtype=predicted.dtype), horizon_shape
+        )
+    denominator = jnp.maximum(jnp.sum(horizon_mask), 1.0)
+    return jnp.sum(per_horizon * horizon_mask) / denominator
 
 
 def action_reward_residual_loss(
@@ -129,7 +145,7 @@ def action_reward_residual_loss(
     *,
     normalization_scale: Array | float,
 ) -> ActionRewardResidualLoss:
-    """Regress centered simulator returns through only the residual subtree."""
+    """Regress simulator returns through only the residual subtree."""
 
     if "reward_action_residual" in frozen_world_model:
         raise ValueError("frozen_world_model must not already contain a residual")
@@ -143,18 +159,30 @@ def action_reward_residual_loss(
         is_first=decision_batch.get("is_first"),
     )
     sequence = jax.tree_util.tree_map(jax.lax.stop_gradient, sequence)
-    advantage = trajectory_advantage_consistency_loss(
+    predicted = model_candidate_returns(
         model,
         sequence,
-        decision_batch,
+        decision_batch["advantage_action_sequences"],
         jax.random.fold_in(key, 2),
         config,
-        objective.advantage_objective(),
-        normalization_scale=normalization_scale,
+        horizons=objective.horizons,
     )
-    output_l2 = _output_projection_l2(residual)
-    total = advantage.total + objective.output_l2_scale * output_l2
-    return ActionRewardResidualLoss(total, advantage.magnitude, output_l2, advantage)
+    targets = decision_batch["advantage_target_returns"]
+    if targets.shape != predicted.shape:
+        raise ValueError("advantage_target_returns have the wrong shape")
+    mask = decision_batch["advantage_mask"]
+    if mask.shape == predicted.shape[:2]:
+        mask = mask[..., None]
+    if mask.shape != predicted.shape[:2] + (predicted.shape[-1],):
+        raise ValueError("advantage_mask must be [batch, time] or [batch, time, horizon]")
+    return_loss = residual_return_regression_loss(
+        predicted,
+        targets,
+        mask=mask,
+        normalization_scale=normalization_scale,
+        huber_delta=objective.huber_delta,
+    )
+    return ActionRewardResidualLoss(return_loss, return_loss)
 
 
 def train_action_reward_residual(
@@ -170,6 +198,8 @@ def train_action_reward_residual(
     if "reward_action_residual" not in state.params.world_model:
         raise ValueError("action reward residual has not been attached")
     targets = jax.lax.stop_gradient(decision_batch["advantage_target_returns"])
+    # Preserve the completed centered study's candidate-independent scale so
+    # the only experimental change is removal of candidate centering.
     centered = targets - jnp.mean(targets, axis=-2, keepdims=True)
     mask = decision_batch["advantage_mask"]
     if mask.shape == targets.shape[:2]:
@@ -245,5 +275,6 @@ __all__ = [
     "action_reward_residual_loss",
     "attach_action_reward_residual",
     "jit_train_action_reward_residual",
+    "residual_return_regression_loss",
     "train_action_reward_residual",
 ]

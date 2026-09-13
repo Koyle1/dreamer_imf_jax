@@ -88,18 +88,22 @@ class ActionRewardResidualStudyTests(unittest.TestCase):
         print("ACTION_REWARD_RESIDUAL_STUDY_VERIFIED")
 
     def test_frozen_design_has_only_one_trainable_subtree_and_two_seeds(self) -> None:
+        self.assertEqual(
+            study.SCHEMA, "trajectory-imf-action-reward-residual-study-v2"
+        )
+        self.assertEqual(
+            study.CENTERED_SCHEMA, "trajectory-imf-action-reward-residual-study-v1"
+        )
         self.assertEqual(study.WORLD_MODEL_SEEDS, (211, 223))
         self.assertEqual(study.HORIZONS, (5, 15))
         objective = ActionRewardResidualConfig()
-        aligned = objective.advantage_objective()
-        self.assertEqual(aligned.advantage_magnitude_scale, 1.0)
-        self.assertEqual(aligned.advantage_ranking_scale, 0.0)
-        self.assertEqual(aligned.advantage_flat_scale, 0.0)
+        self.assertEqual(objective.horizons, (1, 3, 5))
+        self.assertEqual(objective.huber_delta, 1.0)
+        self.assertFalse(hasattr(objective, "output_l2_scale"))
 
     def test_objective_round_trips_through_json_sequence_types(self) -> None:
         objective = ActionRewardResidualConfig(horizons=[1, 3, 5])
         self.assertEqual(objective.horizons, (1, 3, 5))
-        self.assertEqual(objective.advantage_objective().advantage_horizons, (1, 3, 5))
 
     def test_preflight_verifier_accepts_recorded_gpu_runtime_schema(self) -> None:
         manifest = {"source_commit": "abc", "manifest_sha256": "def"}
