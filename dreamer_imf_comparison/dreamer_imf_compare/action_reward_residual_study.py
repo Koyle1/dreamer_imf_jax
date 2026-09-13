@@ -63,6 +63,9 @@ def build_manifest(
     actor_updates: int = 3000,
     preparation_updates: int = 500,
     evaluation_episodes: int = 5,
+    reward_objective: str = "uncentered_pseudo_huber",
+    control_scale: float = 1.0,
+    dense_reference_root: str | Path | None = None,
 ) -> dict[str, Any]:
     del output_root
     if min(residual_updates, actor_updates, preparation_updates, evaluation_episodes) <= 0:
@@ -76,6 +79,11 @@ def build_manifest(
     centered_report = read_json(centered / "report.json")
     sparse_manifest = read_json(sparse / "manifest.json")
     sparse_report = read_json(sparse / "report.json")
+    dense_reference = (
+        None
+        if dense_reference_root is None
+        else Path(dense_reference_root).resolve(strict=True)
+    )
     if base_report.get("status") != "complete":
         raise ValueError("source reward-head MTP study is incomplete")
     if base_manifest.get("manifest_sha256") != base_report.get("manifest_sha256"):
@@ -107,6 +115,36 @@ def build_manifest(
         raise ValueError("sparse residual reference is incomplete or incompatible")
     if residual_updates > int(base_manifest["reward_updates"]):
         raise ValueError("residual updates exceed the authenticated source schedule")
+    dense_reference_payload = None
+    if dense_reference is not None:
+        dense_manifest = read_json(dense_reference / "manifest.json")
+        dense_report = read_json(dense_reference / "report.json")
+        if (
+            dense_manifest.get("schema_version") != SCHEMA
+            or dense_report.get("schema_version") != SCHEMA
+            or dense_report.get("status") != "complete"
+            or dense_manifest.get("manifest_sha256")
+            != dense_report.get("manifest_sha256")
+            or dense_manifest.get("objective_identity")
+            != "uncentered_pseudo_huber_all_prefix_horizons_1_to_15"
+            or dense_report.get("completed_residual_cells")
+            != len(WORLD_MODEL_SEEDS)
+            or dense_report.get("completed_evaluation_cells")
+            != len(WORLD_MODEL_SEEDS)
+            or dense_report.get("completed_actor_cells")
+            != len(WORLD_MODEL_SEEDS) * len(HORIZONS)
+        ):
+            raise ValueError("dense residual reference is incomplete or incompatible")
+        dense_reference_payload = {
+            "root": str(dense_reference),
+            "manifest_sha256": dense_manifest["manifest_sha256"],
+            "report_file_sha256": benchmark.file_sha256(
+                dense_reference / "report.json"
+            ),
+            "reward_groups": dense_report["reward_groups"],
+            "probe_groups": dense_report["probe_groups"],
+            "actor_groups": dense_report["actor_groups"],
+        }
     sources = []
     for seed in WORLD_MODEL_SEEDS:
         source = mtp._source_row(base_manifest, seed)
@@ -167,7 +205,19 @@ def build_manifest(
         )
     from imf_dreamer_jax import ActionRewardResidualConfig
 
-    objective = ActionRewardResidualConfig(horizons=DENSE_TRAINING_HORIZONS)
+    objective = ActionRewardResidualConfig(
+        horizons=DENSE_TRAINING_HORIZONS,
+        objective=reward_objective,
+        control_scale=control_scale,
+    )
+    objective_identities = {
+        "uncentered_pseudo_huber": (
+            "uncentered_pseudo_huber_all_prefix_horizons_1_to_15"
+        ),
+        "dense_quadratic_control": (
+            "exact_dense_quadratic_plus_relative_error_control_h1_to_h15"
+        ),
+    }
     manifest = {
         "schema_version": SCHEMA,
         "status": "frozen_before_execution",
@@ -181,7 +231,7 @@ def build_manifest(
         "evaluation_episodes": int(evaluation_episodes),
         "trainable_world_subtrees": ["reward_action_residual"],
         "objective": asdict(objective),
-        "objective_identity": "uncentered_pseudo_huber_all_prefix_horizons_1_to_15",
+        "objective_identity": objective_identities[reward_objective],
         "normalization_basis": "centered_target_return_running_rms",
         "dense_probe_design": {
             "source_design_reused": True,
@@ -227,6 +277,7 @@ def build_manifest(
             "probe_groups": sparse_report["probe_groups"],
             "actor_groups": sparse_report["actor_groups"],
         },
+        "dense_residual_reference": dense_reference_payload,
         "interpretation": {
             "claim_eligible": False,
             "evidence_class": "exploratory_two_seed_reacher_dense_residual_return",
@@ -235,6 +286,13 @@ def build_manifest(
             "matched_actor_protocol": True,
             "single_loss_term": True,
             "dense_horizon_identification": True,
+            "exact_equivalence_simplification": (
+                reward_objective == "dense_quadratic_control"
+            ),
+            "regret_upper_bound_term": (
+                reward_objective == "dense_quadratic_control"
+                and control_scale > 0.0
+            ),
         },
     }
     manifest = _json_native(manifest)
@@ -287,6 +345,7 @@ def _residual_metrics(details: Any, rms: Any) -> dict[str, float]:
     metrics = {
         "total": float(np.asarray(details.total)),
         "uncentered_return": float(np.asarray(details.uncentered_return)),
+        "control": float(np.asarray(details.control)),
         "advantage_running_rms": float(
             np.sqrt(float(np.asarray(rms.mean_square)) + 1e-6)
         ),
@@ -967,6 +1026,7 @@ def finalize(
     base = manifest["base_mtp_reference"]
     centered = manifest["centered_residual_reference"]
     sparse = manifest["sparse_residual_reference"]
+    dense_reference = manifest.get("dense_residual_reference")
     actor_deltas = {}
     for row in actor_groups:
         horizon = row["imagination_horizon"]
@@ -986,7 +1046,7 @@ def finalize(
             item for item in sparse["actor_groups"]
             if item["imagination_horizon"] == horizon
         )
-        actor_deltas[str(horizon)] = {
+        actor_delta = {
             "versus_base_mtp": row["mean_normalized_return"] - base_actor["mean_normalized_return"],
             "versus_shortcut": row["mean_normalized_return"] - shortcut_actor["mean_normalized_return"],
             "versus_centered_residual": (
@@ -998,6 +1058,16 @@ def finalize(
                 - sparse_actor["mean_normalized_return"]
             ),
         }
+        if dense_reference is not None:
+            dense_actor = next(
+                item for item in dense_reference["actor_groups"]
+                if item["imagination_horizon"] == horizon
+            )
+            actor_delta["versus_dense_residual"] = (
+                row["mean_normalized_return"]
+                - dense_actor["mean_normalized_return"]
+            )
+        actor_deltas[str(horizon)] = actor_delta
     probe_deltas = {
         horizon: {
             "pairwise_accuracy_versus_base_mtp": (
@@ -1027,6 +1097,17 @@ def finalize(
         }
         for horizon in probe_groups
     }
+    if dense_reference is not None:
+        for horizon, deltas in probe_deltas.items():
+            reference = dense_reference["probe_groups"][horizon]
+            deltas["pairwise_accuracy_versus_dense_residual"] = (
+                probe_groups[horizon]["pairwise_accuracy_mean"]
+                - reference["pairwise_accuracy_mean"]
+            )
+            deltas["regret_versus_dense_residual"] = (
+                probe_groups[horizon]["mean_simulator_regret"]
+                - reference["mean_simulator_regret"]
+            )
     reward_deltas = {
         context: {
             "mse_versus_base_mtp": (
@@ -1060,6 +1141,16 @@ def finalize(
         }
         for context in reward_groups
     }
+    if dense_reference is not None:
+        for context, deltas in reward_deltas.items():
+            reference = dense_reference["reward_groups"][context]
+            deltas["mse_versus_dense_residual"] = (
+                reward_groups[context]["mean_mse"] - reference["mean_mse"]
+            )
+            deltas["calibration_versus_dense_residual"] = (
+                reward_groups[context]["mean_offset_zero_calibration_error"]
+                - reference["mean_offset_zero_calibration_error"]
+            )
     report = {
         "schema_version": SCHEMA,
         "stage": "final",
@@ -1086,6 +1177,7 @@ def finalize(
         "shortcut_reference": manifest["shortcut_reference"],
         "centered_residual_reference": centered,
         "sparse_residual_reference": sparse,
+        "dense_residual_reference": dense_reference,
         "aggregate_cell_wall_seconds": float(sum(
             float(row.get("wall_seconds", 0.0))
             for row in dense_probe_rows + residual_rows + actor_rows

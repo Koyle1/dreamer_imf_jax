@@ -10,7 +10,11 @@ from imf_dreamer_jax import (
     ActionRewardResidualConfig,
     DreamerConfig,
     attach_action_reward_residual,
+    best_candidate_relative_error_penalties,
     create_agent,
+    dense_prefix_quadratic_form,
+    dense_reward_objective,
+    discounted_prefix_quadratic_matrix,
     imagine,
     init_running_rms,
     predict_action_reward_residual,
@@ -173,6 +177,169 @@ class ActionRewardResidualTests(unittest.TestCase):
         raw = np.mean(np.square(error))
         self.assertAlmostEqual(centered + gauge, raw, places=14)
 
+    def test_trace_form_exactly_equals_explicit_dense_prefix_loss(self) -> None:
+        errors = jnp.asarray(
+            [
+                [[0.2, -0.4, 0.7, 0.1], [-0.3, 0.5, 0.2, -0.6]],
+                [[0.8, 0.1, -0.2, 0.4], [0.0, -0.7, 0.3, 0.2]],
+            ],
+            dtype=jnp.float32,
+        )
+        discount = 0.93
+        weights = jnp.asarray([0.5, 1.0, 1.5, 2.0], dtype=jnp.float32)
+        actual = dense_prefix_quadratic_form(
+            errors, discount, horizon_weights=weights
+        )
+        discounted_steps = errors * jnp.power(
+            jnp.asarray(discount, errors.dtype), jnp.arange(errors.shape[-1])
+        )
+        prefixes = jnp.cumsum(discounted_steps, axis=-1)
+        expected = jnp.sum(weights * jnp.square(prefixes), axis=-1)
+        np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
+
+        matrix = discounted_prefix_quadratic_matrix(
+            errors.shape[-1], discount, horizon_weights=weights
+        )
+        np.testing.assert_allclose(matrix, matrix.T, rtol=0.0, atol=1e-7)
+        eigenvalues = np.linalg.eigvalsh(np.asarray(matrix))
+        self.assertGreater(float(np.min(eigenvalues)), 0.0)
+
+    def test_trace_form_gradient_matches_explicit_prefix_gradient(self) -> None:
+        errors = jnp.asarray(
+            [[0.2, -0.4, 0.7], [-0.3, 0.5, 0.2]], dtype=jnp.float32
+        )
+        discount = 0.97
+
+        def trace_loss(value):
+            return jnp.sum(dense_prefix_quadratic_form(value, discount))
+
+        def explicit_loss(value):
+            powers = jnp.power(
+                jnp.asarray(discount, value.dtype), jnp.arange(value.shape[-1])
+            )
+            return jnp.sum(jnp.square(jnp.cumsum(value * powers, axis=-1)))
+
+        np.testing.assert_allclose(
+            jax.grad(trace_loss)(errors),
+            jax.grad(explicit_loss)(errors),
+            rtol=2e-6,
+            atol=2e-6,
+        )
+
+    def test_relative_error_penalty_is_exact_gap_cancellation(self) -> None:
+        target = jnp.asarray(
+            [[3.0, 1.0, 2.0, -1.0], [0.5, 2.5, 1.5, 0.0]],
+            dtype=jnp.float32,
+        )
+        predicted = jnp.asarray(
+            [[2.0, 2.5, 2.2, -0.5], [1.5, 1.0, 1.7, 0.2]],
+            dtype=jnp.float32,
+        )
+
+        def original(value):
+            best = jnp.argmax(target, axis=-1)
+            best_target = jnp.take_along_axis(target, best[:, None], axis=-1)
+            best_prediction = jnp.take_along_axis(value, best[:, None], axis=-1)
+            gap = best_target - target
+            predicted_gap = best_prediction - value
+            penalty = jax.nn.relu(gap - predicted_gap)
+            return penalty * (
+                1.0 - jax.nn.one_hot(best, target.shape[-1], dtype=target.dtype)
+            )
+
+        actual = best_candidate_relative_error_penalties(predicted, target)
+        np.testing.assert_allclose(actual, original(predicted), atol=1e-7)
+        np.testing.assert_allclose(
+            jax.grad(lambda value: jnp.sum(
+                best_candidate_relative_error_penalties(value, target)
+            ))(predicted),
+            jax.grad(lambda value: jnp.sum(original(value)))(predicted),
+            atol=1e-7,
+        )
+
+        selected = np.argmax(np.asarray(predicted), axis=-1)
+        best = np.argmax(np.asarray(target), axis=-1)
+        regret = np.asarray(target)[np.arange(target.shape[0]), best] - np.asarray(
+            target
+        )[np.arange(target.shape[0]), selected]
+        self.assertTrue(np.all(regret <= np.sum(np.asarray(actual), axis=-1) + 1e-7))
+
+    def test_dense_reward_objective_matches_direct_formula_and_mask(self) -> None:
+        target = jnp.asarray(
+            [
+                [[1.0, 1.5, 2.0], [0.0, 1.0, 1.0], [-1.0, 0.0, 0.5]],
+                [[2.0, 2.5, 3.0], [1.0, 1.5, 2.0], [0.0, 0.5, 1.0]],
+            ],
+            dtype=jnp.float32,
+        )
+        error = jnp.asarray(
+            [
+                [[0.1, -0.2, -0.5], [0.2, 0.4, 0.8], [-0.1, 0.3, 0.1]],
+                [[0.5, 0.4, 0.3], [-0.2, -0.1, 0.0], [0.1, 0.2, 0.3]],
+            ],
+            dtype=jnp.float32,
+        )
+        mask = jnp.asarray([[1.0, 1.0, 1.0], [1.0, 0.0, 0.0]])
+        scale = 2.0
+        control_scale = 0.7
+        details = dense_reward_objective(
+            target + error,
+            target,
+            mask=mask,
+            normalization_scale=scale,
+            control_scale=control_scale,
+        )
+        normalized = error / scale
+        expected_dense = jnp.sum(
+            jnp.mean(jnp.square(normalized), axis=-2) * mask
+        ) / jnp.sum(mask)
+        terminal_penalties = best_candidate_relative_error_penalties(
+            target[..., -1] + normalized[..., -1], target[..., -1]
+        )
+        expected_control = jnp.sum(terminal_penalties * mask[..., -1, None]) / (
+            jnp.sum(mask[..., -1]) * (target.shape[-2] - 1)
+        )
+        self.assertAlmostEqual(float(details.dense_prefix), float(expected_dense), places=7)
+        self.assertAlmostEqual(float(details.control), float(expected_control), places=7)
+        self.assertAlmostEqual(
+            float(details.total),
+            float(expected_dense + control_scale * expected_control),
+            places=7,
+        )
+
+    def test_dense_reward_objective_corrects_a_misranked_best_action(self) -> None:
+        target = jnp.asarray(
+            [[[0.5, 1.5, 3.0], [0.4, 1.0, 2.0], [0.2, 0.8, 1.0]]],
+            dtype=jnp.float32,
+        )
+        predicted = jnp.asarray(
+            [[[0.0, 0.0, 0.0], [0.5, 1.5, 4.0], [0.1, 0.5, 1.5]]],
+            dtype=jnp.float32,
+        )
+        initial = dense_reward_objective(predicted, target, control_scale=1.0)
+        self.assertEqual(int(jnp.argmax(predicted[..., -1], axis=-1)[0]), 1)
+
+        def loss_fn(value):
+            return dense_reward_objective(value, target, control_scale=1.0).total
+
+        for _ in range(40):
+            predicted = predicted - 0.2 * jax.grad(loss_fn)(predicted)
+        final = dense_reward_objective(predicted, target, control_scale=1.0)
+        self.assertLess(float(final.total), float(initial.total))
+        self.assertEqual(int(jnp.argmax(predicted[..., -1], axis=-1)[0]), 0)
+
+    def test_dense_control_mode_requires_all_prefixes(self) -> None:
+        with self.assertRaisesRegex(ValueError, "every prefix horizon"):
+            ActionRewardResidualConfig(
+                horizons=(1, 3, 5), objective="dense_quadratic_control"
+            )
+        configured = ActionRewardResidualConfig(
+            horizons=tuple(range(1, 16)),
+            objective="dense_quadratic_control",
+            control_scale=0.5,
+        )
+        self.assertEqual(configured.objective, "dense_quadratic_control")
+
     def test_training_changes_only_the_residual_and_its_moments(self) -> None:
         cfg = config()
         source = create_agent(cfg, jax.random.key(30))
@@ -232,7 +399,11 @@ class ActionRewardResidualTests(unittest.TestCase):
             decision_batch(cfg, horizons),
             jax.random.key(37),
             cfg,
-            ActionRewardResidualConfig(horizons=horizons),
+            ActionRewardResidualConfig(
+                horizons=horizons,
+                objective="dense_quadratic_control",
+                control_scale=0.5,
+            ),
             init_running_rms(),
         )
         self.assertTrue(np.isfinite(float(details.uncentered_return)))

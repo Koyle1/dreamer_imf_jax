@@ -23,6 +23,13 @@ def _settings(manifest: dict) -> dict:
         "actor_updates": manifest["actor_updates"],
         "preparation_updates": manifest["preparation_updates"],
         "evaluation_episodes": manifest["evaluation_episodes"],
+        "reward_objective": manifest["objective"]["objective"],
+        "control_scale": manifest["objective"]["control_scale"],
+        "dense_reference_root": (
+            None
+            if manifest.get("dense_residual_reference") is None
+            else manifest["dense_residual_reference"]["root"]
+        ),
     }
 
 
@@ -39,12 +46,18 @@ def verify_manifest(root: Path) -> dict:
         or manifest["imagination_horizons"] != list(study.HORIZONS)
         or manifest["trainable_world_subtrees"] != ["reward_action_residual"]
         or set(manifest["objective"]) != {
-            "horizons", "huber_delta", "normalization_epsilon"
+            "horizons",
+            "huber_delta",
+            "normalization_epsilon",
+            "objective",
+            "control_scale",
         }
         or manifest["objective"]["horizons"]
         != list(study.DENSE_TRAINING_HORIZONS)
-        or manifest.get("objective_identity")
-        != "uncentered_pseudo_huber_all_prefix_horizons_1_to_15"
+        or manifest.get("objective_identity") not in {
+            "uncentered_pseudo_huber_all_prefix_horizons_1_to_15",
+            "exact_dense_quadratic_plus_relative_error_control_h1_to_h15",
+        }
         or manifest.get("normalization_basis")
         != "centered_target_return_running_rms"
         or manifest.get("dense_probe_design", {}).get("training_horizons")
@@ -60,6 +73,19 @@ def verify_manifest(root: Path) -> dict:
         or manifest["interpretation"].get("dense_horizon_identification") is not True
     ):
         raise ValueError("manifest design or freeze contract is invalid")
+    objective = manifest["objective"]
+    if manifest["objective_identity"].startswith("exact_dense_quadratic"):
+        if (
+            objective["objective"] != "dense_quadratic_control"
+            or objective["control_scale"] <= 0.0
+            or manifest.get("dense_residual_reference") is None
+            or manifest["interpretation"].get("exact_equivalence_simplification")
+            is not True
+            or manifest["interpretation"].get("regret_upper_bound_term") is not True
+        ):
+            raise ValueError("dense quadratic-control contract is incomplete")
+    elif objective["objective"] != "uncentered_pseudo_huber":
+        raise ValueError("pseudo-Huber objective identity mismatch")
     for source in manifest["source_artifacts"]:
         checks = (
             (source["checkpoint"], source["checkpoint_sha256"]),
@@ -82,6 +108,12 @@ def verify_manifest(root: Path) -> dict:
         != manifest["sparse_residual_report_file_sha256"]
     ):
         raise ValueError("sparse residual reference digest changed")
+    dense_reference = manifest.get("dense_residual_reference")
+    if dense_reference is not None and (
+        benchmark.file_sha256(Path(dense_reference["root"]) / "report.json")
+        != dense_reference["report_file_sha256"]
+    ):
+        raise ValueError("dense residual reference digest changed")
     print("ACTION_REWARD_RESIDUAL_MANIFEST_VERIFIED")
     return manifest
 
@@ -175,8 +207,7 @@ def verify_results(root: Path) -> dict:
             or residual.get("world_model_seed") != seed
             or residual.get("dense_probe_bank_sha256")
             != dense_probe["probe_bank_sha256"]
-            or residual.get("objective", {}).get("horizons")
-            != list(study.DENSE_TRAINING_HORIZONS)
+            or residual.get("objective") != manifest["objective"]
             or residual.get("residual_parameter_delta", 0.0) <= 0.0
             or any(residual.get("source_parameter_deltas", {}).values())
             or any(residual.get("source_first_moment_deltas", {}).values())
@@ -229,6 +260,8 @@ def verify_results(root: Path) -> dict:
         != manifest["centered_residual_reference"]
         or report.get("sparse_residual_reference")
         != manifest["sparse_residual_reference"]
+        or report.get("dense_residual_reference")
+        != manifest.get("dense_residual_reference")
     ):
         raise ValueError("final report is incomplete")
     for horizon in study.HORIZONS:
@@ -266,6 +299,16 @@ def verify_results(root: Path) -> dict:
         ):
             if not _close(deltas[name], measured - reference):
                 raise ValueError(f"actor delta mismatch for {name}, horizon {horizon}")
+        dense_reference = manifest.get("dense_residual_reference")
+        if dense_reference is not None:
+            dense = next(
+                row for row in dense_reference["actor_groups"]
+                if row["imagination_horizon"] == horizon
+            )["mean_normalized_return"]
+            if not _close(deltas["versus_dense_residual"], measured - dense):
+                raise ValueError(
+                    f"actor delta mismatch versus dense residual at horizon {horizon}"
+                )
     for horizon in ("1", "3", "5", "15"):
         measured = float(np.mean([
             row["metrics_by_horizon"][horizon]["pairwise_accuracy"]
@@ -308,6 +351,22 @@ def verify_results(root: Path) -> dict:
             )
         ):
             raise ValueError(f"probe delta mismatch at horizon {horizon}")
+        dense_reference = manifest.get("dense_residual_reference")
+        if dense_reference is not None:
+            dense = dense_reference["probe_groups"][horizon]
+            if (
+                not _close(
+                    deltas["pairwise_accuracy_versus_dense_residual"],
+                    measured - dense["pairwise_accuracy_mean"],
+                )
+                or not _close(
+                    deltas["regret_versus_dense_residual"],
+                    measured_regret - dense["mean_simulator_regret"],
+                )
+            ):
+                raise ValueError(
+                    f"probe delta mismatch versus dense residual at horizon {horizon}"
+                )
     for context in ("posterior", "corrupted", "generated"):
         measured = float(np.mean([
             row["reward_context_metrics"][context]["mse"]
@@ -351,6 +410,23 @@ def verify_results(root: Path) -> dict:
             )
         ):
             raise ValueError(f"reward delta mismatch for {context}")
+        dense_reference = manifest.get("dense_residual_reference")
+        if dense_reference is not None:
+            dense = dense_reference["reward_groups"][context]
+            if (
+                not _close(
+                    deltas["mse_versus_dense_residual"],
+                    measured - dense["mean_mse"],
+                )
+                or not _close(
+                    deltas["calibration_versus_dense_residual"],
+                    measured_calibration
+                    - dense["mean_offset_zero_calibration_error"],
+                )
+            ):
+                raise ValueError(
+                    f"reward delta mismatch versus dense residual for {context}"
+                )
     print("ACTION_REWARD_RESIDUAL_RESULTS_VERIFIED")
     return report
 

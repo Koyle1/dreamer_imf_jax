@@ -28,11 +28,13 @@ Batch = Mapping[str, Array]
 
 @dataclass(frozen=True)
 class ActionRewardResidualConfig:
-    """Exact uncentered return objective for the causal reward residual."""
+    """Objective settings for the frozen-world-model reward residual."""
 
     horizons: tuple[int, ...] = (1, 3, 5)
     huber_delta: float = 1.0
     normalization_epsilon: float = 1e-3
+    objective: str = "uncentered_pseudo_huber"
+    control_scale: float = 1.0
 
     def __post_init__(self) -> None:
         horizons = tuple(self.horizons)
@@ -47,11 +49,37 @@ class ActionRewardResidualConfig:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive")
+        if self.objective not in {
+            "uncentered_pseudo_huber",
+            "dense_quadratic_control",
+        }:
+            raise ValueError(
+                "objective must be 'uncentered_pseudo_huber' or "
+                "'dense_quadratic_control'"
+            )
+        if not math.isfinite(self.control_scale) or self.control_scale < 0.0:
+            raise ValueError("control_scale must be finite and nonnegative")
+        if self.objective == "dense_quadratic_control" and horizons != tuple(
+            range(1, horizons[-1] + 1)
+        ):
+            raise ValueError(
+                "dense_quadratic_control requires every prefix horizon from 1 to H"
+            )
 
 
 class ActionRewardResidualLoss(NamedTuple):
     total: Array
     uncentered_return: Array
+    control: Array
+
+
+class DenseRewardObjectiveLoss(NamedTuple):
+    """Components of the exact dense-prefix and control-alignment objective."""
+
+    total: Array
+    dense_prefix: Array
+    control: Array
+    terminal_return_errors: Array
 
 
 def attach_action_reward_residual(
@@ -90,6 +118,143 @@ def attach_action_reward_residual(
 def _pseudo_huber(value: Array, delta: float) -> Array:
     scaled = value / delta
     return delta**2 * (jnp.sqrt(1.0 + jnp.square(scaled)) - 1.0)
+
+
+def discounted_prefix_quadratic_matrix(
+    horizon: int,
+    discount: float,
+    *,
+    horizon_weights: Array | None = None,
+    dtype: jnp.dtype = jnp.float32,
+) -> Array:
+    """Return ``Q = C.T @ W @ C`` for all discounted reward prefixes.
+
+    ``C[h, t] = discount**t`` when ``t <= h`` and zero otherwise.  Therefore
+    ``d.T @ Q @ d`` is exactly the weighted sum of squared discounted-prefix
+    errors for a per-step reward-error vector ``d``.
+    """
+
+    if not isinstance(horizon, int) or isinstance(horizon, bool) or horizon <= 0:
+        raise ValueError("horizon must be a positive integer")
+    if not math.isfinite(discount) or discount <= 0.0:
+        raise ValueError("discount must be finite and positive")
+    powers = jnp.power(jnp.asarray(discount, dtype=dtype), jnp.arange(horizon))
+    cumulative = jnp.tril(jnp.ones((horizon, horizon), dtype=dtype)) * powers[None]
+    if horizon_weights is None:
+        weights = jnp.ones((horizon,), dtype=dtype)
+    else:
+        weights = jnp.asarray(horizon_weights, dtype=dtype)
+        if weights.shape != (horizon,):
+            raise ValueError("horizon_weights must have shape [horizon]")
+    return cumulative.T @ (weights[:, None] * cumulative)
+
+
+def dense_prefix_quadratic_form(
+    reward_errors: Array,
+    discount: float,
+    *,
+    horizon_weights: Array | None = None,
+) -> Array:
+    """Evaluate the trace-form dense-prefix loss without forming prefixes."""
+
+    errors = jnp.asarray(reward_errors)
+    if errors.ndim < 1 or errors.shape[-1] == 0:
+        raise ValueError("reward_errors must end in a nonempty step dimension")
+    matrix = discounted_prefix_quadratic_matrix(
+        errors.shape[-1],
+        discount,
+        horizon_weights=horizon_weights,
+        dtype=errors.dtype,
+    )
+    return jnp.einsum("...t,tu,...u->...", errors, matrix, errors)
+
+
+def best_candidate_relative_error_penalties(
+    predicted_returns: Array,
+    target_returns: Array,
+) -> Array:
+    """Return the exactly simplified best-versus-rest hinge penalties.
+
+    For each leading row, the target-best candidate ``i*`` is selected at the
+    final horizon.  The result is ``[E_i - E_i*]_+`` with a structural zero at
+    ``i*``.  This equals
+    ``[Delta_i - (predicted_gap_i)]_+`` algebraically; no approximation or
+    statistical assumption is used.
+    """
+
+    predicted = jnp.asarray(predicted_returns)
+    target = jax.lax.stop_gradient(jnp.asarray(target_returns))
+    if predicted.shape != target.shape or predicted.ndim < 2:
+        raise ValueError(
+            "predicted_returns and target_returns must share [..., candidate]"
+        )
+    if predicted.shape[-1] < 2:
+        raise ValueError("control alignment requires at least two candidates")
+    errors = predicted - target
+    best = jnp.argmax(target, axis=-1)
+    best_error = jnp.take_along_axis(errors, best[..., None], axis=-1)
+    penalties = jax.nn.relu(errors - best_error)
+    best_mask = jax.nn.one_hot(best, predicted.shape[-1], dtype=predicted.dtype)
+    return penalties * (1.0 - best_mask)
+
+
+def dense_reward_objective(
+    predicted_prefix_returns: Array,
+    target_prefix_returns: Array,
+    *,
+    mask: Array | None = None,
+    normalization_scale: Array | float = 1.0,
+    control_scale: float = 1.0,
+) -> DenseRewardObjectiveLoss:
+    """Exact dense-prefix quadratic plus simplified terminal control loss.
+
+    Inputs end in ``[candidate, horizon]`` and must contain every prefix from
+    one through ``H``.  Since these prefix returns are already materialized,
+    their squared residual is the direct evaluation of ``tr(D Q D.T)``.  The
+    control component uses only terminal return errors and target-best indices;
+    explicit target gaps cancel exactly.
+    """
+
+    predicted = jnp.asarray(predicted_prefix_returns)
+    target = jax.lax.stop_gradient(jnp.asarray(target_prefix_returns))
+    if predicted.shape != target.shape or predicted.ndim < 3:
+        raise ValueError(
+            "predicted_prefix_returns and target_prefix_returns must share "
+            "[..., candidate, horizon]"
+        )
+    if predicted.shape[-2] < 2 or predicted.shape[-1] < 1:
+        raise ValueError("dense reward objective requires candidates and horizons")
+    if not math.isfinite(control_scale) or control_scale < 0.0:
+        raise ValueError("control_scale must be finite and nonnegative")
+    scale = jax.lax.stop_gradient(
+        jnp.maximum(jnp.asarray(normalization_scale), 1e-8)
+    )
+    errors = (predicted - target) / scale
+    horizon_shape = predicted.shape[:-2] + (predicted.shape[-1],)
+    if mask is None:
+        horizon_mask = jnp.ones(horizon_shape, dtype=predicted.dtype)
+    else:
+        horizon_mask = jnp.broadcast_to(
+            jnp.asarray(mask, dtype=predicted.dtype), horizon_shape
+        )
+    dense_per_horizon = jnp.mean(jnp.square(errors), axis=-2)
+    dense_denominator = jnp.maximum(jnp.sum(horizon_mask), 1.0)
+    dense_prefix = jnp.sum(dense_per_horizon * horizon_mask) / dense_denominator
+
+    terminal_errors = errors[..., -1]
+    terminal_targets = target[..., -1]
+    penalties = best_candidate_relative_error_penalties(
+        terminal_errors + terminal_targets,
+        terminal_targets,
+    )
+    terminal_mask = horizon_mask[..., -1]
+    candidate_count = predicted.shape[-2]
+    control_denominator = jnp.maximum(
+        jnp.sum(terminal_mask) * (candidate_count - 1), 1.0
+    )
+    control = jnp.sum(penalties * terminal_mask[..., None]) / control_denominator
+    total = dense_prefix + control_scale * control
+    return DenseRewardObjectiveLoss(total, dense_prefix, control, terminal_errors)
 
 
 def residual_return_regression_loss(
@@ -175,6 +340,15 @@ def action_reward_residual_loss(
         mask = mask[..., None]
     if mask.shape != predicted.shape[:2] + (predicted.shape[-1],):
         raise ValueError("advantage_mask must be [batch, time] or [batch, time, horizon]")
+    if objective.objective == "dense_quadratic_control":
+        dense = dense_reward_objective(
+            predicted,
+            targets,
+            mask=mask,
+            normalization_scale=normalization_scale,
+            control_scale=objective.control_scale,
+        )
+        return ActionRewardResidualLoss(dense.total, dense.dense_prefix, dense.control)
     return_loss = residual_return_regression_loss(
         predicted,
         targets,
@@ -182,7 +356,7 @@ def action_reward_residual_loss(
         normalization_scale=normalization_scale,
         huber_delta=objective.huber_delta,
     )
-    return ActionRewardResidualLoss(return_loss, return_loss)
+    return ActionRewardResidualLoss(return_loss, return_loss, jnp.zeros_like(return_loss))
 
 
 def train_action_reward_residual(
@@ -272,8 +446,13 @@ jit_train_action_reward_residual = partial(
 __all__ = [
     "ActionRewardResidualConfig",
     "ActionRewardResidualLoss",
+    "DenseRewardObjectiveLoss",
     "action_reward_residual_loss",
     "attach_action_reward_residual",
+    "best_candidate_relative_error_penalties",
+    "dense_prefix_quadratic_form",
+    "dense_reward_objective",
+    "discounted_prefix_quadratic_matrix",
     "jit_train_action_reward_residual",
     "residual_return_regression_loss",
     "train_action_reward_residual",

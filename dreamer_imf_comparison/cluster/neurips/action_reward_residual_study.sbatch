@@ -46,7 +46,12 @@ COMMON=(
   --actor-updates "${AR_ACTOR_UPDATES:-3000}"
   --preparation-updates "${AR_PREPARATION_UPDATES:-500}"
   --evaluation-episodes "${AR_EVALUATION_EPISODES:-5}"
+  --reward-objective "${AR_REWARD_OBJECTIVE:-uncentered_pseudo_huber}"
+  --control-scale "${AR_CONTROL_SCALE:-1.0}"
 )
+if [[ -n "${AR_DENSE_REFERENCE_ROOT:-}" ]]; then
+  COMMON+=(--dense-reference-root "${AR_DENSE_REFERENCE_ROOT}")
+fi
 SEEDS=(211 223)
 HORIZONS=(5 15)
 

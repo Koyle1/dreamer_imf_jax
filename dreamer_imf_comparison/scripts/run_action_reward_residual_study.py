@@ -33,6 +33,13 @@ def main() -> None:
     parser.add_argument("--actor-updates", type=int, default=3000)
     parser.add_argument("--preparation-updates", type=int, default=500)
     parser.add_argument("--evaluation-episodes", type=int, default=5)
+    parser.add_argument(
+        "--reward-objective",
+        choices=("uncentered_pseudo_huber", "dense_quadratic_control"),
+        default="uncentered_pseudo_huber",
+    )
+    parser.add_argument("--control-scale", type=float, default=1.0)
+    parser.add_argument("--dense-reference-root")
     args = parser.parse_args()
     settings = {
         "centered_root": args.centered_root,
@@ -41,6 +48,9 @@ def main() -> None:
         "actor_updates": args.actor_updates,
         "preparation_updates": args.preparation_updates,
         "evaluation_episodes": args.evaluation_episodes,
+        "reward_objective": args.reward_objective,
+        "control_scale": args.control_scale,
+        "dense_reference_root": args.dense_reference_root,
     }
     common = (args.mtp_root, args.output_root)
     if args.stage == "manifest":
