@@ -94,6 +94,11 @@ class ActionRewardResidualStudyTests(unittest.TestCase):
         self.assertEqual(aligned.advantage_ranking_scale, 0.0)
         self.assertEqual(aligned.advantage_flat_scale, 0.0)
 
+    def test_objective_round_trips_through_json_sequence_types(self) -> None:
+        objective = ActionRewardResidualConfig(horizons=[1, 3, 5])
+        self.assertEqual(objective.horizons, (1, 3, 5))
+        self.assertEqual(objective.advantage_objective().advantage_horizons, (1, 3, 5))
+
     def test_preflight_verifier_accepts_recorded_gpu_runtime_schema(self) -> None:
         manifest = {"source_commit": "abc", "manifest_sha256": "def"}
         preflight = {

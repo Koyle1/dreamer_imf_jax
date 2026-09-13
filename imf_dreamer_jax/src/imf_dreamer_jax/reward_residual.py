@@ -38,10 +38,12 @@ class ActionRewardResidualConfig:
     output_l2_scale: float = 1e-4
 
     def __post_init__(self) -> None:
+        horizons = tuple(self.horizons)
+        object.__setattr__(self, "horizons", horizons)
         if (
-            not self.horizons
-            or tuple(sorted(set(self.horizons))) != self.horizons
-            or any(value <= 0 for value in self.horizons)
+            not horizons
+            or tuple(sorted(set(horizons))) != horizons
+            or any(value <= 0 for value in horizons)
         ):
             raise ValueError("horizons must be unique increasing positive integers")
         for name in ("huber_delta", "normalization_epsilon"):
