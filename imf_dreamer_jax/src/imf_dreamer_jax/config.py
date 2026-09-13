@@ -112,6 +112,7 @@ class DreamerConfig:
     actor_critic_warmup_steps: int = 0
     slow_critic_fraction: float = 0.02
     return_normalization_epsilon: float = 1e-6
+    return_scale_ema_decay: float = 0.99
     model_learning_rate: float = 3e-4
     actor_learning_rate: float = 3e-4
     critic_learning_rate: float = 3e-4
@@ -360,6 +361,11 @@ class DreamerConfig:
             or not 0 < self.slow_critic_fraction <= 1
         ):
             raise ValueError("slow_critic_fraction must be finite and in (0, 1]")
+        if (
+            not math.isfinite(self.return_scale_ema_decay)
+            or not 0.0 <= self.return_scale_ema_decay < 1.0
+        ):
+            raise ValueError("return_scale_ema_decay must be finite and in [0, 1)")
         if not 0 <= self.discount <= 1 or not 0 <= self.lambda_ <= 1:
             raise ValueError("discount and lambda_ must be in [0, 1]")
         for name in (

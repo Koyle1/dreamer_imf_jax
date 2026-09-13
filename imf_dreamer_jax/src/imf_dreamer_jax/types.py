@@ -119,6 +119,12 @@ class ActorCriticMetrics(NamedTuple):
     squashed_entropy: Array
     return_scale: Array
     slow_critic_delta: Array
+    deterministic_action_mean: Array
+    pre_tanh_mean: Array
+    policy_std_mean: Array
+    behavior_kl: Array
+    advantage_mean: Array
+    advantage_positive_fraction: Array
 
 
 class RunningRMSState(NamedTuple):

@@ -13,6 +13,12 @@ from jax import Array
 from .config import DreamerConfig
 from .nn import Params, clip_by_global_norm, init_mlp, mlp, tree_global_norm
 from .optim import adam_update, init_adam
+from .policy_optimization import (
+    ReturnScaleState,
+    init_return_scale_state,
+    normalized_reinforce_objective,
+    update_return_scale,
+)
 from .types import (
     ActorCriticMetrics,
     ActorSample,
@@ -742,18 +748,20 @@ def train_replay_critic(
     ), loss
 
 
-def train_actor_critic(
+def _train_actor_critic(
     state: AgentState,
     start: RSSMState,
     key: Array,
     config: DreamerConfig,
+    return_scale_state: ReturnScaleState,
     *,
+    use_percentile_ema_scale: bool,
     behavior_prior: Params | None = None,
     reward_ensemble_params: Params | None = None,
     epistemic_penalty_scale: float = 0.0,
     reward_fn: ImaginationSignalFn | None = None,
     continuation_fn: ImaginationSignalFn | None = None,
-) -> tuple[AgentState, ActorCriticMetrics]:
+) -> tuple[AgentState, ReturnScaleState, ActorCriticMetrics]:
     """Update a stable actor and critic from imagined trajectories.
 
     The default estimator is a stopped-action likelihood-ratio objective. This
@@ -803,35 +811,43 @@ def train_actor_critic(
             discount=config.discount,
             lambda_=config.lambda_,
         )
-        return_mean = jax.lax.stop_gradient(jnp.mean(returns))
-        return_scale = jax.lax.stop_gradient(
-            jnp.maximum(
-                1.0,
-                jnp.sqrt(
-                    jnp.mean(jnp.square(returns - return_mean))
-                    + config.return_normalization_epsilon**2
-                ),
+        if use_percentile_ema_scale:
+            updated_return_scale_state, return_scale = update_return_scale(
+                return_scale_state,
+                returns,
+                decay=config.return_scale_ema_decay,
             )
-        )
+        else:
+            return_mean = jax.lax.stop_gradient(jnp.mean(returns))
+            return_scale = jax.lax.stop_gradient(
+                jnp.maximum(
+                    1.0,
+                    jnp.sqrt(
+                        jnp.mean(jnp.square(returns - return_mean))
+                        + config.return_normalization_epsilon**2
+                    ),
+                )
+            )
+            updated_return_scale_state = return_scale_state
         weights = jax.lax.stop_gradient(
             _discount_weights(imagined.continuations, discount=config.discount)
         )
+        baseline = critic(
+            state.params.critic, imagined.features[:, :-1], config
+        )
+        raw_advantage = jax.lax.stop_gradient(returns - baseline)
         if config.actor_gradient in ("reinforce", "pmpo"):
-            baseline = critic(
-                state.params.critic, imagined.features[:, :-1], config
-            )
-            advantage = jax.lax.stop_gradient(
-                (returns - baseline) / return_scale
-            )
             if config.actor_gradient == "reinforce":
-                policy_weights = advantage
-                reward_objective = _fixed_denominator_weighted_mean(
-                    imagined.log_probs * policy_weights, weights
+                reward_objective = normalized_reinforce_objective(
+                    imagined.log_probs,
+                    raw_advantage,
+                    weights,
+                    return_scale,
                 )
             else:
                 reward_objective = sign_only_pmpo_objective(
                     imagined.log_probs,
-                    advantage,
+                    raw_advantage / return_scale,
                     weights,
                     positive_weight=config.pmpo_positive_weight,
                     negative_weight=config.pmpo_negative_weight,
@@ -870,7 +886,14 @@ def train_actor_critic(
             + config.actor_action_l2_scale * action_l2
             + config.behavior_kl_scale * behavior_kl
         )
-        auxiliary = (imagined, returns, return_scale)
+        auxiliary = (
+            imagined,
+            returns,
+            return_scale,
+            updated_return_scale_state,
+            raw_advantage,
+            behavior_kl,
+        )
         return loss, auxiliary
 
     (actor_loss, actor_auxiliary), actor_gradients = jax.value_and_grad(
@@ -974,9 +997,21 @@ def train_actor_critic(
         updated_slow_critic,
         state.world_model_teacher,
     )
-    actor_imagined, actor_returns, return_scale = actor_auxiliary
+    (
+        actor_imagined,
+        actor_returns,
+        return_scale,
+        updated_return_scale_state,
+        raw_advantage,
+        behavior_kl,
+    ) = actor_auxiliary
     actor_weights = _discount_weights(
         actor_imagined.continuations, discount=config.discount
+    )
+    policy_distribution = actor_distribution(
+        state.params.actor,
+        jax.lax.stop_gradient(actor_imagined.features[:, :-1]),
+        config,
     )
     metrics = ActorCriticMetrics(
         actor_loss,
@@ -995,8 +1030,95 @@ def train_actor_critic(
         _weighted_mean(actor_imagined.entropies, actor_weights),
         return_scale,
         slow_critic_delta,
+        _weighted_mean(
+            jnp.mean(jnp.tanh(actor_imagined.pre_tanh_means), axis=-1),
+            actor_weights,
+        ),
+        _weighted_mean(
+            jnp.mean(actor_imagined.pre_tanh_means, axis=-1),
+            actor_weights,
+        ),
+        _weighted_mean(
+            jnp.mean(policy_distribution.std, axis=-1),
+            actor_weights,
+        ),
+        behavior_kl,
+        _weighted_mean(raw_advantage, actor_weights),
+        _weighted_mean(
+            (raw_advantage > 0.0).astype(raw_advantage.dtype),
+            actor_weights,
+        ),
     )
-    return new_state, metrics
+    return new_state, updated_return_scale_state, metrics
+
+
+def train_actor_critic(
+    state: AgentState,
+    start: RSSMState,
+    key: Array,
+    config: DreamerConfig,
+    *,
+    behavior_prior: Params | None = None,
+    reward_ensemble_params: Params | None = None,
+    epistemic_penalty_scale: float = 0.0,
+    reward_fn: ImaginationSignalFn | None = None,
+    continuation_fn: ImaginationSignalFn | None = None,
+) -> tuple[AgentState, ActorCriticMetrics]:
+    """Compatibility update using the historical per-batch RMS scale.
+
+    New continuous-control experiments should call
+    :func:`train_actor_critic_dreamer3`, which carries the robust percentile
+    EMA explicitly without changing the checkpointed ``AgentState`` tuple.
+    """
+
+    updated, _, metrics = _train_actor_critic(
+        state,
+        start,
+        key,
+        config,
+        init_return_scale_state(dtype=start.deterministic.dtype),
+        use_percentile_ema_scale=False,
+        behavior_prior=behavior_prior,
+        reward_ensemble_params=reward_ensemble_params,
+        epistemic_penalty_scale=epistemic_penalty_scale,
+        reward_fn=reward_fn,
+        continuation_fn=continuation_fn,
+    )
+    return updated, metrics
+
+
+def train_actor_critic_dreamer3(
+    state: AgentState,
+    return_scale_state: ReturnScaleState,
+    start: RSSMState,
+    key: Array,
+    config: DreamerConfig,
+    *,
+    behavior_prior: Params | None = None,
+    reward_ensemble_params: Params | None = None,
+    epistemic_penalty_scale: float = 0.0,
+    reward_fn: ImaginationSignalFn | None = None,
+    continuation_fn: ImaginationSignalFn | None = None,
+) -> tuple[AgentState, ReturnScaleState, ActorCriticMetrics]:
+    """Dreamer-style REINFORCE update with a 5th--95th percentile EMA scale."""
+
+    if config.actor_gradient != "reinforce":
+        raise ValueError(
+            "train_actor_critic_dreamer3 requires actor_gradient='reinforce'"
+        )
+    return _train_actor_critic(
+        state,
+        start,
+        key,
+        config,
+        return_scale_state,
+        use_percentile_ema_scale=True,
+        behavior_prior=behavior_prior,
+        reward_ensemble_params=reward_ensemble_params,
+        epistemic_penalty_scale=epistemic_penalty_scale,
+        reward_fn=reward_fn,
+        continuation_fn=continuation_fn,
+    )
 
 
 jit_act = partial(jax.jit, static_argnames=("config", "deterministic"))(act)
@@ -1020,6 +1142,15 @@ jit_train_actor_critic = partial(
         "continuation_fn",
     ),
 )(train_actor_critic)
+jit_train_actor_critic_dreamer3 = partial(
+    jax.jit,
+    static_argnames=(
+        "config",
+        "epistemic_penalty_scale",
+        "reward_fn",
+        "continuation_fn",
+    ),
+)(train_actor_critic_dreamer3)
 
 
 __all__ = [
@@ -1041,6 +1172,7 @@ __all__ = [
     "jit_train_behavior_cloning",
     "jit_train_replay_critic",
     "jit_train_actor_critic",
+    "jit_train_actor_critic_dreamer3",
     "jit_train_world_model",
     "lambda_returns",
     "loss_bearing_imagination_starts",
@@ -1052,6 +1184,7 @@ __all__ = [
     "symlog",
     "tanh_normal_log_prob",
     "train_actor_critic",
+    "train_actor_critic_dreamer3",
     "train_behavior_cloning",
     "train_replay_critic",
     "train_world_model",
