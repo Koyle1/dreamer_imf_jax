@@ -132,6 +132,15 @@ class RobustReinforceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "return_scale_ema_decay"):
             small_config(return_scale_ema_decay=1.0)
 
+    def test_equal_policy_kl_is_support_safe_nonnegative(self) -> None:
+        cfg = small_config()
+        state = create_agent(cfg, jax.random.key(30))
+        features = jax.random.normal(jax.random.key(31), (64, cfg.feature_dim))
+        distribution = actor_distribution(state.params.actor, features, cfg)
+        kl = diagonal_normal_kl(distribution, distribution)
+        self.assertTrue(bool(jnp.all(kl >= 0.0)))
+        np.testing.assert_allclose(kl, 0.0, atol=1e-7)
+
 
 class SafeMultiActionMPOTests(unittest.TestCase):
     @classmethod

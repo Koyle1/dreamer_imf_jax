@@ -176,7 +176,7 @@ def decoupled_reference_kl(
         + 0.5 * (jnp.square(reference.std / current.std) - 1.0),
         axis=-1,
     )
-    return mean_kl, std_kl
+    return mean_kl, jnp.maximum(std_kl, 0.0)
 
 
 def positive_elite_weights(

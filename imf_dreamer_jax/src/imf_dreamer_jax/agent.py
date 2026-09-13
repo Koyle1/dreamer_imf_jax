@@ -170,11 +170,14 @@ def diagonal_normal_kl(
         raise ValueError("normal distributions must have identical shapes")
     variance_ratio = jnp.square(left.std / right.std)
     location = jnp.square((left.mean - right.mean) / right.std)
-    return jnp.sum(
+    value = jnp.sum(
         jnp.log(right.std / left.std)
         + 0.5 * (variance_ratio + location - 1.0),
         axis=-1,
     )
+    # Each analytic KL is nonnegative. Roundoff near equality can otherwise
+    # produce tiny negative penalties and misleading telemetry.
+    return jnp.maximum(value, 0.0)
 
 
 def snapshot_behavior_prior(actor_params: Params) -> Params:
