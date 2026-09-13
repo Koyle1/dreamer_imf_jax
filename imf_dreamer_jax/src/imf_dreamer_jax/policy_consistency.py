@@ -38,7 +38,7 @@ from .types import (
 from .world_model import (
     observe_sequence,
     predict_continuation_logits,
-    predict_reward,
+    predict_transition_reward,
     sample_prior,
     trajectory_deterministic_conditions,
     transition_deterministic,
@@ -291,6 +291,7 @@ def model_candidate_returns(
     selected: list[Array] = []
     noise_keys = jax.random.split(key, maximum_horizon)
     for offset in range(maximum_horizon):
+        previous_feature = state.feature
         action = actions[..., offset, :].reshape((base_count * candidates, action_dim))
         deterministic = transition_deterministic(params, state, action, config)
         base_noise = jax.random.normal(
@@ -303,7 +304,9 @@ def model_candidate_returns(
             params, deterministic, None, config, noise=common_noise
         )
         state = RSSMState(deterministic, stochastic)
-        reward = predict_reward(params, state.feature, config)
+        reward = predict_transition_reward(
+            params, previous_feature, action, state.feature, config
+        )
         continuation = jax.nn.sigmoid(
             predict_continuation_logits(params, state.feature)
         )

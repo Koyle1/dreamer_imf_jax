@@ -29,7 +29,7 @@ from .world_model import (
     init_world_model,
     observe_step,
     predict_continuation_logits,
-    predict_reward,
+    predict_transition_reward,
     sample_prior,
     transition_deterministic,
     world_model_loss,
@@ -399,6 +399,7 @@ def imagine(
     step_keys = jax.random.split(key, horizon)
 
     def step(state: RSSMState, step_key: Array):
+        previous_feature = state.feature
         actor_key, prior_key = jax.random.split(step_key)
         actor_sample = sample_actor(
             params.actor, state.feature, actor_key, config
@@ -417,7 +418,13 @@ def imagine(
         output = (
             next_state.feature,
             actor_sample.action,
-            predict_reward(params.world_model, next_state.feature, config),
+            predict_transition_reward(
+                params.world_model,
+                previous_feature,
+                actor_sample.action,
+                next_state.feature,
+                config,
+            ),
             jax.nn.sigmoid(
                 predict_continuation_logits(params.world_model, next_state.feature)
             ),

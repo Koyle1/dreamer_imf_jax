@@ -65,6 +65,25 @@ def init_reward_head(config: DreamerConfig, key: Array) -> Params:
     return {"layers": tuple(reward_layers)}
 
 
+def init_action_reward_residual(config: DreamerConfig, key: Array) -> Params:
+    """Initialize a transition-conditioned scalar reward correction.
+
+    The zero-gain output layer makes attaching the residual an exact identity:
+    existing reward predictions are bitwise unchanged until the residual is
+    trained.  The input contains the previous feature, aligned action, and
+    latent feature change, while callers stop gradients into those features.
+    """
+
+    return init_mlp(
+        key,
+        2 * config.feature_dim + config.action_dim,
+        config.hidden_dim,
+        1,
+        depth=1,
+        output_gain=0.0,
+    )
+
+
 def init_world_model(config: DreamerConfig, key: Array) -> Params:
     """Initialize all recurrent world-model parameters."""
 
@@ -794,6 +813,47 @@ def predict_reward(
     return predict_reward_offsets(params, feature, config)[..., 0]
 
 
+def predict_action_reward_residual(
+    params: Params,
+    previous_feature: Array,
+    action: Array,
+    next_feature: Array,
+    config: DreamerConfig,
+) -> Array:
+    """Predict the action-sensitive correction for one latent transition."""
+
+    leading = next_feature.shape[:-1]
+    if previous_feature.shape != next_feature.shape:
+        raise ValueError("previous_feature and next_feature must have identical shape")
+    if next_feature.shape[-1] != config.feature_dim:
+        raise ValueError("transition features have the wrong final dimension")
+    if action.shape != (*leading, config.action_dim):
+        raise ValueError("transition action has the wrong shape")
+    if "reward_action_residual" not in params:
+        return jnp.zeros(leading, dtype=next_feature.dtype)
+    previous = jax.lax.stop_gradient(previous_feature)
+    next_value = jax.lax.stop_gradient(next_feature)
+    action_value = jax.lax.stop_gradient(action)
+    inputs = jnp.concatenate(
+        (previous, action_value, next_value - previous), axis=-1
+    )
+    return mlp(params["reward_action_residual"], inputs)[..., 0]
+
+
+def predict_transition_reward(
+    params: Params,
+    previous_feature: Array,
+    action: Array,
+    next_feature: Array,
+    config: DreamerConfig,
+) -> Array:
+    """Compose the calibrated base reward with an optional causal residual."""
+
+    return predict_reward(params, next_feature, config) + predict_action_reward_residual(
+        params, previous_feature, action, next_feature, config
+    )
+
+
 def predict_continuation_logits(params: Params, feature: Array) -> Array:
     return mlp(params["continuation"], feature)[..., 0]
 
@@ -994,14 +1054,17 @@ def trajectory_causal_consistency_loss(
     )
 
     def paired_prediction(action: Array) -> tuple[Array, Array]:
+        flat_action = flatten(action)
         deterministic = transition_deterministic(
-            params, previous_flat, flatten(action), config
+            params, previous_flat, flat_action, config
         )
         # Calling the pure sampler with the same key is exact common randomness.
         stochastic, _ = sample_prior(params, deterministic, key, config)
         feature = jnp.concatenate((deterministic, stochastic), axis=-1)
         observation = decode(params, feature, config).reshape(observation_shape)
-        reward = predict_reward(params, feature, config).reshape((batch_size, steps))
+        reward = predict_transition_reward(
+            params, previous_flat.feature, flat_action, feature, config
+        ).reshape((batch_size, steps))
         return observation, reward
 
     lower_observation, lower_reward = paired_prediction(batch["causal_actions_lower"])

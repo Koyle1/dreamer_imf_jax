@@ -39,6 +39,7 @@ from .types import (
 from .world_model import (
     init_reward_head,
     observe_sequence,
+    predict_action_reward_residual,
     predict_reward_offsets,
     reward_mtp_targets,
     reward_prediction_loss,
@@ -390,7 +391,20 @@ def reward_context_predictions(
         mask,
         config.reward_prediction_horizon,
     )
-    predictions = tuple(predict_reward_offsets(params, value, config) for value in features)
+    def predict(value: Array) -> Array:
+        offsets = predict_reward_offsets(params, value, config)
+        previous = jnp.concatenate(
+            (jnp.zeros_like(value[:, :1]), value[:, :-1]), axis=1
+        )
+        reset = is_first[..., None]
+        previous = jnp.where(reset, jnp.zeros_like(previous), previous)
+        actions = jnp.where(reset, jnp.zeros_like(batch["actions"]), batch["actions"])
+        correction = predict_action_reward_residual(
+            params, previous, actions, value, config
+        )
+        return offsets.at[..., 0].add(correction)
+
+    predictions = tuple(predict(value) for value in features)
     return RewardContextPredictions(*predictions, targets, target_mask)
 
 
