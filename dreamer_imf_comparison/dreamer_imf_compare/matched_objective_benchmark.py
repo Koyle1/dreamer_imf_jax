@@ -1994,6 +1994,19 @@ def _selected_overrides(
     return _validate_candidate(protocol, arm, candidate_value)
 
 
+_POST_PILOT_RUNTIME_DEFAULTS = {
+    "imf_causal_consistency_scale": 0.0,
+    "imf_causal_reward_scale": 1.0,
+    "imf_causal_huber_delta": 1.0,
+    "imf_causal_normalization_epsilon": 1e-3,
+    "reward_prediction_horizon": 0,
+    "reward_bins": 1,
+    "reward_symlog_min": -20.0,
+    "reward_symlog_max": 20.0,
+    "return_scale_ema_decay": 0.99,
+}
+
+
 def make_config(
     protocol: Mapping[str, Any],
     profile: str,
@@ -2022,19 +2035,7 @@ def make_config(
     # These fields were added after the matched-objective protocol was frozen.
     # Resolve them explicitly to a no-op rather than changing that protocol's
     # identity or silently relying on future library defaults.
-    common.update(
-        imf_causal_consistency_scale=0.0,
-        imf_causal_reward_scale=1.0,
-        imf_causal_huber_delta=1.0,
-        imf_causal_normalization_epsilon=1e-3,
-        reward_prediction_horizon=0,
-        reward_bins=1,
-        reward_symlog_min=-20.0,
-        reward_symlog_max=20.0,
-        # Added after the pilot protocol was frozen. This is actor-only and its
-        # library default is the exact value used by corrected actor training.
-        return_scale_ema_decay=0.99,
-    )
+    common.update(_POST_PILOT_RUNTIME_DEFAULTS)
     common["overshooting_distances"] = tuple(common["overshooting_distances"])
     common["observation_shape"] = tuple(int(value) for value in observation_shape)
     common["action_dim"] = int(action_dim)
@@ -2077,19 +2078,21 @@ def runtime_config_matches_frozen_protocol(
 ) -> bool:
     """Compare configs while admitting exactly one registered legacy omission.
 
-    The authenticated pilot predates ``return_scale_ema_decay``. Its JSON
-    runtime configs therefore omit that actor-only field, while old pickled
-    ``DreamerConfig`` objects resolve the dataclass default after loading. No
-    value difference and no other missing or extra field is accepted.
+    The authenticated pilot predates the registered fields in
+    ``_POST_PILOT_RUNTIME_DEFAULTS``. Old JSON runtime configs omit them, while
+    old pickled ``DreamerConfig`` objects resolve dataclass defaults after
+    loading. No value difference and no other missing or extra field is
+    accepted.
     """
 
     expected_payload = asdict(expected)
     if canonical_bytes(recorded) == canonical_bytes(expected_payload):
         return True
-    if expected_payload.get("return_scale_ema_decay") != 0.99:
-        return False
     legacy_payload = dict(expected_payload)
-    legacy_payload.pop("return_scale_ema_decay")
+    for name, value in _POST_PILOT_RUNTIME_DEFAULTS.items():
+        if expected_payload.get(name) != value:
+            return False
+        legacy_payload.pop(name)
     return canonical_bytes(recorded) == canonical_bytes(legacy_payload)
 
 

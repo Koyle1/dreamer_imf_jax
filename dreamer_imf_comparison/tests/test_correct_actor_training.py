@@ -61,7 +61,8 @@ class CorrectActorTrainingTests(unittest.TestCase):
 
         expected = DreamerConfig()
         legacy = asdict(expected)
-        legacy.pop("return_scale_ema_decay")
+        for name in study.benchmark._POST_PILOT_RUNTIME_DEFAULTS:
+            legacy.pop(name)
         self.assertTrue(
             study.benchmark.runtime_config_matches_frozen_protocol(legacy, expected)
         )
