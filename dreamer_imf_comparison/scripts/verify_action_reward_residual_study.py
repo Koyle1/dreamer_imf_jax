@@ -54,17 +54,22 @@ def verify_manifest(root: Path) -> dict:
     return manifest
 
 
+def _preflight_evidence_complete(preflight: dict, manifest: dict) -> bool:
+    """Validate the fields emitted by ``benchmark.runtime_fingerprint``."""
+    return bool(
+        preflight.get("status") == "complete"
+        and preflight.get("source_commit") == manifest["source_commit"]
+        and preflight.get("manifest_sha256") == manifest["manifest_sha256"]
+        and preflight.get("full_library_suite_passed") is True
+        and preflight.get("full_comparison_suite_passed") is True
+        and preflight.get("runtime", {}).get("backend") == "gpu"
+    )
+
+
 def verify_preflight(root: Path) -> dict:
     manifest = verify_manifest(root)
     preflight = read_json(root / "preflight.json")
-    if (
-        preflight.get("status") != "complete"
-        or preflight.get("source_commit") != manifest["source_commit"]
-        or preflight.get("manifest_sha256") != manifest["manifest_sha256"]
-        or preflight.get("full_library_suite_passed") is not True
-        or preflight.get("full_comparison_suite_passed") is not True
-        or preflight.get("runtime", {}).get("jax_backend") != "gpu"
-    ):
+    if not _preflight_evidence_complete(preflight, manifest):
         raise ValueError("preflight evidence is incomplete")
     job_id = str(preflight["slurm_job_id"])
     output = subprocess.check_output(

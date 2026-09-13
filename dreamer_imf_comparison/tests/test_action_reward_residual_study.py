@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
 import unittest
 
 import jax
@@ -16,6 +18,19 @@ from imf_dreamer_jax import (
     jit_train_action_reward_residual,
 )
 from imf_dreamer_jax.nn import tree_global_norm
+
+
+_VERIFIER_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "verify_action_reward_residual_study.py"
+)
+_VERIFIER_SPEC = importlib.util.spec_from_file_location(
+    "verify_action_reward_residual_study", _VERIFIER_PATH
+)
+assert _VERIFIER_SPEC is not None and _VERIFIER_SPEC.loader is not None
+_VERIFIER = importlib.util.module_from_spec(_VERIFIER_SPEC)
+_VERIFIER_SPEC.loader.exec_module(_VERIFIER)
 
 
 def config() -> DreamerConfig:
@@ -78,6 +93,20 @@ class ActionRewardResidualStudyTests(unittest.TestCase):
         self.assertEqual(aligned.advantage_magnitude_scale, 1.0)
         self.assertEqual(aligned.advantage_ranking_scale, 0.0)
         self.assertEqual(aligned.advantage_flat_scale, 0.0)
+
+    def test_preflight_verifier_accepts_recorded_gpu_runtime_schema(self) -> None:
+        manifest = {"source_commit": "abc", "manifest_sha256": "def"}
+        preflight = {
+            "status": "complete",
+            "source_commit": "abc",
+            "manifest_sha256": "def",
+            "full_library_suite_passed": True,
+            "full_comparison_suite_passed": True,
+            "runtime": {"backend": "gpu"},
+        }
+        self.assertTrue(_VERIFIER._preflight_evidence_complete(preflight, manifest))
+        preflight["runtime"]["backend"] = "cpu"
+        self.assertFalse(_VERIFIER._preflight_evidence_complete(preflight, manifest))
 
     def test_jitted_study_update_preserves_base_reward_and_dynamics(self) -> None:
         cfg = config()
