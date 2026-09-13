@@ -73,6 +73,7 @@ class ActorFailureDiagnosticOverrideTests(unittest.TestCase):
             prior="gaussian",
             reward_min=0.0,
             reward_max=1.0,
+            reward_initial_value=0.5,
             imagination_horizon=4,
             actor_gradient="pmpo",
             critic_bins=7,
