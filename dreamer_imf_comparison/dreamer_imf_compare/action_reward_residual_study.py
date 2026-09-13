@@ -124,8 +124,30 @@ def build_manifest(
         for path, digest, label in checks:
             if benchmark.file_sha256(path) != digest:
                 raise ValueError(f"{label} digest mismatch for seed {seed}")
-        if benchmark.array_sha256(benchmark.load_npz(source["dataset"])) != source["dataset_sha256"]:
+        arrays = benchmark.load_npz(source["dataset"])
+        if benchmark.array_sha256(arrays) != source["dataset_sha256"]:
             raise ValueError("dataset payload digest mismatch")
+        train_bank = benchmark.load_npz(source["train_probe_bank"])
+        validate_shared_probe_bank(train_bank)
+        if (
+            [int(value) for value in train_bank["horizons"]] != [1, 3, 5]
+            or train_bank["action_sequences"].shape[2] != 5
+            or any(
+                int(anchor) + DENSE_TRAINING_HORIZONS[-1]
+                > arrays["actions"].shape[1]
+                or not np.all(
+                    arrays["continuations"][
+                        int(episode),
+                        int(anchor) : int(anchor) + DENSE_TRAINING_HORIZONS[-1],
+                    ]
+                    > 0.0
+                )
+                for episode, anchor in zip(
+                    train_bank["episode_ids"], train_bank["anchors"], strict=True
+                )
+            )
+        ):
+            raise ValueError("source train probe cannot be extended to horizon 15")
         sources.append(
             {
                 "world_model_seed": seed,
@@ -163,9 +185,12 @@ def build_manifest(
         "normalization_basis": "centered_target_return_running_rms",
         "dense_probe_design": {
             "source_design_reused": True,
+            "source_intervention_horizon": 5,
             "training_horizons": list(DENSE_TRAINING_HORIZONS),
             "simulator_replay_required": True,
-            "legacy_horizon_agreement": [1, 3, 5, 15],
+            "legacy_horizon_agreement": [1, 3, 5],
+            "tail_action_rule": "recorded_behavior_suffix_common_across_candidates",
+            "noise_tail_rule": "deterministic_scoped_extension_after_exact_source_prefix",
             "action_repeat": 1,
             "discount": 0.99,
         },
@@ -279,9 +304,35 @@ def dense_probe_legacy_max_error(
 
     validate_shared_probe_bank(source_bank)
     validate_shared_probe_bank(dense_bank)
-    for name in ("episode_ids", "anchors", "action_sequences", "model_noise"):
+    for name in ("episode_ids", "anchors"):
         if not np.array_equal(np.asarray(source_bank[name]), np.asarray(dense_bank[name])):
             raise ValueError(f"dense probe changed fixed design field {name!r}")
+    source_horizon = int(np.asarray(source_bank["action_sequences"]).shape[2])
+    if not np.array_equal(
+        np.asarray(source_bank["action_sequences"]),
+        np.asarray(dense_bank["action_sequences"])[:, :, :source_horizon],
+    ):
+        raise ValueError("dense probe changed fixed design field 'action_sequences'")
+    if not np.array_equal(
+        np.asarray(source_bank["model_noise"]),
+        np.asarray(dense_bank["model_noise"])[:, :, :source_horizon],
+    ):
+        raise ValueError("dense probe changed fixed design field 'model_noise'")
+    for name in (
+        "candidate_pool_size",
+        "selection_horizon",
+        "selection_return_ranges",
+        "action_delta",
+        "intervention_steps",
+    ):
+        if not np.array_equal(np.asarray(source_bank[name]), np.asarray(dense_bank[name])):
+            raise ValueError(f"dense probe changed fixed design field {name!r}")
+    dense_actions = np.asarray(dense_bank["action_sequences"])
+    if dense_actions.shape[2] > source_horizon and not np.all(
+        dense_actions[:, 1:, source_horizon:]
+        == dense_actions[:, :1, source_horizon:]
+    ):
+        raise ValueError("dense probe tail must be common across candidates")
     legacy_horizons = [int(value) for value in source_bank["horizons"]]
     dense_horizons = [int(value) for value in dense_bank["horizons"]]
     if tuple(dense_horizons) != DENSE_TRAINING_HORIZONS:

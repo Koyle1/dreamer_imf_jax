@@ -264,30 +264,70 @@ def relabel_shared_probe_bank_horizons(
 ) -> dict[str, np.ndarray]:
     """Replay an existing fixed probe design at a denser set of horizons.
 
-    States, candidate action suffixes, and shared model-noise draws are copied
-    exactly from ``source_bank``. Only simulator return labels and their masks
-    are regenerated. This keeps the intervention design fixed when testing
-    whether denser return supervision closes a temporal nullspace.
+    States and the complete source intervention prefix are copied exactly.
+    When a longer horizon is requested, every candidate receives the same
+    recorded behavior-action tail, and source model-noise draws are preserved
+    as a prefix. Simulator return labels and masks are then regenerated. This
+    keeps the causal intervention fixed while extending its evaluation window.
     """
 
     validate_shared_probe_bank(source_bank)
     ordered_horizons = tuple(int(value) for value in horizons)
-    maximum_horizon = int(np.asarray(source_bank["action_sequences"]).shape[2])
+    source_horizon = int(np.asarray(source_bank["action_sequences"]).shape[2])
+    maximum_horizon = ordered_horizons[-1] if ordered_horizons else 0
     if (
         not ordered_horizons
         or tuple(sorted(set(ordered_horizons))) != ordered_horizons
         or ordered_horizons[0] <= 0
-        or ordered_horizons[-1] != maximum_horizon
+        or maximum_horizon < source_horizon
     ):
         raise ValueError(
             "relabel horizons must be unique increasing positive integers "
-            "ending at the fixed suffix length"
+            "covering the fixed source suffix"
         )
     if not np.isfinite(discount) or not 0.0 <= discount <= 1.0:
         raise ValueError("discount must lie in [0, 1]")
     episodes = np.asarray(source_bank["episode_ids"], dtype=np.int32)
     anchors = np.asarray(source_bank["anchors"], dtype=np.int32)
-    action_sequences = np.asarray(source_bank["action_sequences"], dtype=np.float32)
+    source_actions = np.asarray(source_bank["action_sequences"], dtype=np.float32)
+    behavior_suffixes = []
+    continuations = np.asarray(arrays["continuations"])
+    for episode, anchor in zip(episodes, anchors, strict=True):
+        episode = int(episode)
+        anchor = int(anchor)
+        if (
+            anchor + maximum_horizon > arrays["actions"].shape[1]
+            or not np.all(
+                continuations[episode, anchor : anchor + maximum_horizon] > 0.0
+            )
+        ):
+            raise ValueError("fixed probe state lacks a valid dense-horizon suffix")
+        behavior_suffixes.append(
+            np.asarray(
+                arrays["actions"][episode, anchor : anchor + maximum_horizon],
+                np.float32,
+            )
+        )
+    behavior_actions = np.stack(behavior_suffixes)
+    action_sequences = np.repeat(
+        behavior_actions[:, None], source_actions.shape[1], axis=1
+    )
+    action_sequences[:, :, :source_horizon] = source_actions
+    source_noise = np.asarray(source_bank["model_noise"])
+    noise = np.empty(
+        (
+            source_noise.shape[0],
+            source_noise.shape[1],
+            maximum_horizon,
+            source_noise.shape[3],
+        ),
+        dtype=source_noise.dtype,
+    )
+    noise[:, :, :source_horizon] = source_noise
+    if maximum_horizon > source_horizon:
+        noise[:, :, source_horizon:] = np.random.default_rng(
+            derive_seed("dense-probe-model-noise-tail", task, world_model_seed)
+        ).standard_normal(noise[:, :, source_horizon:].shape).astype(noise.dtype)
     targets = np.zeros(
         (len(episodes), action_sequences.shape[1], len(ordered_horizons)),
         np.float32,
@@ -374,15 +414,15 @@ def relabel_shared_probe_bank_horizons(
         "anchors": np.asarray(source_bank["anchors"]).copy(),
         "horizons": np.asarray(ordered_horizons, np.int32),
         "action_sequences": action_sequences.copy(),
-        "model_noise": np.asarray(source_bank["model_noise"]).copy(),
+        "model_noise": noise,
         "simulator_returns": targets,
         "horizon_mask": valid,
         "maximum_replay_error": np.asarray([replay_error], np.float64),
         "candidate_pool_size": np.asarray(source_bank["candidate_pool_size"]).copy(),
-        "selection_horizon": np.asarray([ordered_horizons[-1]], np.int32),
-        "selection_return_ranges": np.ptp(targets[:, :, -1], axis=1).astype(
-            np.float32
-        ),
+        "selection_horizon": np.asarray(source_bank["selection_horizon"]).copy(),
+        "selection_return_ranges": np.asarray(
+            source_bank["selection_return_ranges"]
+        ).copy(),
         "action_delta": np.asarray(source_bank["action_delta"]).copy(),
         "intervention_steps": np.asarray(source_bank["intervention_steps"]).copy(),
     }
@@ -429,7 +469,8 @@ def validate_shared_probe_bank(bank: Mapping[str, np.ndarray]) -> None:
         or np.asarray(bank["candidate_pool_size"]).shape != (1,)
         or int(np.asarray(bank["candidate_pool_size"])[0]) < probes
         or np.asarray(bank["selection_horizon"]).shape != (1,)
-        or int(np.asarray(bank["selection_horizon"])[0]) != int(horizons[-1])
+        or int(np.asarray(bank["selection_horizon"])[0])
+        not in {int(value) for value in horizons}
         or np.asarray(bank["selection_return_ranges"]).shape != (probes,)
         or np.asarray(bank["action_delta"]).shape != (1,)
         or np.asarray(bank["intervention_steps"]).shape != (1,)

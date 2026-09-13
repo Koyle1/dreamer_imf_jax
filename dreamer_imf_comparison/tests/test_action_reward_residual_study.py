@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -206,33 +208,34 @@ class ActionRewardResidualStudyTests(unittest.TestCase):
             )
 
     def test_dense_probe_contract_preserves_design_and_legacy_labels(self) -> None:
-        horizons = np.asarray((1, 3, 5, 15), np.int32)
+        horizons = np.asarray((1, 3, 5), np.int32)
         dense_horizons = np.arange(1, 16, dtype=np.int32)
         dense_returns = np.arange(45, dtype=np.float32).reshape((1, 3, 15))
 
         def bank(selected: np.ndarray, returns: np.ndarray) -> dict[str, np.ndarray]:
+            steps = int(selected[-1])
             return {
                 "episode_ids": np.asarray([0], np.int32),
                 "anchors": np.asarray([2], np.int32),
                 "horizons": selected,
-                "action_sequences": np.zeros((1, 3, 15, 2), np.float32),
-                "model_noise": np.zeros((2, 1, 15, 3), np.float32),
+                "action_sequences": np.zeros((1, 3, steps, 2), np.float32),
+                "model_noise": np.zeros((2, 1, steps, 3), np.float32),
                 "simulator_returns": returns,
                 "horizon_mask": np.ones((1, len(selected)), np.float32),
                 "maximum_replay_error": np.asarray([0.0], np.float64),
                 "candidate_pool_size": np.asarray([8], np.int32),
-                "selection_horizon": np.asarray([15], np.int32),
+                "selection_horizon": np.asarray([5], np.int32),
                 "selection_return_ranges": np.asarray([30.0], np.float32),
                 "action_delta": np.asarray([0.5], np.float32),
                 "intervention_steps": np.asarray([5], np.int32),
             }
 
-        legacy_indices = [0, 2, 4, 14]
+        legacy_indices = [0, 2, 4]
         source = bank(horizons, dense_returns[:, :, legacy_indices])
         dense = bank(dense_horizons, dense_returns.copy())
         self.assertEqual(study.dense_probe_legacy_max_error(source, dense), 0.0)
         dense["simulator_returns"] = dense["simulator_returns"].copy()
-        dense["simulator_returns"][0, 0, 14] += 0.25
+        dense["simulator_returns"][0, 0, 4] += 0.25
         self.assertAlmostEqual(
             study.dense_probe_legacy_max_error(source, dense), 0.25
         )
@@ -248,6 +251,91 @@ class ActionRewardResidualStudyTests(unittest.TestCase):
             * np.ones((15, 1), np.float64)
         )
         self.assertEqual(np.linalg.matrix_rank(operator), 15)
+
+    def test_dense_replay_extends_only_the_common_behavior_suffix(self) -> None:
+        time = 20
+        actions = np.arange(time, dtype=np.float32).reshape((1, time, 1)) / 20.0
+        arrays = {
+            "observations": np.arange(time, dtype=np.float32).reshape((1, time, 1)),
+            "actions": actions,
+            "rewards": (actions[..., 0] + 1.0).astype(np.float32),
+            "continuations": np.ones((1, time), np.float32),
+        }
+        source_actions = np.repeat(actions[:, 2:7, :][:, None], 3, axis=1)
+        source_actions[0, 1, :, 0] -= 0.25
+        source_actions[0, 2, :, 0] += 0.25
+
+        class FakeAdapter:
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.step_index = 0
+
+            def reset(self) -> np.ndarray:
+                self.step_index = 0
+                return np.asarray([0.0], np.float32)
+
+            def snapshot(self) -> int:
+                return self.step_index
+
+            def restore(self, snapshot: int) -> None:
+                self.step_index = snapshot
+
+            def step(self, action: np.ndarray) -> SimpleNamespace:
+                self.step_index += 1
+                return SimpleNamespace(
+                    observation=np.asarray([self.step_index], np.float32),
+                    reward=float(action[0] + 1.0),
+                    continuation=1.0,
+                    is_last=False,
+                )
+
+            def close(self) -> None:
+                pass
+
+        source = {
+            "episode_ids": np.asarray([0], np.int32),
+            "anchors": np.asarray([2], np.int32),
+            "horizons": np.asarray([1, 3, 5], np.int32),
+            "action_sequences": source_actions,
+            "model_noise": np.zeros((2, 1, 5, 3), np.float32),
+            "simulator_returns": np.zeros((1, 3, 3), np.float32),
+            "horizon_mask": np.ones((1, 3), np.float32),
+            "maximum_replay_error": np.asarray([0.0], np.float64),
+            "candidate_pool_size": np.asarray([8], np.int32),
+            "selection_horizon": np.asarray([5], np.int32),
+            "selection_return_ranges": np.asarray([1.0], np.float32),
+            "action_delta": np.asarray([0.5], np.float32),
+            "intervention_steps": np.asarray([5], np.int32),
+        }
+        discount = 0.99
+        legacy_indices = (0, 2, 4)
+        for candidate in range(3):
+            cumulative = 0.0
+            for offset in range(5):
+                cumulative += discount**offset * (
+                    float(source_actions[0, candidate, offset, 0]) + 1.0
+                )
+                if offset in legacy_indices:
+                    source["simulator_returns"][
+                        0, candidate, legacy_indices.index(offset)
+                    ] = cumulative
+        with mock.patch.object(shared_probe_bank, "DMCAdapter", FakeAdapter):
+            dense = shared_probe_bank.relabel_shared_probe_bank_horizons(
+                arrays,
+                source,
+                task="fake_task",
+                world_model_seed=211,
+                action_repeat=1,
+                horizons=tuple(range(1, 16)),
+                discount=discount,
+            )
+        np.testing.assert_array_equal(
+            dense["action_sequences"][:, :, :5], source_actions
+        )
+        expected_tail = np.repeat(actions[:, None, 7:17], 3, axis=1)
+        np.testing.assert_array_equal(
+            dense["action_sequences"][:, :, 5:], expected_tail
+        )
+        self.assertLessEqual(study.dense_probe_legacy_max_error(source, dense), 1e-6)
 
 
 if __name__ == "__main__":

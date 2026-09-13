@@ -49,6 +49,11 @@ def verify_manifest(root: Path) -> dict:
         != "centered_target_return_running_rms"
         or manifest.get("dense_probe_design", {}).get("training_horizons")
         != list(study.DENSE_TRAINING_HORIZONS)
+        or manifest["dense_probe_design"].get("source_intervention_horizon") != 5
+        or manifest["dense_probe_design"].get("legacy_horizon_agreement")
+        != [1, 3, 5]
+        or manifest["dense_probe_design"].get("tail_action_rule")
+        != "recorded_behavior_suffix_common_across_candidates"
         or manifest["interpretation"]["trajectory_model_frozen"] is not True
         or manifest["interpretation"]["base_reward_head_frozen"] is not True
         or manifest["interpretation"].get("single_loss_term") is not True
