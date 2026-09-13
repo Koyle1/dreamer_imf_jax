@@ -18,12 +18,18 @@ from . import matched_objective_benchmark as benchmark
 from . import reward_head_mtp_study as mtp
 from .advantage_repair_study import materialize_advantage_batch
 from .policy_consistency_vnext import ACTOR_SEED, HORIZONS, TASK, _tree_delta
-from .shared_probe_bank import evaluate_shared_probe_bank
+from .shared_probe_bank import (
+    evaluate_shared_probe_bank,
+    relabel_shared_probe_bank_horizons,
+    validate_shared_probe_bank,
+)
 
 
-SCHEMA = "trajectory-imf-action-reward-residual-study-v2"
+SCHEMA = "trajectory-imf-action-reward-residual-study-v3"
+SPARSE_SCHEMA = "trajectory-imf-action-reward-residual-study-v2"
 CENTERED_SCHEMA = "trajectory-imf-action-reward-residual-study-v1"
 WORLD_MODEL_SEEDS = mtp.WORLD_MODEL_SEEDS
+DENSE_TRAINING_HORIZONS = tuple(range(1, 16))
 
 
 def _json_native(value: Any) -> Any:
@@ -52,6 +58,7 @@ def build_manifest(
     output_root: str | Path | None = None,
     *,
     centered_root: str | Path,
+    sparse_root: str | Path,
     residual_updates: int = 1000,
     actor_updates: int = 3000,
     preparation_updates: int = 500,
@@ -62,10 +69,13 @@ def build_manifest(
         raise ValueError("update and evaluation counts must be positive")
     base = Path(mtp_root).resolve(strict=True)
     centered = Path(centered_root).resolve(strict=True)
+    sparse = Path(sparse_root).resolve(strict=True)
     base_manifest = read_json(base / "manifest.json")
     base_report = read_json(base / "report.json")
     centered_manifest = read_json(centered / "manifest.json")
     centered_report = read_json(centered / "report.json")
+    sparse_manifest = read_json(sparse / "manifest.json")
+    sparse_report = read_json(sparse / "report.json")
     if base_report.get("status") != "complete":
         raise ValueError("source reward-head MTP study is incomplete")
     if base_manifest.get("manifest_sha256") != base_report.get("manifest_sha256"):
@@ -82,6 +92,19 @@ def build_manifest(
         != len(WORLD_MODEL_SEEDS) * len(HORIZONS)
     ):
         raise ValueError("centered residual reference is incomplete or incompatible")
+    if (
+        sparse_manifest.get("schema_version") != SPARSE_SCHEMA
+        or sparse_report.get("schema_version") != SPARSE_SCHEMA
+        or sparse_report.get("status") != "complete"
+        or sparse_manifest.get("manifest_sha256")
+        != sparse_report.get("manifest_sha256")
+        or sparse_manifest.get("objective", {}).get("horizons") != [1, 3, 5]
+        or sparse_report.get("completed_residual_cells") != len(WORLD_MODEL_SEEDS)
+        or sparse_report.get("completed_evaluation_cells") != len(WORLD_MODEL_SEEDS)
+        or sparse_report.get("completed_actor_cells")
+        != len(WORLD_MODEL_SEEDS) * len(HORIZONS)
+    ):
+        raise ValueError("sparse residual reference is incomplete or incompatible")
     if residual_updates > int(base_manifest["reward_updates"]):
         raise ValueError("residual updates exceed the authenticated source schedule")
     sources = []
@@ -122,7 +145,7 @@ def build_manifest(
         )
     from imf_dreamer_jax import ActionRewardResidualConfig
 
-    objective = ActionRewardResidualConfig()
+    objective = ActionRewardResidualConfig(horizons=DENSE_TRAINING_HORIZONS)
     manifest = {
         "schema_version": SCHEMA,
         "status": "frozen_before_execution",
@@ -136,11 +159,16 @@ def build_manifest(
         "evaluation_episodes": int(evaluation_episodes),
         "trainable_world_subtrees": ["reward_action_residual"],
         "objective": asdict(objective),
-        "objective_identity": (
-            "centered_pseudo_huber_plus_exact_missing_component"
-            "_equals_uncentered_pseudo_huber"
-        ),
+        "objective_identity": "uncentered_pseudo_huber_all_prefix_horizons_1_to_15",
         "normalization_basis": "centered_target_return_running_rms",
+        "dense_probe_design": {
+            "source_design_reused": True,
+            "training_horizons": list(DENSE_TRAINING_HORIZONS),
+            "simulator_replay_required": True,
+            "legacy_horizon_agreement": [1, 3, 5, 15],
+            "action_repeat": 1,
+            "discount": 0.99,
+        },
         "mtp_root": str(base),
         "mtp_manifest_sha256": base_manifest["manifest_sha256"],
         "mtp_report_file_sha256": benchmark.file_sha256(base / "report.json"),
@@ -164,13 +192,24 @@ def build_manifest(
             "probe_groups": centered_report["probe_groups"],
             "actor_groups": centered_report["actor_groups"],
         },
+        "sparse_residual_root": str(sparse),
+        "sparse_residual_manifest_sha256": sparse_manifest["manifest_sha256"],
+        "sparse_residual_report_file_sha256": benchmark.file_sha256(
+            sparse / "report.json"
+        ),
+        "sparse_residual_reference": {
+            "reward_groups": sparse_report["reward_groups"],
+            "probe_groups": sparse_report["probe_groups"],
+            "actor_groups": sparse_report["actor_groups"],
+        },
         "interpretation": {
             "claim_eligible": False,
-            "evidence_class": "exploratory_two_seed_reacher_raw_residual_return",
+            "evidence_class": "exploratory_two_seed_reacher_dense_residual_return",
             "trajectory_model_frozen": True,
             "base_reward_head_frozen": True,
             "matched_actor_protocol": True,
             "single_loss_term": True,
+            "dense_horizon_identification": True,
         },
     }
     manifest = _json_native(manifest)
@@ -232,6 +271,117 @@ def _residual_metrics(details: Any, rms: Any) -> dict[str, float]:
     return metrics
 
 
+def dense_probe_legacy_max_error(
+    source_bank: Mapping[str, np.ndarray],
+    dense_bank: Mapping[str, np.ndarray],
+) -> float:
+    """Return the largest relabeling error at legacy supervised horizons."""
+
+    validate_shared_probe_bank(source_bank)
+    validate_shared_probe_bank(dense_bank)
+    for name in ("episode_ids", "anchors", "action_sequences", "model_noise"):
+        if not np.array_equal(np.asarray(source_bank[name]), np.asarray(dense_bank[name])):
+            raise ValueError(f"dense probe changed fixed design field {name!r}")
+    legacy_horizons = [int(value) for value in source_bank["horizons"]]
+    dense_horizons = [int(value) for value in dense_bank["horizons"]]
+    if tuple(dense_horizons) != DENSE_TRAINING_HORIZONS:
+        raise ValueError("dense probe does not contain every horizon 1 through 15")
+    if any(horizon not in dense_horizons for horizon in legacy_horizons):
+        raise ValueError("dense probe omitted a legacy horizon")
+    maximum_error = 0.0
+    for source_index, horizon in enumerate(legacy_horizons):
+        dense_index = dense_horizons.index(horizon)
+        if not np.array_equal(
+            np.asarray(source_bank["horizon_mask"])[:, source_index],
+            np.asarray(dense_bank["horizon_mask"])[:, dense_index],
+        ):
+            raise ValueError(f"dense probe validity differs at horizon {horizon}")
+        maximum_error = max(
+            maximum_error,
+            float(
+                np.max(
+                    np.abs(
+                        np.asarray(source_bank["simulator_returns"])[
+                            :, :, source_index
+                        ]
+                        - np.asarray(dense_bank["simulator_returns"])[
+                            :, :, dense_index
+                        ]
+                    )
+                )
+            ),
+        )
+    return maximum_error
+
+
+def prepare_dense_probe_cell(
+    mtp_root: str | Path,
+    output_root: str | Path,
+    seed: int,
+    **settings: Any,
+) -> dict[str, Any]:
+    """Relabel the frozen train probe design at every horizon 1 through 15."""
+
+    manifest = write_manifest(mtp_root, output_root, **settings)
+    if seed not in WORLD_MODEL_SEEDS:
+        raise ValueError("dense probe cell is outside the frozen design")
+    source = _source_row(manifest, seed)
+    directory = Path(output_root) / "dense_probe" / f"seed-{seed}"
+    result_path = directory / "result.json"
+    bank_path = directory / "probe_bank.npz"
+    if result_path.is_file():
+        result = read_json(result_path)
+        if benchmark.file_sha256(bank_path) != result["probe_bank_file_sha256"]:
+            raise ValueError("existing dense probe artifact digest mismatch")
+        return result
+    arrays = benchmark.load_npz(source["dataset"])
+    if benchmark.array_sha256(arrays) != source["dataset_sha256"]:
+        raise ValueError("dense probe source dataset payload digest mismatch")
+    source_bank = benchmark.load_npz(source["train_probe_bank"])
+    if benchmark.array_sha256(source_bank) != source["train_probe_bank_sha256"]:
+        raise ValueError("dense probe source design payload digest mismatch")
+    started = time.perf_counter()
+    dense_bank = relabel_shared_probe_bank_horizons(
+        arrays,
+        source_bank,
+        task=TASK,
+        world_model_seed=seed,
+        action_repeat=int(manifest["dense_probe_design"]["action_repeat"]),
+        horizons=DENSE_TRAINING_HORIZONS,
+        discount=float(manifest["dense_probe_design"]["discount"]),
+    )
+    legacy_max_error = dense_probe_legacy_max_error(source_bank, dense_bank)
+    if legacy_max_error > 1e-6:
+        raise ValueError(
+            "dense simulator labels disagree with the frozen legacy labels: "
+            f"{legacy_max_error}"
+        )
+    directory.mkdir(parents=True, exist_ok=True)
+    benchmark._write_npz_atomic(bank_path, dense_bank)
+    result = {
+        "schema_version": SCHEMA,
+        "stage": "dense_probe",
+        "status": "complete",
+        "source_commit": manifest["source_commit"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "world_model_seed": seed,
+        "source_probe_bank_sha256": source["train_probe_bank_sha256"],
+        "source_probe_bank_file_sha256": source["train_probe_bank_file_sha256"],
+        "probe_bank_sha256": benchmark.array_sha256(dense_bank),
+        "probe_bank_file_sha256": benchmark.file_sha256(bank_path),
+        "horizons": list(DENSE_TRAINING_HORIZONS),
+        "legacy_horizon_max_abs_error": legacy_max_error,
+        "maximum_replay_error": float(
+            np.asarray(dense_bank["maximum_replay_error"])[0]
+        ),
+        "wall_seconds": time.perf_counter() - started,
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "runtime": benchmark.runtime_fingerprint(),
+    }
+    write_json_atomic(result_path, result)
+    return result
+
+
 def train_residual_cell(
     mtp_root: str | Path,
     output_root: str | Path,
@@ -272,9 +422,20 @@ def train_residual_cell(
     )
     initial = state
     arrays = benchmark.load_npz(source["dataset"])
-    train_bank = benchmark.load_npz(source["train_probe_bank"])
-    if benchmark.array_sha256(train_bank) != source["train_probe_bank_sha256"]:
-        raise ValueError("training probe bank payload digest mismatch")
+    dense_probe_directory = Path(output_root) / "dense_probe" / f"seed-{seed}"
+    dense_probe_result = read_json(dense_probe_directory / "result.json")
+    dense_probe_path = dense_probe_directory / "probe_bank.npz"
+    if (
+        dense_probe_result.get("status") != "complete"
+        or dense_probe_result.get("manifest_sha256") != manifest["manifest_sha256"]
+        or dense_probe_result.get("horizons") != list(DENSE_TRAINING_HORIZONS)
+        or benchmark.file_sha256(dense_probe_path)
+        != dense_probe_result.get("probe_bank_file_sha256")
+    ):
+        raise ValueError("dense training probe evidence is invalid")
+    train_bank = benchmark.load_npz(dense_probe_path)
+    if benchmark.array_sha256(train_bank) != dense_probe_result["probe_bank_sha256"]:
+        raise ValueError("dense training probe payload digest mismatch")
     source_schedule = benchmark.load_npz(source["source_schedule"])
     updates = int(manifest["residual_updates"])
     probe_indices = np.asarray(source_schedule["probe_indices"][:updates], np.int32)
@@ -363,6 +524,7 @@ def train_residual_cell(
         "manifest_sha256": manifest["manifest_sha256"],
         "world_model_seed": seed,
         "source_checkpoint_sha256": source["checkpoint_sha256"],
+        "dense_probe_bank_sha256": dense_probe_result["probe_bank_sha256"],
         "checkpoint_sha256": benchmark.file_sha256(checkpoint),
         "source_parameter_deltas": parameter_deltas,
         "source_first_moment_deltas": first_deltas,
@@ -374,6 +536,7 @@ def train_residual_cell(
         "schedule_file_sha256": benchmark.file_sha256(schedule_path),
         "final_metrics": latest,
         "wall_seconds": time.perf_counter() - started,
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
         "runtime": benchmark.runtime_fingerprint(),
     }
     write_json_atomic(result_path, result)
@@ -463,6 +626,8 @@ def evaluate_residual_cell(
         "metrics_by_horizon": probe["metrics_by_horizon"],
         "reward_context_metrics": context_metrics,
         "raw_sha256": benchmark.file_sha256(raw_path),
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "runtime": benchmark.runtime_fingerprint(),
     }
     write_json_atomic(result_path, result)
     return result
@@ -668,6 +833,7 @@ def train_actor_cell(
         "checkpoint_sha256": benchmark.file_sha256(checkpoint_path),
         "raw_action_traces_sha256": benchmark.file_sha256(trace_path),
         "wall_seconds": time.perf_counter() - started,
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
         "runtime": benchmark.runtime_fingerprint(),
     }
     write_json_atomic(result_path, result)
@@ -697,11 +863,15 @@ def finalize(
 ) -> dict[str, Any]:
     manifest = write_manifest(mtp_root, output_root, **settings)
     output = Path(output_root)
+    dense_probe_rows = [
+        read_json(path) for path in sorted(output.glob("dense_probe/*/result.json"))
+    ]
     residual_rows = [read_json(path) for path in sorted(output.glob("residual/*/result.json"))]
     evaluation_rows = [read_json(path) for path in sorted(output.glob("evaluation/*/result.json"))]
     actor_rows = [read_json(path) for path in sorted(output.glob("actor/*/result.json"))]
     complete = (
-        len(residual_rows) == len(WORLD_MODEL_SEEDS)
+        len(dense_probe_rows) == len(WORLD_MODEL_SEEDS)
+        and len(residual_rows) == len(WORLD_MODEL_SEEDS)
         and len(evaluation_rows) == len(WORLD_MODEL_SEEDS)
         and len(actor_rows) == len(WORLD_MODEL_SEEDS) * len(HORIZONS)
     )
@@ -745,6 +915,7 @@ def finalize(
             )
     base = manifest["base_mtp_reference"]
     centered = manifest["centered_residual_reference"]
+    sparse = manifest["sparse_residual_reference"]
     actor_deltas = {}
     for row in actor_groups:
         horizon = row["imagination_horizon"]
@@ -760,12 +931,20 @@ def finalize(
             item for item in centered["actor_groups"]
             if item["imagination_horizon"] == horizon
         )
+        sparse_actor = next(
+            item for item in sparse["actor_groups"]
+            if item["imagination_horizon"] == horizon
+        )
         actor_deltas[str(horizon)] = {
             "versus_base_mtp": row["mean_normalized_return"] - base_actor["mean_normalized_return"],
             "versus_shortcut": row["mean_normalized_return"] - shortcut_actor["mean_normalized_return"],
             "versus_centered_residual": (
                 row["mean_normalized_return"]
                 - centered_actor["mean_normalized_return"]
+            ),
+            "versus_sparse_residual": (
+                row["mean_normalized_return"]
+                - sparse_actor["mean_normalized_return"]
             ),
         }
     probe_deltas = {
@@ -785,6 +964,14 @@ def finalize(
             "regret_versus_centered_residual": (
                 probe_groups[horizon]["mean_simulator_regret"]
                 - centered["probe_groups"][horizon]["mean_simulator_regret"]
+            ),
+            "pairwise_accuracy_versus_sparse_residual": (
+                probe_groups[horizon]["pairwise_accuracy_mean"]
+                - sparse["probe_groups"][horizon]["pairwise_accuracy_mean"]
+            ),
+            "regret_versus_sparse_residual": (
+                probe_groups[horizon]["mean_simulator_regret"]
+                - sparse["probe_groups"][horizon]["mean_simulator_regret"]
             ),
         }
         for horizon in probe_groups
@@ -809,6 +996,16 @@ def finalize(
                     "mean_offset_zero_calibration_error"
                 ]
             ),
+            "mse_versus_sparse_residual": (
+                reward_groups[context]["mean_mse"]
+                - sparse["reward_groups"][context]["mean_mse"]
+            ),
+            "calibration_versus_sparse_residual": (
+                reward_groups[context]["mean_offset_zero_calibration_error"]
+                - sparse["reward_groups"][context][
+                    "mean_offset_zero_calibration_error"
+                ]
+            ),
         }
         for context in reward_groups
     }
@@ -818,6 +1015,8 @@ def finalize(
         "status": "complete" if complete else "partial",
         "source_commit": manifest["source_commit"],
         "manifest_sha256": manifest["manifest_sha256"],
+        "completed_dense_probe_cells": len(dense_probe_rows),
+        "expected_dense_probe_cells": len(WORLD_MODEL_SEEDS),
         "completed_residual_cells": len(residual_rows),
         "expected_residual_cells": len(WORLD_MODEL_SEEDS),
         "completed_evaluation_cells": len(evaluation_rows),
@@ -835,9 +1034,10 @@ def finalize(
         "base_mtp_reference": base,
         "shortcut_reference": manifest["shortcut_reference"],
         "centered_residual_reference": centered,
+        "sparse_residual_reference": sparse,
         "aggregate_cell_wall_seconds": float(sum(
             float(row.get("wall_seconds", 0.0))
-            for row in residual_rows + actor_rows
+            for row in dense_probe_rows + residual_rows + actor_rows
         )),
         "interpretation": manifest["interpretation"],
     }
@@ -847,10 +1047,14 @@ def finalize(
 
 __all__ = [
     "SCHEMA",
+    "DENSE_TRAINING_HORIZONS",
+    "SPARSE_SCHEMA",
     "WORLD_MODEL_SEEDS",
     "build_manifest",
+    "dense_probe_legacy_max_error",
     "evaluate_residual_cell",
     "finalize",
+    "prepare_dense_probe_cell",
     "record_preflight",
     "train_actor_cell",
     "train_residual_cell",

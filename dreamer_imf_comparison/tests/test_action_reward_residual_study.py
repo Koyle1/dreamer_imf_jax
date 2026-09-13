@@ -60,7 +60,7 @@ def tree_delta(left: object, right: object) -> float:
 
 
 def decision_batch(cfg: DreamerConfig) -> dict[str, jax.Array]:
-    batch, steps, candidates, horizon = 2, 4, 3, 5
+    batch, steps, candidates, horizon = 2, 4, 3, 15
     return {
         "observations": jax.random.normal(
             jax.random.key(1), (batch, steps, *cfg.observation_shape)
@@ -76,9 +76,12 @@ def decision_batch(cfg: DreamerConfig) -> dict[str, jax.Array]:
             maxval=1.0,
         ),
         "advantage_target_returns": jax.random.normal(
-            jax.random.key(4), (batch, steps, candidates, 3)
+            jax.random.key(4),
+            (batch, steps, candidates, len(study.DENSE_TRAINING_HORIZONS)),
         ),
-        "advantage_mask": jnp.ones((batch, steps, 3)),
+        "advantage_mask": jnp.ones(
+            (batch, steps, len(study.DENSE_TRAINING_HORIZONS))
+        ),
     }
 
 
@@ -89,21 +92,26 @@ class ActionRewardResidualStudyTests(unittest.TestCase):
 
     def test_frozen_design_has_only_one_trainable_subtree_and_two_seeds(self) -> None:
         self.assertEqual(
-            study.SCHEMA, "trajectory-imf-action-reward-residual-study-v2"
+            study.SCHEMA, "trajectory-imf-action-reward-residual-study-v3"
+        )
+        self.assertEqual(
+            study.SPARSE_SCHEMA, "trajectory-imf-action-reward-residual-study-v2"
         )
         self.assertEqual(
             study.CENTERED_SCHEMA, "trajectory-imf-action-reward-residual-study-v1"
         )
         self.assertEqual(study.WORLD_MODEL_SEEDS, (211, 223))
         self.assertEqual(study.HORIZONS, (5, 15))
-        objective = ActionRewardResidualConfig()
-        self.assertEqual(objective.horizons, (1, 3, 5))
+        objective = ActionRewardResidualConfig(
+            horizons=study.DENSE_TRAINING_HORIZONS
+        )
+        self.assertEqual(objective.horizons, tuple(range(1, 16)))
         self.assertEqual(objective.huber_delta, 1.0)
         self.assertFalse(hasattr(objective, "output_l2_scale"))
 
     def test_objective_round_trips_through_json_sequence_types(self) -> None:
-        objective = ActionRewardResidualConfig(horizons=[1, 3, 5])
-        self.assertEqual(objective.horizons, (1, 3, 5))
+        objective = ActionRewardResidualConfig(horizons=list(range(1, 16)))
+        self.assertEqual(objective.horizons, tuple(range(1, 16)))
 
     def test_preflight_verifier_accepts_recorded_gpu_runtime_schema(self) -> None:
         manifest = {"source_commit": "abc", "manifest_sha256": "def"}
@@ -165,7 +173,7 @@ class ActionRewardResidualStudyTests(unittest.TestCase):
             decision_batch(cfg),
             jax.random.key(12),
             cfg,
-            ActionRewardResidualConfig(),
+            ActionRewardResidualConfig(horizons=study.DENSE_TRAINING_HORIZONS),
             init_running_rms(),
         )
         self.assertTrue(np.isfinite(float(details.total)))
@@ -196,6 +204,50 @@ class ActionRewardResidualStudyTests(unittest.TestCase):
                 ),
                 0.0,
             )
+
+    def test_dense_probe_contract_preserves_design_and_legacy_labels(self) -> None:
+        horizons = np.asarray((1, 3, 5, 15), np.int32)
+        dense_horizons = np.arange(1, 16, dtype=np.int32)
+        dense_returns = np.arange(45, dtype=np.float32).reshape((1, 3, 15))
+
+        def bank(selected: np.ndarray, returns: np.ndarray) -> dict[str, np.ndarray]:
+            return {
+                "episode_ids": np.asarray([0], np.int32),
+                "anchors": np.asarray([2], np.int32),
+                "horizons": selected,
+                "action_sequences": np.zeros((1, 3, 15, 2), np.float32),
+                "model_noise": np.zeros((2, 1, 15, 3), np.float32),
+                "simulator_returns": returns,
+                "horizon_mask": np.ones((1, len(selected)), np.float32),
+                "maximum_replay_error": np.asarray([0.0], np.float64),
+                "candidate_pool_size": np.asarray([8], np.int32),
+                "selection_horizon": np.asarray([15], np.int32),
+                "selection_return_ranges": np.asarray([30.0], np.float32),
+                "action_delta": np.asarray([0.5], np.float32),
+                "intervention_steps": np.asarray([5], np.int32),
+            }
+
+        legacy_indices = [0, 2, 4, 14]
+        source = bank(horizons, dense_returns[:, :, legacy_indices])
+        dense = bank(dense_horizons, dense_returns.copy())
+        self.assertEqual(study.dense_probe_legacy_max_error(source, dense), 0.0)
+        dense["simulator_returns"] = dense["simulator_returns"].copy()
+        dense["simulator_returns"][0, 0, 14] += 0.25
+        self.assertAlmostEqual(
+            study.dense_probe_legacy_max_error(source, dense), 0.25
+        )
+        dense["action_sequences"] = dense["action_sequences"].copy()
+        dense["action_sequences"][0, 0, 0, 0] = 0.5
+        with self.assertRaisesRegex(ValueError, "fixed design field"):
+            study.dense_probe_legacy_max_error(source, dense)
+
+    def test_all_prefix_return_operator_is_full_rank(self) -> None:
+        discount = 0.99
+        operator = np.tril(
+            np.power(discount, np.arange(15, dtype=np.float64))[None, :]
+            * np.ones((15, 1), np.float64)
+        )
+        self.assertEqual(np.linalg.matrix_rank(operator), 15)
 
 
 if __name__ == "__main__":

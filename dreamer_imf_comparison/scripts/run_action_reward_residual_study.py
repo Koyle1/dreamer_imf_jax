@@ -12,10 +12,20 @@ from dreamer_imf_compare import action_reward_residual_study as study
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "stage", choices=("manifest", "preflight", "residual", "evaluation", "actor", "finalize")
+        "stage",
+        choices=(
+            "manifest",
+            "preflight",
+            "dense_probe",
+            "residual",
+            "evaluation",
+            "actor",
+            "finalize",
+        ),
     )
     parser.add_argument("--mtp-root", required=True)
     parser.add_argument("--centered-root", required=True)
+    parser.add_argument("--sparse-root", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--seed", type=int, choices=study.WORLD_MODEL_SEEDS)
     parser.add_argument("--horizon", type=int, choices=study.HORIZONS)
@@ -26,6 +36,7 @@ def main() -> None:
     args = parser.parse_args()
     settings = {
         "centered_root": args.centered_root,
+        "sparse_root": args.sparse_root,
         "residual_updates": args.residual_updates,
         "actor_updates": args.actor_updates,
         "preparation_updates": args.preparation_updates,
@@ -36,6 +47,10 @@ def main() -> None:
         result = study.write_manifest(*common, **settings)
     elif args.stage == "preflight":
         result = study.record_preflight(*common, **settings)
+    elif args.stage == "dense_probe":
+        if args.seed is None:
+            parser.error("--seed is required")
+        result = study.prepare_dense_probe_cell(*common, args.seed, **settings)
     elif args.stage == "residual":
         if args.seed is None:
             parser.error("--seed is required")

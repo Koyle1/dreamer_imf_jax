@@ -48,14 +48,16 @@ def tree_delta(left: object, right: object) -> float:
     )
 
 
-def decision_batch(cfg: DreamerConfig) -> dict[str, jax.Array]:
-    batch, steps, candidates, horizon = 2, 3, 2, 5
+def decision_batch(
+    cfg: DreamerConfig, horizons: tuple[int, ...] = (1, 3, 5)
+) -> dict[str, jax.Array]:
+    batch, steps, candidates, horizon = 2, 3, 2, max(horizons)
     candidate_actions = jnp.zeros(
         (batch, steps, candidates, horizon, cfg.action_dim)
     )
     candidate_actions = candidate_actions.at[:, :, 0, :, 0].set(-0.75)
     candidate_actions = candidate_actions.at[:, :, 1, :, 0].set(0.75)
-    targets = jnp.zeros((batch, steps, candidates, 3))
+    targets = jnp.zeros((batch, steps, candidates, len(horizons)))
     targets = targets.at[:, :, 0, :].set(-1.0)
     targets = targets.at[:, :, 1, :].set(1.0)
     return {
@@ -66,7 +68,7 @@ def decision_batch(cfg: DreamerConfig) -> dict[str, jax.Array]:
         "is_first": jnp.zeros((batch, steps), dtype=jnp.bool_).at[:, 0].set(True),
         "advantage_action_sequences": candidate_actions,
         "advantage_target_returns": targets,
-        "advantage_mask": jnp.ones((batch, steps, 3)),
+        "advantage_mask": jnp.ones((batch, steps, len(horizons))),
     }
 
 
@@ -217,6 +219,31 @@ class ActionRewardResidualTests(unittest.TestCase):
                 ),
                 0.0,
             )
+
+    def test_dense_horizon_training_is_finite_and_updates_the_residual(self) -> None:
+        cfg = config()
+        horizons = tuple(range(1, 16))
+        state = attach_action_reward_residual(
+            create_agent(cfg, jax.random.key(35)), cfg, jax.random.key(36)
+        )
+        initial_residual = state.params.world_model["reward_action_residual"]
+        updated, details, rms = train_action_reward_residual(
+            state,
+            decision_batch(cfg, horizons),
+            jax.random.key(37),
+            cfg,
+            ActionRewardResidualConfig(horizons=horizons),
+            init_running_rms(),
+        )
+        self.assertTrue(np.isfinite(float(details.uncentered_return)))
+        self.assertGreater(float(rms.count), 0.0)
+        self.assertGreater(
+            tree_delta(
+                initial_residual,
+                updated.params.world_model["reward_action_residual"],
+            ),
+            0.0,
+        )
 
     def test_imagination_uses_the_residual_without_mutating_dynamics(self) -> None:
         cfg = config()

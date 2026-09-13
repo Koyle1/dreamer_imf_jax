@@ -198,8 +198,8 @@ def train_action_reward_residual(
     if "reward_action_residual" not in state.params.world_model:
         raise ValueError("action reward residual has not been attached")
     targets = jax.lax.stop_gradient(decision_batch["advantage_target_returns"])
-    # Preserve the completed centered study's candidate-independent scale so
-    # the only experimental change is removal of candidate centering.
+    # Keep the candidate-independent normalization used by the earlier
+    # residual studies; dense-horizon experiments change only label coverage.
     centered = targets - jnp.mean(targets, axis=-2, keepdims=True)
     mask = decision_batch["advantage_mask"]
     if mask.shape == targets.shape[:2]:

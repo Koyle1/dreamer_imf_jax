@@ -18,6 +18,7 @@ from dreamer_imf_compare import matched_objective_benchmark as benchmark
 def _settings(manifest: dict) -> dict:
     return {
         "centered_root": manifest["centered_residual_root"],
+        "sparse_root": manifest["sparse_residual_root"],
         "residual_updates": manifest["residual_updates"],
         "actor_updates": manifest["actor_updates"],
         "preparation_updates": manifest["preparation_updates"],
@@ -40,13 +41,18 @@ def verify_manifest(root: Path) -> dict:
         or set(manifest["objective"]) != {
             "horizons", "huber_delta", "normalization_epsilon"
         }
+        or manifest["objective"]["horizons"]
+        != list(study.DENSE_TRAINING_HORIZONS)
         or manifest.get("objective_identity")
-        != "centered_pseudo_huber_plus_exact_missing_component_equals_uncentered_pseudo_huber"
+        != "uncentered_pseudo_huber_all_prefix_horizons_1_to_15"
         or manifest.get("normalization_basis")
         != "centered_target_return_running_rms"
+        or manifest.get("dense_probe_design", {}).get("training_horizons")
+        != list(study.DENSE_TRAINING_HORIZONS)
         or manifest["interpretation"]["trajectory_model_frozen"] is not True
         or manifest["interpretation"]["base_reward_head_frozen"] is not True
         or manifest["interpretation"].get("single_loss_term") is not True
+        or manifest["interpretation"].get("dense_horizon_identification") is not True
     ):
         raise ValueError("manifest design or freeze contract is invalid")
     for source in manifest["source_artifacts"]:
@@ -65,6 +71,12 @@ def verify_manifest(root: Path) -> dict:
         != manifest["centered_residual_report_file_sha256"]
     ):
         raise ValueError("centered residual reference digest changed")
+    sparse_report = Path(manifest["sparse_residual_root"]) / "report.json"
+    if (
+        benchmark.file_sha256(sparse_report)
+        != manifest["sparse_residual_report_file_sha256"]
+    ):
+        raise ValueError("sparse residual reference digest changed")
     print("ACTION_REWARD_RESIDUAL_MANIFEST_VERIFIED")
     return manifest
 
@@ -106,12 +118,49 @@ def _close(left: float, right: float) -> bool:
     return math.isclose(float(left), float(right), rel_tol=1e-12, abs_tol=1e-12)
 
 
+def verify_dense_probes(root: Path) -> dict[int, dict]:
+    """Authenticate every dense relabeling before residual training starts."""
+
+    manifest = verify_manifest(root)
+    dense_probe_rows = {}
+    for seed in study.WORLD_MODEL_SEEDS:
+        source = study._source_row(manifest, seed)
+        dense_probe_directory = root / "dense_probe" / f"seed-{seed}"
+        dense_probe = read_json(dense_probe_directory / "result.json")
+        dense_probe_path = dense_probe_directory / "probe_bank.npz"
+        dense_bank = benchmark.load_npz(dense_probe_path)
+        source_bank = benchmark.load_npz(source["train_probe_bank"])
+        if (
+            dense_probe.get("status") != "complete"
+            or dense_probe.get("source_commit") != manifest["source_commit"]
+            or dense_probe.get("manifest_sha256") != manifest["manifest_sha256"]
+            or dense_probe.get("world_model_seed") != seed
+            or dense_probe.get("horizons")
+            != list(study.DENSE_TRAINING_HORIZONS)
+            or dense_probe.get("legacy_horizon_max_abs_error", math.inf) > 1e-6
+            or dense_probe.get("maximum_replay_error", math.inf) > 1e-6
+            or benchmark.file_sha256(dense_probe_path)
+            != dense_probe.get("probe_bank_file_sha256")
+            or benchmark.array_sha256(dense_bank)
+            != dense_probe.get("probe_bank_sha256")
+            or benchmark.array_sha256(source_bank)
+            != source["train_probe_bank_sha256"]
+            or study.dense_probe_legacy_max_error(source_bank, dense_bank) > 1e-6
+        ):
+            raise ValueError(f"invalid dense probe result for seed {seed}")
+        dense_probe_rows[seed] = dense_probe
+    print("ACTION_REWARD_RESIDUAL_DENSE_PROBES_VERIFIED")
+    return dense_probe_rows
+
+
 def verify_results(root: Path) -> dict:
     manifest = verify_manifest(root)
+    dense_probe_rows = verify_dense_probes(root)
     residual_rows = []
     evaluation_rows = []
     actor_rows = []
     for seed in study.WORLD_MODEL_SEEDS:
+        dense_probe = dense_probe_rows[seed]
         residual_directory = root / "residual" / f"seed-{seed}"
         residual = read_json(residual_directory / "result.json")
         if (
@@ -119,6 +168,10 @@ def verify_results(root: Path) -> dict:
             or residual.get("source_commit") != manifest["source_commit"]
             or residual.get("manifest_sha256") != manifest["manifest_sha256"]
             or residual.get("world_model_seed") != seed
+            or residual.get("dense_probe_bank_sha256")
+            != dense_probe["probe_bank_sha256"]
+            or residual.get("objective", {}).get("horizons")
+            != list(study.DENSE_TRAINING_HORIZONS)
             or residual.get("residual_parameter_delta", 0.0) <= 0.0
             or any(residual.get("source_parameter_deltas", {}).values())
             or any(residual.get("source_first_moment_deltas", {}).values())
@@ -162,12 +215,15 @@ def verify_results(root: Path) -> dict:
     if (
         report.get("status") != "complete"
         or report.get("manifest_sha256") != manifest["manifest_sha256"]
+        or report.get("completed_dense_probe_cells") != len(study.WORLD_MODEL_SEEDS)
         or report.get("completed_residual_cells") != len(study.WORLD_MODEL_SEEDS)
         or report.get("completed_evaluation_cells") != len(study.WORLD_MODEL_SEEDS)
         or report.get("completed_actor_cells") != len(study.WORLD_MODEL_SEEDS) * len(study.HORIZONS)
         or set(report.get("matched_deltas", {})) != {"reward", "probe", "actor"}
         or report.get("centered_residual_reference")
         != manifest["centered_residual_reference"]
+        or report.get("sparse_residual_reference")
+        != manifest["sparse_residual_reference"]
     ):
         raise ValueError("final report is incomplete")
     for horizon in study.HORIZONS:
@@ -192,11 +248,16 @@ def verify_results(root: Path) -> dict:
             row for row in manifest["centered_residual_reference"]["actor_groups"]
             if row["imagination_horizon"] == horizon
         )["mean_normalized_return"]
+        sparse = next(
+            row for row in manifest["sparse_residual_reference"]["actor_groups"]
+            if row["imagination_horizon"] == horizon
+        )["mean_normalized_return"]
         deltas = report["matched_deltas"]["actor"][str(horizon)]
         for name, reference in (
             ("versus_base_mtp", base),
             ("versus_shortcut", shortcut),
             ("versus_centered_residual", centered),
+            ("versus_sparse_residual", sparse),
         ):
             if not _close(deltas[name], measured - reference):
                 raise ValueError(f"actor delta mismatch for {name}, horizon {horizon}")
@@ -214,6 +275,7 @@ def verify_results(root: Path) -> dict:
         deltas = report["matched_deltas"]["probe"][horizon]
         base = manifest["base_mtp_reference"]["probe_groups"][horizon]
         centered = manifest["centered_residual_reference"]["probe_groups"][horizon]
+        sparse = manifest["sparse_residual_reference"]["probe_groups"][horizon]
         if (
             not _close(
                 deltas["pairwise_accuracy_versus_base_mtp"],
@@ -230,6 +292,14 @@ def verify_results(root: Path) -> dict:
             or not _close(
                 deltas["regret_versus_centered_residual"],
                 measured_regret - centered["mean_simulator_regret"],
+            )
+            or not _close(
+                deltas["pairwise_accuracy_versus_sparse_residual"],
+                measured - sparse["pairwise_accuracy_mean"],
+            )
+            or not _close(
+                deltas["regret_versus_sparse_residual"],
+                measured_regret - sparse["mean_simulator_regret"],
             )
         ):
             raise ValueError(f"probe delta mismatch at horizon {horizon}")
@@ -249,6 +319,7 @@ def verify_results(root: Path) -> dict:
         deltas = report["matched_deltas"]["reward"][context]
         base = manifest["base_mtp_reference"]["reward_groups"][context]
         centered = manifest["centered_residual_reference"]["reward_groups"][context]
+        sparse = manifest["sparse_residual_reference"]["reward_groups"][context]
         if (
             not _close(deltas["mse_versus_base_mtp"], measured - base["mean_mse"])
             or not _close(
@@ -264,6 +335,15 @@ def verify_results(root: Path) -> dict:
                 measured_calibration
                 - centered["mean_offset_zero_calibration_error"],
             )
+            or not _close(
+                deltas["mse_versus_sparse_residual"],
+                measured - sparse["mean_mse"],
+            )
+            or not _close(
+                deltas["calibration_versus_sparse_residual"],
+                measured_calibration
+                - sparse["mean_offset_zero_calibration_error"],
+            )
         ):
             raise ValueError(f"reward delta mismatch for {context}")
     print("ACTION_REWARD_RESIDUAL_RESULTS_VERIFIED")
@@ -272,13 +352,17 @@ def verify_results(root: Path) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("preflight", "manifest", "results"))
+    parser.add_argument(
+        "mode", choices=("preflight", "manifest", "dense-probes", "results")
+    )
     parser.add_argument("--root", type=Path, required=True)
     args = parser.parse_args()
     if args.mode == "preflight":
         verify_preflight(args.root)
     elif args.mode == "manifest":
         verify_manifest(args.root)
+    elif args.mode == "dense-probes":
+        verify_dense_probes(args.root)
     else:
         verify_results(args.root)
 

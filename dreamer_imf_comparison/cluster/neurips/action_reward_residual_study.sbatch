@@ -14,6 +14,7 @@ set -euo pipefail
 : "${AR_OUTPUT_ROOT:?AR_OUTPUT_ROOT is required}"
 : "${AR_MTP_ROOT:?AR_MTP_ROOT is required}"
 : "${AR_CENTERED_ROOT:?AR_CENTERED_ROOT is required}"
+: "${AR_SPARSE_ROOT:?AR_SPARSE_ROOT is required}"
 : "${AR_SOURCE_COMMIT:?AR_SOURCE_COMMIT is required}"
 : "${AR_STAGE:?AR_STAGE is required}"
 
@@ -39,6 +40,7 @@ RUNNER=${AR_SOURCE_ROOT}/dreamer_imf_comparison/scripts/run_action_reward_residu
 COMMON=(
   --mtp-root "${AR_MTP_ROOT}"
   --centered-root "${AR_CENTERED_ROOT}"
+  --sparse-root "${AR_SPARSE_ROOT}"
   --output-root "${AR_OUTPUT_ROOT}"
   --residual-updates "${AR_RESIDUAL_UPDATES:-1000}"
   --actor-updates "${AR_ACTOR_UPDATES:-3000}"
@@ -58,8 +60,8 @@ case "${AR_STAGE}" in
     python "${RUNNER}" preflight "${COMMON[@]}"
     echo ACTION_REWARD_RESIDUAL_PREFLIGHT_COMPLETE
     ;;
-  residual|evaluation)
-    : "${SLURM_ARRAY_TASK_ID:?residual/evaluation requires index 0..1}"
+  dense_probe|residual|evaluation)
+    : "${SLURM_ARRAY_TASK_ID:?dense_probe/residual/evaluation requires index 0..1}"
     python "${RUNNER}" "${AR_STAGE}" "${COMMON[@]}" \
       --seed "${SEEDS[${SLURM_ARRAY_TASK_ID}]}"
     ;;

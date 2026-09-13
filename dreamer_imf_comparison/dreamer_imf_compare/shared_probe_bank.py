@@ -252,6 +252,144 @@ def generate_shared_probe_bank(
     return result
 
 
+def relabel_shared_probe_bank_horizons(
+    arrays: Mapping[str, np.ndarray],
+    source_bank: Mapping[str, np.ndarray],
+    *,
+    task: str,
+    world_model_seed: int,
+    action_repeat: int,
+    horizons: Sequence[int],
+    discount: float = 0.99,
+) -> dict[str, np.ndarray]:
+    """Replay an existing fixed probe design at a denser set of horizons.
+
+    States, candidate action suffixes, and shared model-noise draws are copied
+    exactly from ``source_bank``. Only simulator return labels and their masks
+    are regenerated. This keeps the intervention design fixed when testing
+    whether denser return supervision closes a temporal nullspace.
+    """
+
+    validate_shared_probe_bank(source_bank)
+    ordered_horizons = tuple(int(value) for value in horizons)
+    maximum_horizon = int(np.asarray(source_bank["action_sequences"]).shape[2])
+    if (
+        not ordered_horizons
+        or tuple(sorted(set(ordered_horizons))) != ordered_horizons
+        or ordered_horizons[0] <= 0
+        or ordered_horizons[-1] != maximum_horizon
+    ):
+        raise ValueError(
+            "relabel horizons must be unique increasing positive integers "
+            "ending at the fixed suffix length"
+        )
+    if not np.isfinite(discount) or not 0.0 <= discount <= 1.0:
+        raise ValueError("discount must lie in [0, 1]")
+    episodes = np.asarray(source_bank["episode_ids"], dtype=np.int32)
+    anchors = np.asarray(source_bank["anchors"], dtype=np.int32)
+    action_sequences = np.asarray(source_bank["action_sequences"], dtype=np.float32)
+    targets = np.zeros(
+        (len(episodes), action_sequences.shape[1], len(ordered_horizons)),
+        np.float32,
+    )
+    valid = np.zeros((len(episodes), len(ordered_horizons)), np.float32)
+    horizon_indices = {
+        horizon: index for index, horizon in enumerate(ordered_horizons)
+    }
+    by_location = {
+        (int(episode), int(anchor)): index
+        for index, (episode, anchor) in enumerate(zip(episodes, anchors, strict=True))
+    }
+    if len(by_location) != len(episodes):
+        raise ValueError("source probe locations must be unique")
+    replay_error = 0.0
+    environment = DMCAdapter(
+        task,
+        seed=derive_seed("dataset-environment", task, world_model_seed),
+        action_repeat=action_repeat,
+    )
+    try:
+        maximum_episode = int(np.max(episodes))
+        for episode in range(maximum_episode + 1):
+            observation = environment.reset()
+            replay_error = max(
+                replay_error,
+                float(
+                    np.max(
+                        np.abs(observation - arrays["observations"][episode, 0])
+                    )
+                ),
+            )
+            for anchor in range(1, arrays["actions"].shape[1]):
+                snapshot = environment.snapshot()
+                probe_index = by_location.get((episode, anchor))
+                if probe_index is not None:
+                    for candidate in range(action_sequences.shape[1]):
+                        environment.restore(snapshot)
+                        cumulative = 0.0
+                        survival = 1.0
+                        for offset in range(maximum_horizon):
+                            transition = environment.step(
+                                action_sequences[probe_index, candidate, offset]
+                            )
+                            cumulative += (
+                                (discount**offset) * survival * transition.reward
+                            )
+                            survival *= transition.continuation
+                            horizon = offset + 1
+                            if horizon in horizon_indices:
+                                horizon_index = horizon_indices[horizon]
+                                targets[probe_index, candidate, horizon_index] = cumulative
+                                valid[probe_index, horizon_index] = 1.0
+                            if transition.is_last:
+                                break
+                environment.restore(snapshot)
+                actual = environment.step(
+                    np.asarray(arrays["actions"][episode, anchor], np.float32)
+                )
+                replay_error = max(
+                    replay_error,
+                    float(
+                        np.max(
+                            np.abs(
+                                actual.observation
+                                - arrays["observations"][episode, anchor]
+                            )
+                        )
+                    ),
+                    abs(float(actual.reward) - float(arrays["rewards"][episode, anchor])),
+                    abs(
+                        float(actual.continuation)
+                        - float(arrays["continuations"][episode, anchor])
+                    ),
+                )
+                if actual.is_last:
+                    break
+    finally:
+        environment.close()
+    if replay_error > 1e-6:
+        raise ValueError(f"shared probe replay differs from dataset by {replay_error}")
+    result = {
+        "episode_ids": np.asarray(source_bank["episode_ids"]).copy(),
+        "anchors": np.asarray(source_bank["anchors"]).copy(),
+        "horizons": np.asarray(ordered_horizons, np.int32),
+        "action_sequences": action_sequences.copy(),
+        "model_noise": np.asarray(source_bank["model_noise"]).copy(),
+        "simulator_returns": targets,
+        "horizon_mask": valid,
+        "maximum_replay_error": np.asarray([replay_error], np.float64),
+        "candidate_pool_size": np.asarray(source_bank["candidate_pool_size"]).copy(),
+        "selection_horizon": np.asarray([ordered_horizons[-1]], np.int32),
+        "selection_return_ranges": np.ptp(targets[:, :, -1], axis=1).astype(
+            np.float32
+        ),
+        "action_delta": np.asarray(source_bank["action_delta"]).copy(),
+        "intervention_steps": np.asarray(source_bank["intervention_steps"]).copy(),
+    }
+    validate_shared_probe_bank(result)
+    return result
+
+
 def validate_shared_probe_bank(bank: Mapping[str, np.ndarray]) -> None:
     required = {
         "episode_ids",
@@ -511,6 +649,7 @@ __all__ = [
     "build_probe_plan",
     "evaluate_shared_probe_bank",
     "generate_shared_probe_bank",
+    "relabel_shared_probe_bank_horizons",
     "shared_probe_manifest",
     "validate_shared_probe_bank",
 ]
