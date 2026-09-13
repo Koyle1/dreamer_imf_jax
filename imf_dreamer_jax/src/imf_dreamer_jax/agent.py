@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import partial
 import math
-from typing import Mapping
+from typing import Callable, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -34,6 +34,11 @@ from .world_model import (
     transition_deterministic,
     world_model_loss,
 )
+
+
+ImaginationSignalFn = Callable[
+    [Params, Array, Array, Array, DreamerConfig], Array
+]
 
 
 def init_actor(config: DreamerConfig, key: Array) -> Params:
@@ -392,6 +397,8 @@ def imagine(
     config: DreamerConfig,
     *,
     horizon: int | None = None,
+    reward_fn: ImaginationSignalFn | None = None,
+    continuation_fn: ImaginationSignalFn | None = None,
 ) -> Imagination:
     horizon = config.imagination_horizon if horizon is None else horizon
     if horizon <= 0:
@@ -415,19 +422,45 @@ def imagine(
             params.world_model, deterministic, prior_key, config
         )
         next_state = RSSMState(deterministic, stochastic)
-        output = (
-            next_state.feature,
-            actor_sample.action,
+        reward = (
             predict_transition_reward(
                 params.world_model,
                 previous_feature,
                 actor_sample.action,
                 next_state.feature,
                 config,
-            ),
+            )
+            if reward_fn is None
+            else reward_fn(
+                params.world_model,
+                previous_feature,
+                actor_sample.action,
+                next_state.feature,
+                config,
+            )
+        )
+        continuation = (
             jax.nn.sigmoid(
                 predict_continuation_logits(params.world_model, next_state.feature)
-            ),
+            )
+            if continuation_fn is None
+            else continuation_fn(
+                params.world_model,
+                previous_feature,
+                actor_sample.action,
+                next_state.feature,
+                config,
+            )
+        )
+        if reward.shape != actor_sample.action.shape[:-1]:
+            raise ValueError("imagination reward_fn returned the wrong shape")
+        if continuation.shape != reward.shape:
+            raise ValueError("imagination continuation_fn returned the wrong shape")
+        output = (
+            next_state.feature,
+            actor_sample.action,
+            reward,
+            continuation,
             actor_sample.entropy,
             tanh_normal_log_prob(
                 actor_sample.distribution.mean,
@@ -718,6 +751,8 @@ def train_actor_critic(
     behavior_prior: Params | None = None,
     reward_ensemble_params: Params | None = None,
     epistemic_penalty_scale: float = 0.0,
+    reward_fn: ImaginationSignalFn | None = None,
+    continuation_fn: ImaginationSignalFn | None = None,
 ) -> tuple[AgentState, ActorCriticMetrics]:
     """Update a stable actor and critic from imagined trajectories.
 
@@ -744,7 +779,14 @@ def train_actor_critic(
 
     def actor_objective(actor_params: Params):
         params = AgentParams(state.params.world_model, actor_params, state.params.critic)
-        imagined = imagine(params, start, actor_key, config)
+        imagined = imagine(
+            params,
+            start,
+            actor_key,
+            config,
+            reward_fn=reward_fn,
+            continuation_fn=continuation_fn,
+        )
         target_values = critic(slow_critic, imagined.features, config)
         imagined_rewards = imagined.rewards
         if epistemic_penalty_scale > 0.0:
@@ -851,7 +893,14 @@ def train_actor_critic(
         epsilon=config.adam_epsilon,
     )
     rollout_params = AgentParams(state.params.world_model, actor_params, state.params.critic)
-    imagined = imagine(rollout_params, start, critic_rollout_key, config)
+    imagined = imagine(
+        rollout_params,
+        start,
+        critic_rollout_key,
+        config,
+        reward_fn=reward_fn,
+        continuation_fn=continuation_fn,
+    )
     target_values = critic(slow_critic, imagined.features, config)
     imagined_rewards = imagined.rewards
     if epistemic_penalty_scale > 0.0:
@@ -951,7 +1000,10 @@ def train_actor_critic(
 
 
 jit_act = partial(jax.jit, static_argnames=("config", "deterministic"))(act)
-jit_imagine = partial(jax.jit, static_argnames=("config", "horizon"))(imagine)
+jit_imagine = partial(
+    jax.jit,
+    static_argnames=("config", "horizon", "reward_fn", "continuation_fn"),
+)(imagine)
 jit_train_behavior_cloning = partial(jax.jit, static_argnames=("config",))(
     train_behavior_cloning
 )
@@ -960,7 +1012,13 @@ jit_train_replay_critic = partial(jax.jit, static_argnames=("config",))(
 )
 jit_train_world_model = partial(jax.jit, static_argnames=("config",))(train_world_model)
 jit_train_actor_critic = partial(
-    jax.jit, static_argnames=("config", "epistemic_penalty_scale")
+    jax.jit,
+    static_argnames=(
+        "config",
+        "epistemic_penalty_scale",
+        "reward_fn",
+        "continuation_fn",
+    ),
 )(train_actor_critic)
 
 
@@ -976,6 +1034,7 @@ __all__ = [
     "diagonal_normal_kl",
     "diverse_imagination_starts",
     "imagine",
+    "ImaginationSignalFn",
     "initial_state",
     "jit_act",
     "jit_imagine",

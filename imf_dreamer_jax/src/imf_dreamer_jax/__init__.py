@@ -1,6 +1,7 @@
 """Pure-JAX compact Dreamer-style world models with Improved MeanFlow priors."""
 
 from .agent import (
+    ImaginationSignalFn,
     act,
     actor,
     actor_distribution,
@@ -196,6 +197,7 @@ from .world_model import (
 __version__ = "0.6.0"
 
 __all__ = [
+    "ImaginationSignalFn",
     "CHECKPOINT_VERSION",
     "ActionRewardResidualConfig",
     "ActionRewardResidualLoss",
