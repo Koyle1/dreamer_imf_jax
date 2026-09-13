@@ -20,3 +20,6 @@ matched pilot setup.
 All source dependencies, schedules, checkpoints, environment traces, and
 strict replay markers are hash-bound. A source world-model mutation, old actor
 result, missing cell, non-finite metric, or trace mismatch invalidates the run.
+Reused artifacts are authenticated by the immutable stage markers produced by
+their original source revision; architecture-sensitive initialization checks
+are not reinterpreted under the newer actor-training source.

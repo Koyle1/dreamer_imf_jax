@@ -380,6 +380,71 @@ def _original_actor_cell(
     return original
 
 
+def _authenticated_source_result(
+    root: Path,
+    matrix: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    stage: str,
+) -> tuple[dict[str, Any], Path]:
+    """Load a source artifact authenticated by its original stage verifier.
+
+    Reused artifacts were verified under the exact 456d-era source. Replaying
+    architecture-sensitive initialization checks under later source would be
+    neither equivalent nor desirable. The signed stage marker instead binds
+    the exact result bytes, after which stage-specific supplementary hashes
+    are checked below.
+    """
+
+    if cell.get("stage") != stage:
+        raise ValueError(f"source dependency is not a {stage} cell")
+    marker = read_json(root / "cluster_stage_verification" / f"{stage}.json")
+    expected_cells = benchmark.expected_hpo_matrix_counts(
+        read_json(root / "frozen_protocol.json")
+    )[stage]
+    validate_cluster_stage_verification(
+        marker,
+        stage=stage,
+        expected_cells=int(expected_cells),
+        matrix_sha256=str(matrix["matrix_sha256"]),
+    )
+    path = benchmark._cell_result_path(root, cell)
+    relative = str(path.relative_to(root))
+    rows = [
+        row
+        for row in marker["result_files"]
+        if row["cell_id"] == cell["cell_id"]
+    ]
+    if (
+        len(rows) != 1
+        or rows[0]["path"] != relative
+        or not path.is_file()
+        or rows[0]["sha256"] != benchmark.file_sha256(path)
+    ):
+        raise ValueError(f"authenticated {stage} result binding differs")
+    result = read_json(path)
+    for key in (
+        "cell_id",
+        "stage",
+        "task",
+        "arm",
+        "candidate_id",
+        "world_model_seed",
+        "actor_seed",
+        "budget_track",
+        "profile",
+        "evidence_class",
+        "source_sha256",
+        "protocol_sha256",
+        "config_template_sha256",
+        "selection_sha256",
+    ):
+        if result.get(key) != cell.get(key):
+            raise ValueError(f"authenticated {stage} result {key} differs")
+    if result.get("matrix_sha256") != matrix["matrix_sha256"]:
+        raise ValueError(f"authenticated {stage} result matrix differs")
+    return result, path
+
+
 def _load_dependencies(
     manifest: Mapping[str, Any], cell: Mapping[str, Any]
 ) -> tuple[
@@ -393,18 +458,20 @@ def _load_dependencies(
 ]:
     root, _, protocol, matrix = load_and_validate_input(manifest["pilot_root"])
     original = _original_actor_cell(matrix, cell)
-    _, world_result, world_directory = benchmark._load_dependency_result(
-        root, matrix, original, "world_model"
-    )
-    _, dataset_result, dataset_directory = benchmark._load_dependency_result(
-        root, matrix, original, "dataset"
-    )
-    _, compute_result, _ = benchmark._load_dependency_result(
-        root, matrix, original, "compute_plan"
-    )
     world_cell = benchmark._dependency_cell(matrix, original, "world_model")
     dataset_cell = benchmark._dependency_cell(matrix, original, "dataset")
     compute_cell = benchmark._dependency_cell(matrix, original, "compute_plan")
+    world_result, _ = _authenticated_source_result(
+        root, matrix, world_cell, "world_model"
+    )
+    dataset_result, _ = _authenticated_source_result(
+        root, matrix, dataset_cell, "dataset"
+    )
+    compute_result, _ = _authenticated_source_result(
+        root, matrix, compute_cell, "compute_plan"
+    )
+    world_directory = benchmark.stage_directory(root, world_cell)
+    dataset_directory = benchmark.stage_directory(root, dataset_cell)
     benchmark.validate_dataset_result(
         dataset_result,
         dataset_cell,
@@ -422,9 +489,6 @@ def _load_dependencies(
         world_result,
         world_cell,
         world_directory,
-        protocol=protocol,
-        matrix=matrix,
-        output_root=root,
     )
     return (
         protocol,
@@ -1232,12 +1296,34 @@ def build_corrected_trials(output_root: str | Path) -> dict[str, Any]:
                         raise ValueError("corrected selection dependency is absent or duplicated")
                     world = worlds[0]
                     rollout = rollouts[0]
-                    world_result, world_path = benchmark._completed_result_for_cell(
-                        pilot_root, matrix, protocol, world
+                    world_result, world_path = _authenticated_source_result(
+                        pilot_root, matrix, world, "world_model"
                     )
-                    rollout_result, rollout_path = benchmark._completed_result_for_cell(
-                        pilot_root, matrix, protocol, rollout
+                    benchmark.validate_world_result(
+                        world_result,
+                        world,
+                        benchmark.stage_directory(pilot_root, world),
                     )
+                    rollout_result, rollout_path = _authenticated_source_result(
+                        pilot_root, matrix, rollout, "rollout"
+                    )
+                    rollout_metric = float(
+                        rollout_result.get(
+                            "normalized_free_running_rollout_error_auc", math.nan
+                        )
+                    )
+                    raw_rollout = (
+                        benchmark.stage_directory(pilot_root, rollout)
+                        / "predictive_draws.npz"
+                    )
+                    if (
+                        not math.isfinite(rollout_metric)
+                        or rollout_metric < 0.0
+                        or not raw_rollout.is_file()
+                        or rollout_result.get("raw_predictive_draws_sha256")
+                        != benchmark.file_sha256(raw_rollout)
+                    ):
+                        raise ValueError("authenticated rollout metric or draws differ")
                     actor_returns: list[float] = []
                     actor_hashes: list[str] = []
                     for actor_seed in profile[
@@ -1273,17 +1359,22 @@ def build_corrected_trials(output_root: str | Path) -> dict[str, Any]:
                     compute_cell = benchmark._dependency_cell(
                         matrix, world, "compute_plan"
                     )
-                    compute_result, _ = benchmark._completed_result_for_cell(
-                        pilot_root, matrix, protocol, compute_cell
+                    compute_result, _ = _authenticated_source_result(
+                        pilot_root, matrix, compute_cell, "compute_plan"
+                    )
+                    benchmark.validate_compute_plan_cell(
+                        compute_result, protocol, matrix, compute_cell, pilot_root
+                    )
+                    benchmark._validate_compute_files(
+                        compute_result,
+                        benchmark.stage_directory(pilot_root, compute_cell),
                     )
                     units.append(
                         {
                             "task": task,
                             "world_model_seed": int(world_seed),
                             "rollout_auc": float(
-                                rollout_result[
-                                    "normalized_free_running_rollout_error_auc"
-                                ]
+                                rollout_metric
                             ),
                             "nested_actor_return": float(np.mean(actor_returns)),
                             "full_forward_backward_train_flops_per_update": float(
