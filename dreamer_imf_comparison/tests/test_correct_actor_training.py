@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import asdict
+import json
 import unittest
 
 from dreamer_imf_compare import correct_actor_training as study
@@ -75,6 +76,16 @@ class CorrectActorTrainingTests(unittest.TestCase):
         wrong["return_scale_ema_decay"] = 0.9
         self.assertFalse(
             study.benchmark.runtime_config_matches_frozen_protocol(wrong, expected)
+        )
+
+    def test_runtime_config_digest_is_json_round_trip_stable(self) -> None:
+        from imf_dreamer_jax import DreamerConfig
+
+        payload = asdict(DreamerConfig(observation_shape=(6,), overshooting_distances=(1,)))
+        decoded = json.loads(json.dumps(payload))
+        self.assertEqual(
+            study.benchmark.object_sha256(decoded),
+            study.benchmark.object_sha256(payload),
         )
 
     def test_fail_closed_self_test(self) -> None:

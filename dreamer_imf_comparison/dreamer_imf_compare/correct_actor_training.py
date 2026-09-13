@@ -1031,7 +1031,11 @@ def validate_cell_result(
         if not path.is_file() or result.get(field) != benchmark.file_sha256(path):
             raise ValueError(f"corrected actor {path.name} digest mismatch")
     state, stored_config, metadata = load_checkpoint(checkpoint_path)
-    if stored_config != config or result.get("runtime_config") != asdict(config):
+    if (
+        stored_config != config
+        or benchmark.object_sha256(result.get("runtime_config"))
+        != benchmark.object_sha256(asdict(config))
+    ):
         raise ValueError("corrected actor runtime config mismatch")
     if result.get("runtime_config_sha256") != benchmark.object_sha256(asdict(config)):
         raise ValueError("corrected actor runtime config digest mismatch")
