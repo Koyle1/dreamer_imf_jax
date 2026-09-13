@@ -9,9 +9,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from dreamer_imf_compare import action_reward_residual_study as study
+from dreamer_imf_compare import shared_probe_bank
 from imf_dreamer_jax import (
     ActionRewardResidualConfig,
     DreamerConfig,
+    RSSMState,
     attach_action_reward_residual,
     create_agent,
     init_running_rms,
@@ -112,6 +114,42 @@ class ActionRewardResidualStudyTests(unittest.TestCase):
         self.assertTrue(_VERIFIER._preflight_evidence_complete(preflight, manifest))
         preflight["runtime"]["backend"] = "cpu"
         self.assertFalse(_VERIFIER._preflight_evidence_complete(preflight, manifest))
+
+    def test_shared_probe_evaluator_uses_transition_residual(self) -> None:
+        cfg = config()
+        source = create_agent(cfg, jax.random.key(20))
+        attached = attach_action_reward_residual(source, cfg, jax.random.key(21))
+        residual = attached.params.world_model["reward_action_residual"]
+        shifted_residual = {
+            "layers": (
+                residual["layers"][0],
+                {
+                    **residual["layers"][1],
+                    "bias": jnp.ones_like(residual["layers"][1]["bias"]),
+                },
+            )
+        }
+        shifted_world = {
+            **attached.params.world_model,
+            "reward_action_residual": shifted_residual,
+        }
+        initial = RSSMState(
+            jnp.zeros((1, cfg.deterministic_dim)),
+            jnp.zeros((1, cfg.stochastic_dim)),
+        )
+        actions = jnp.zeros((1, 2, 3, cfg.action_dim))
+        noise = jnp.zeros((1, 1, 3, cfg.stochastic_dim))
+        baseline = shared_probe_bank._model_probe_returns(
+            source.params.world_model, initial, actions, noise, cfg, (1, 3)
+        )
+        zero_residual = shared_probe_bank._model_probe_returns(
+            attached.params.world_model, initial, actions, noise, cfg, (1, 3)
+        )
+        shifted = shared_probe_bank._model_probe_returns(
+            shifted_world, initial, actions, noise, cfg, (1, 3)
+        )
+        np.testing.assert_array_equal(np.asarray(zero_residual), np.asarray(baseline))
+        self.assertGreater(float(jnp.max(jnp.abs(shifted - baseline))), 0.0)
 
     def test_jitted_study_update_preserves_base_reward_and_dynamics(self) -> None:
         cfg = config()

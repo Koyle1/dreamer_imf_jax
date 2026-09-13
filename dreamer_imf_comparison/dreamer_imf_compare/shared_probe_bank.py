@@ -402,7 +402,7 @@ def _model_probe_returns(
     from imf_dreamer_jax import (
         RSSMState,
         predict_continuation_logits,
-        predict_reward,
+        predict_transition_reward,
         sample_prior,
         transition_deterministic,
     )
@@ -423,6 +423,7 @@ def _model_probe_returns(
     survival = jnp.ones_like(cumulative)
     selected = []
     for offset in range(action_sequences.shape[2]):
+        previous_feature = state.feature
         action = jnp.broadcast_to(
             action_sequences[None, :, :, offset, :],
             (draws, probes, candidates, config.action_dim),
@@ -443,7 +444,9 @@ def _model_probe_returns(
             deterministic,
             stochastic.reshape((draws, probes, candidates, config.stochastic_dim)),
         )
-        reward = predict_reward(params, state.feature, config)
+        reward = predict_transition_reward(
+            params, previous_feature, action, state.feature, config
+        )
         continuation = jax.nn.sigmoid(
             predict_continuation_logits(params, state.feature)
         )
