@@ -975,6 +975,7 @@ def run_world_cell(
         horizon=horizon,
         maximum_steps=int(manifest["maximum_environment_steps"]),
     )
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
     benchmark._write_npz_atomic(raw_path, traces)
     trace_metrics = previous._trace_metrics(returns, traces)
     trace_metrics["mean_imagined_horizon_return"] = float(
@@ -1028,6 +1029,7 @@ def run_random_cell(
         evaluation_seeds=manifest["shared_evaluation_seeds"],
         maximum_steps=int(manifest["maximum_environment_steps"]),
     )
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
     benchmark._write_npz_atomic(raw_path, traces)
     result = {
         "schema_version": RESULT_SCHEMA,
