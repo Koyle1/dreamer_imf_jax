@@ -2031,6 +2031,9 @@ def make_config(
         reward_bins=1,
         reward_symlog_min=-20.0,
         reward_symlog_max=20.0,
+        # Added after the pilot protocol was frozen. This is actor-only and its
+        # library default is the exact value used by corrected actor training.
+        return_scale_ema_decay=0.99,
     )
     common["overshooting_distances"] = tuple(common["overshooting_distances"])
     common["observation_shape"] = tuple(int(value) for value in observation_shape)
@@ -2067,6 +2070,27 @@ def make_config(
             f"extra={sorted(set(common) - expected_fields)}"
         )
     return DreamerConfig(**common)
+
+
+def runtime_config_matches_frozen_protocol(
+    recorded: Mapping[str, Any], expected: Any
+) -> bool:
+    """Compare configs while admitting exactly one registered legacy omission.
+
+    The authenticated pilot predates ``return_scale_ema_decay``. Its JSON
+    runtime configs therefore omit that actor-only field, while old pickled
+    ``DreamerConfig`` objects resolve the dataclass default after loading. No
+    value difference and no other missing or extra field is accepted.
+    """
+
+    expected_payload = asdict(expected)
+    if canonical_bytes(recorded) == canonical_bytes(expected_payload):
+        return True
+    if expected_payload.get("return_scale_ema_decay") != 0.99:
+        return False
+    legacy_payload = dict(expected_payload)
+    legacy_payload.pop("return_scale_ema_decay")
+    return canonical_bytes(recorded) == canonical_bytes(legacy_payload)
 
 
 def _dummy_batch(config: Any, profile: str) -> dict[str, Any]:
@@ -2943,7 +2967,7 @@ def validate_compute_plan_cell(
             output_root=output_root,
             candidate=candidates.get(arm),
         )
-        if object_sha256(runtime) != object_sha256(asdict(expected)):
+        if not runtime_config_matches_frozen_protocol(runtime, expected):
             raise ValueError("compute-plan resolved runtime config differs from the frozen arm")
     if not rederive_compiler_evidence:
         return
@@ -4116,7 +4140,7 @@ def validate_world_result(
             output_root=output_root,
             candidate=_candidate_for_cell(matrix, cell),
         )
-        if object_sha256(runtime) != object_sha256(asdict(expected)):
+        if not runtime_config_matches_frozen_protocol(runtime, expected):
             raise ValueError("world-model runtime config differs from its frozen matrix arm")
         import jax
         from imf_dreamer_jax import create_agent, load_checkpoint
@@ -4141,7 +4165,7 @@ def validate_world_result(
             raise ValueError("world-model shared initialization evidence mismatch")
 
         state, stored_config, metadata = load_checkpoint(root / "checkpoint.pkl")
-        if object_sha256(asdict(stored_config)) != object_sha256(asdict(expected)):
+        if not runtime_config_matches_frozen_protocol(asdict(stored_config), expected):
             raise ValueError("world-model checkpoint config mismatch")
         if (
             metadata.get("stage") != "world_model"
@@ -4911,11 +4935,12 @@ def validate_rollout_result(
             output_root=root,
             candidate=_candidate_for_cell(matrix, cell),
         )
-        config_payload = asdict(config)
         if (
-            result.get("runtime_config_sha256") != object_sha256(config_payload)
-            or canonical_bytes(result.get("runtime_config"))
-            != canonical_bytes(config_payload)
+            result.get("runtime_config_sha256")
+            != object_sha256(result.get("runtime_config"))
+            or not runtime_config_matches_frozen_protocol(
+                result.get("runtime_config"), config
+            )
         ):
             raise ValueError("rollout runtime config differs from its canonical NFE cell")
         if result.get("inference_replay_comparison") != _rollout_replay_comparison_contract():
@@ -5457,7 +5482,7 @@ def validate_actor_result(
             ),
         )
         if (
-            object_sha256(asdict(actor_config)) != object_sha256(asdict(expected))
+            not runtime_config_matches_frozen_protocol(asdict(actor_config), expected)
             or metadata.get("cell_id") != cell["cell_id"]
             or metadata.get("completed_updates") != result.get("updates")
             or int(np.asarray(actor_state.actor_optimizer.step)) != expected_updates

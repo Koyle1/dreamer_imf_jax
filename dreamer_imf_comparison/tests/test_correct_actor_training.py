@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import asdict
 import unittest
 
 from dreamer_imf_compare import correct_actor_training as study
@@ -54,6 +55,26 @@ class CorrectActorTrainingTests(unittest.TestCase):
         self.assertEqual(study.ACTOR_UPDATES, 10_000)
         self.assertEqual(study.BEHAVIOR_KL_SCALE, 0.0)
         self.assertEqual(study.RETURN_SCALE_EMA_DECAY, 0.99)
+
+    def test_legacy_config_adapter_allows_only_registered_omission(self) -> None:
+        from imf_dreamer_jax import DreamerConfig
+
+        expected = DreamerConfig()
+        legacy = asdict(expected)
+        legacy.pop("return_scale_ema_decay")
+        self.assertTrue(
+            study.benchmark.runtime_config_matches_frozen_protocol(legacy, expected)
+        )
+        forged = dict(legacy)
+        forged.pop("discount")
+        self.assertFalse(
+            study.benchmark.runtime_config_matches_frozen_protocol(forged, expected)
+        )
+        wrong = dict(legacy)
+        wrong["return_scale_ema_decay"] = 0.9
+        self.assertFalse(
+            study.benchmark.runtime_config_matches_frozen_protocol(wrong, expected)
+        )
 
     def test_fail_closed_self_test(self) -> None:
         study.self_test()
