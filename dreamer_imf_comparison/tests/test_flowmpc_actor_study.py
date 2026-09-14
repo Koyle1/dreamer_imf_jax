@@ -38,6 +38,11 @@ class FlowMPCActorStudyTests(unittest.TestCase):
             study.benchmark._tree_digest(state.critics),
         )
 
+    def test_typed_prng_key_has_portable_checkpoint_payload(self) -> None:
+        payload = study._prng_key_payload(jax.random.key(17))
+        self.assertEqual(payload, [0, 17])
+        self.assertTrue(all(isinstance(value, int) for value in payload))
+
     def test_trace_verifier_rejects_changed_action(self) -> None:
         retained = {
             "actions": np.zeros((1, 2, 1), np.float32),

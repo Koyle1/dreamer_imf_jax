@@ -77,6 +77,15 @@ def _finite_tree(value: Any) -> bool:
     return True
 
 
+def _prng_key_payload(key: Any) -> list[int]:
+    """Return portable uint32 key data for authenticated checkpoint metadata."""
+
+    import jax
+
+    data = jax.device_get(jax.random.key_data(key))
+    return np.asarray(data, dtype=np.uint32).tolist()
+
+
 def _write_pickle_atomic(path: str | Path, payload: Mapping[str, Any]) -> Path:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -599,7 +608,7 @@ def train_rebrac_cell(
                 "cell_id": cell["cell_id"],
                 "manifest_sha256": manifest["manifest_sha256"],
                 "completed_updates": completed,
-                "training_key": np.asarray(jax.device_get(training_key)).tolist(),
+                "training_key": _prng_key_payload(training_key),
                 "initial_actor_parameter_sha256": initial_actor_digest,
                 "initial_critic_parameter_sha256": initial_critic_digest,
                 "latest_metrics": latest,
