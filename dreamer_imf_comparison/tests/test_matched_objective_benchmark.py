@@ -846,6 +846,37 @@ class MatchedObjectiveBenchmarkTest(unittest.TestCase):
             3 * trajectory_config.deterministic_dim,
         )
 
+    def test_runtime_fingerprint_binds_full_software_environment(self) -> None:
+        runtime = benchmark.runtime_fingerprint()
+        identity = benchmark.runtime_homogeneity_identity(runtime)
+        required = {
+            "python_executable",
+            "python_executable_sha256",
+            "platform_system",
+            "platform_release",
+            "platform_machine",
+            "numpy_version",
+            "jax_version",
+            "jaxlib_version",
+            "dm_control_version",
+            "mujoco_version",
+            "environment_package_count",
+            "environment_packages_sha256",
+        }
+        self.assertTrue(required.issubset(identity))
+        self.assertRegex(identity["python_executable_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(identity["environment_packages_sha256"], r"^[0-9a-f]{64}$")
+        self.assertGreater(identity["environment_package_count"], 0)
+
+        extended = required - {"jax_version", "jaxlib_version"}
+        legacy = {key: value for key, value in runtime.items() if key not in extended}
+        legacy_identity = benchmark.runtime_homogeneity_identity(legacy)
+        self.assertFalse(extended & set(legacy_identity))
+        partial = dict(legacy)
+        partial["numpy_version"] = runtime["numpy_version"]
+        with self.assertRaisesRegex(ValueError, "extended runtime"):
+            benchmark.runtime_homogeneity_identity(partial)
+
 
 if __name__ == "__main__":
     unittest.main()

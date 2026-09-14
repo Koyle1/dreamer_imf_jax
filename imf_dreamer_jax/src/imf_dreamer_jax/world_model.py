@@ -84,6 +84,56 @@ def init_action_reward_residual(config: DreamerConfig, key: Array) -> Params:
     )
 
 
+def init_transition_reward_head(
+    config: DreamerConfig,
+    key: Array,
+    *,
+    observation_mean: Array | None = None,
+    observation_std: Array | None = None,
+    hidden_dim: int = 512,
+) -> Params:
+    """Initialize the state-action reward model used by ITPO/FlowMPC.
+
+    The published model is a three-hidden-layer, width-512 MLP over a
+    standardized state and an unnormalized action.  Our dynamics remain
+    latent, so imagined latent features are decoded into the environment
+    observation space before this head is evaluated.  Dataset statistics are
+    stored with the head and are constants, not learned parameters.
+    """
+
+    if hidden_dim <= 0:
+        raise ValueError("transition reward hidden_dim must be positive")
+    mean = (
+        jnp.zeros((config.observation_dim,), dtype=jnp.float32)
+        if observation_mean is None
+        else jnp.asarray(observation_mean, dtype=jnp.float32)
+    )
+    std = (
+        jnp.ones((config.observation_dim,), dtype=jnp.float32)
+        if observation_std is None
+        else jnp.asarray(observation_std, dtype=jnp.float32)
+    )
+    if mean.shape != (config.observation_dim,) or std.shape != (
+        config.observation_dim,
+    ):
+        raise ValueError("reward observation statistics have the wrong shape")
+    if not bool(jnp.all(jnp.isfinite(mean))) or not bool(
+        jnp.all(jnp.isfinite(std) & (std > 0.0))
+    ):
+        raise ValueError("reward observation statistics must be finite and positive")
+    return {
+        "network": init_mlp(
+            key,
+            config.observation_dim + config.action_dim,
+            hidden_dim,
+            1,
+            depth=3,
+        ),
+        "observation_mean": mean,
+        "observation_std": std,
+    }
+
+
 def init_world_model(config: DreamerConfig, key: Array) -> Params:
     """Initialize all recurrent world-model parameters."""
 
@@ -840,6 +890,68 @@ def predict_action_reward_residual(
     return mlp(params["reward_action_residual"], inputs)[..., 0]
 
 
+def predict_direct_transition_reward(
+    params: Params,
+    previous_feature: Array,
+    action: Array,
+    next_feature: Array,
+    config: DreamerConfig,
+) -> Array:
+    """Predict the complete reward from the current decoded state and action.
+
+    This preserves the published causal ordering ``r(s_t, a_t)``: the reward
+    at step ``t`` cannot depend on the sampled ``s_{t+1}``.  Gradients remain
+    available through the action and through the frozen decoder into the
+    current latent state.
+    """
+
+    leading = next_feature.shape[:-1]
+    if previous_feature.shape != next_feature.shape:
+        raise ValueError("previous_feature and next_feature must have identical shape")
+    if next_feature.shape[-1] != config.feature_dim:
+        raise ValueError("transition features have the wrong final dimension")
+    if action.shape != (*leading, config.action_dim):
+        raise ValueError("transition action has the wrong shape")
+    if "reward_transition" not in params:
+        raise ValueError("state-action reward head is not attached")
+    observation = decode(params, previous_feature, config)
+    return predict_state_action_reward_from_observation(
+        params["reward_transition"], observation, action, config
+    )
+
+
+def predict_state_action_reward_from_observation(
+    reward_params: Params,
+    observation: Array,
+    action: Array,
+    config: DreamerConfig,
+) -> Array:
+    """Evaluate a frozen-statistics state-action reward head on observations."""
+
+    expected_ndim = 1 + len(config.observation_shape)
+    if observation.ndim < expected_ndim or observation.shape[
+        -len(config.observation_shape) :
+    ] != config.observation_shape:
+        raise ValueError("reward observation has the wrong trailing shape")
+    leading = observation.shape[: -len(config.observation_shape)]
+    if action.shape != (*leading, config.action_dim):
+        raise ValueError("reward action has the wrong shape")
+    if set(reward_params) != {"network", "observation_mean", "observation_std"}:
+        raise ValueError("state-action reward head structure is invalid")
+    mean = jax.lax.stop_gradient(reward_params["observation_mean"])
+    std = jax.lax.stop_gradient(reward_params["observation_std"])
+    if mean.shape != (config.observation_dim,) or std.shape != (
+        config.observation_dim,
+    ):
+        raise ValueError("reward observation statistics have the wrong shape")
+    flat = preprocess_observation(observation).reshape(
+        (*leading, config.observation_dim)
+    )
+    normalized = (flat - mean) / jnp.maximum(std, 1e-6)
+    inputs = jnp.concatenate((normalized, action), axis=-1)
+    return mlp(reward_params["network"], inputs, activation=jax.nn.relu)[..., 0]
+
+
 def predict_transition_reward(
     params: Params,
     previous_feature: Array,
@@ -847,7 +959,16 @@ def predict_transition_reward(
     next_feature: Array,
     config: DreamerConfig,
 ) -> Array:
-    """Compose the calibrated base reward with an optional causal residual."""
+    """Predict transition reward with an explicit backwards-compatible order.
+
+    A direct state-action head replaces the legacy state-only decoder. Without
+    it, existing checkpoints retain their exact base-plus-residual behavior.
+    """
+
+    if "reward_transition" in params:
+        return predict_direct_transition_reward(
+            params, previous_feature, action, next_feature, config
+        )
 
     return predict_reward(params, next_feature, config) + predict_action_reward_residual(
         params, previous_feature, action, next_feature, config

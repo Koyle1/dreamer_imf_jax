@@ -609,6 +609,7 @@ def resolved_config(
         reward_bins=1,
         reward_symlog_min=-20.0,
         reward_symlog_max=20.0,
+        return_scale_ema_decay=0.99,
     )
     common["overshooting_distances"] = tuple(common["overshooting_distances"])
     common.update(protocol["profiles"][profile]["model_overrides"])

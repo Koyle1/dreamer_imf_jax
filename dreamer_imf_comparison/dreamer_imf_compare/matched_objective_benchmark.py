@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import asdict, replace
 from functools import partial
 import hashlib
+import importlib.metadata
 import json
 import math
 import multiprocessing
@@ -514,6 +515,8 @@ def _source_files(root: Path) -> list[str]:
         "dreamer_imf_comparison/dreamer_imf_compare/causal_reacher_study.py",
         "dreamer_imf_comparison/dreamer_imf_compare/pixel_benchmark.py",
         "dreamer_imf_comparison/dreamer_imf_compare/policy_alignment_diagnostics.py",
+        "dreamer_imf_comparison/dreamer_imf_compare/flowmpc_actor_study.py",
+        "dreamer_imf_comparison/dreamer_imf_compare/actor_gap*.py",
         "dreamer_imf_comparison/scripts/*causal*.py",
         "dreamer_imf_comparison/scripts/verify_causal_consistency.sh",
         "dreamer_imf_comparison/scripts/*matched_objective*.py",
@@ -521,6 +524,7 @@ def _source_files(root: Path) -> list[str]:
         "dreamer_imf_comparison/scripts/*pixel*.py",
         "dreamer_imf_comparison/scripts/*pendulum*.sh",
         "dreamer_imf_comparison/scripts/*policy_alignment*.py",
+        "dreamer_imf_comparison/scripts/*actor_gap*.py",
         "dreamer_imf_comparison/scripts/*reacher_imf_small*.sh",
         "dreamer_imf_comparison/scripts/verify_smoke_idempotence.py",
         "dreamer_imf_comparison/scripts/*trajectory_imf*.py",
@@ -530,10 +534,16 @@ def _source_files(root: Path) -> list[str]:
         "dreamer_imf_comparison/cluster/neurips/**/*.sh",
         "dreamer_imf_comparison/cluster/neurips/**/*.sbatch",
         "dreamer_imf_comparison/cluster/neurips/**/*.json",
+        "dreamer_imf_comparison/cluster/actor_gap_roadmap/**/*.py",
+        "dreamer_imf_comparison/cluster/actor_gap_roadmap/**/*.sh",
+        "dreamer_imf_comparison/cluster/actor_gap_roadmap/**/*.sbatch",
+        "dreamer_imf_comparison/cluster/actor_gap_roadmap/**/*.json",
+        "dreamer_imf_comparison/ACTOR_GAP_ROADMAP_STUDY.md",
         "dreamer_imf_comparison/tests/test_matched_objective*.py",
         "dreamer_imf_comparison/tests/test_neurips_*.py",
         "dreamer_imf_comparison/tests/test_pixel*.py",
         "dreamer_imf_comparison/tests/test_policy_alignment*.py",
+        "dreamer_imf_comparison/tests/test_actor_gap*.py",
         "dreamer_imf_comparison/tests/test_causal_reacher*.py",
         "dreamer_imf_comparison/tests/test_trajectory_imf*.py",
         "dreamer_imf_comparison/tests/test_rollout_replay_validation.py",
@@ -1994,6 +2004,19 @@ def _selected_overrides(
     return _validate_candidate(protocol, arm, candidate_value)
 
 
+_POST_PILOT_RUNTIME_DEFAULTS = {
+    "imf_causal_consistency_scale": 0.0,
+    "imf_causal_reward_scale": 1.0,
+    "imf_causal_huber_delta": 1.0,
+    "imf_causal_normalization_epsilon": 1e-3,
+    "reward_prediction_horizon": 0,
+    "reward_bins": 1,
+    "reward_symlog_min": -20.0,
+    "reward_symlog_max": 20.0,
+    "return_scale_ema_decay": 0.99,
+}
+
+
 def make_config(
     protocol: Mapping[str, Any],
     profile: str,
@@ -2022,16 +2045,7 @@ def make_config(
     # These fields were added after the matched-objective protocol was frozen.
     # Resolve them explicitly to a no-op rather than changing that protocol's
     # identity or silently relying on future library defaults.
-    common.update(
-        imf_causal_consistency_scale=0.0,
-        imf_causal_reward_scale=1.0,
-        imf_causal_huber_delta=1.0,
-        imf_causal_normalization_epsilon=1e-3,
-        reward_prediction_horizon=0,
-        reward_bins=1,
-        reward_symlog_min=-20.0,
-        reward_symlog_max=20.0,
-    )
+    common.update(_POST_PILOT_RUNTIME_DEFAULTS)
     common["overshooting_distances"] = tuple(common["overshooting_distances"])
     common["observation_shape"] = tuple(int(value) for value in observation_shape)
     common["action_dim"] = int(action_dim)
@@ -2067,6 +2081,29 @@ def make_config(
             f"extra={sorted(set(common) - expected_fields)}"
         )
     return DreamerConfig(**common)
+
+
+def runtime_config_matches_frozen_protocol(
+    recorded: Mapping[str, Any], expected: Any
+) -> bool:
+    """Compare configs while admitting exactly one registered legacy omission.
+
+    The authenticated pilot predates the registered fields in
+    ``_POST_PILOT_RUNTIME_DEFAULTS``. Old JSON runtime configs omit them, while
+    old pickled ``DreamerConfig`` objects resolve dataclass defaults after
+    loading. No value difference and no other missing or extra field is
+    accepted.
+    """
+
+    expected_payload = asdict(expected)
+    if canonical_bytes(recorded) == canonical_bytes(expected_payload):
+        return True
+    legacy_payload = dict(expected_payload)
+    for name, value in _POST_PILOT_RUNTIME_DEFAULTS.items():
+        if expected_payload.get(name) != value:
+            return False
+        legacy_payload.pop(name)
+    return canonical_bytes(recorded) == canonical_bytes(legacy_payload)
 
 
 def _dummy_batch(config: Any, profile: str) -> dict[str, Any]:
@@ -2323,10 +2360,36 @@ def runtime_fingerprint() -> dict[str, Any]:
 
     devices = jax.devices()
     client = devices[0].client if devices else None
+    python_executable = Path(sys.executable).resolve(strict=True)
+    installed_distributions = sorted(
+        (
+            str(distribution.metadata.get("Name") or "").strip().lower(),
+            str(distribution.version),
+        )
+        for distribution in importlib.metadata.distributions()
+        if str(distribution.metadata.get("Name") or "").strip()
+    )
+
+    def distribution_version(name: str) -> str:
+        try:
+            return importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            return "unavailable"
+
     return {
         "python": platform.python_version(),
+        "python_executable": str(python_executable),
+        "python_executable_sha256": file_sha256(python_executable),
+        "platform_system": platform.system(),
+        "platform_release": platform.release(),
+        "platform_machine": platform.machine(),
+        "numpy_version": np.__version__,
         "jax_version": jax.__version__,
         "jaxlib_version": jaxlib.__version__,
+        "dm_control_version": distribution_version("dm-control"),
+        "mujoco_version": distribution_version("mujoco"),
+        "environment_package_count": len(installed_distributions),
+        "environment_packages_sha256": object_sha256(installed_distributions),
         "backend": jax.default_backend(),
         "device_platforms": [str(device.platform) for device in devices],
         "device_kinds": [str(device.device_kind) for device in devices],
@@ -2357,7 +2420,7 @@ def runtime_fingerprint() -> dict[str, Any]:
 def runtime_homogeneity_identity(runtime: Mapping[str, Any]) -> dict[str, Any]:
     """Fields that must match across cells, excluding scheduler-assigned ordinals."""
 
-    fields = (
+    legacy_fields = (
         "python",
         "jax_version",
         "jaxlib_version",
@@ -2374,8 +2437,28 @@ def runtime_homogeneity_identity(runtime: Mapping[str, Any]) -> dict[str, Any]:
         "jax_persistent_cache_enable_xla_caches",
         "jax_raise_persistent_cache_errors",
     )
-    if any(field not in runtime for field in fields):
+    environment_fields = (
+        "python_executable",
+        "python_executable_sha256",
+        "platform_system",
+        "platform_release",
+        "platform_machine",
+        "numpy_version",
+        "dm_control_version",
+        "mujoco_version",
+        "environment_package_count",
+        "environment_packages_sha256",
+    )
+    if any(field not in runtime for field in legacy_fields):
         raise ValueError("runtime homogeneity fingerprint is incomplete")
+    present_environment_fields = sum(
+        field in runtime for field in environment_fields
+    )
+    if present_environment_fields not in (0, len(environment_fields)):
+        raise ValueError("extended runtime environment fingerprint is incomplete")
+    fields = legacy_fields + (
+        environment_fields if present_environment_fields else ()
+    )
     return {field: runtime[field] for field in fields}
 
 
@@ -2943,7 +3026,7 @@ def validate_compute_plan_cell(
             output_root=output_root,
             candidate=candidates.get(arm),
         )
-        if object_sha256(runtime) != object_sha256(asdict(expected)):
+        if not runtime_config_matches_frozen_protocol(runtime, expected):
             raise ValueError("compute-plan resolved runtime config differs from the frozen arm")
     if not rederive_compiler_evidence:
         return
@@ -4116,7 +4199,7 @@ def validate_world_result(
             output_root=output_root,
             candidate=_candidate_for_cell(matrix, cell),
         )
-        if object_sha256(runtime) != object_sha256(asdict(expected)):
+        if not runtime_config_matches_frozen_protocol(runtime, expected):
             raise ValueError("world-model runtime config differs from its frozen matrix arm")
         import jax
         from imf_dreamer_jax import create_agent, load_checkpoint
@@ -4141,7 +4224,7 @@ def validate_world_result(
             raise ValueError("world-model shared initialization evidence mismatch")
 
         state, stored_config, metadata = load_checkpoint(root / "checkpoint.pkl")
-        if object_sha256(asdict(stored_config)) != object_sha256(asdict(expected)):
+        if not runtime_config_matches_frozen_protocol(asdict(stored_config), expected):
             raise ValueError("world-model checkpoint config mismatch")
         if (
             metadata.get("stage") != "world_model"
@@ -4911,11 +4994,12 @@ def validate_rollout_result(
             output_root=root,
             candidate=_candidate_for_cell(matrix, cell),
         )
-        config_payload = asdict(config)
         if (
-            result.get("runtime_config_sha256") != object_sha256(config_payload)
-            or canonical_bytes(result.get("runtime_config"))
-            != canonical_bytes(config_payload)
+            result.get("runtime_config_sha256")
+            != object_sha256(result.get("runtime_config"))
+            or not runtime_config_matches_frozen_protocol(
+                result.get("runtime_config"), config
+            )
         ):
             raise ValueError("rollout runtime config differs from its canonical NFE cell")
         if result.get("inference_replay_comparison") != _rollout_replay_comparison_contract():
@@ -5457,7 +5541,7 @@ def validate_actor_result(
             ),
         )
         if (
-            object_sha256(asdict(actor_config)) != object_sha256(asdict(expected))
+            not runtime_config_matches_frozen_protocol(asdict(actor_config), expected)
             or metadata.get("cell_id") != cell["cell_id"]
             or metadata.get("completed_updates") != result.get("updates")
             or int(np.asarray(actor_state.actor_optimizer.step)) != expected_updates

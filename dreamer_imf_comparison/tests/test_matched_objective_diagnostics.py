@@ -47,8 +47,18 @@ class MatchedObjectiveDiagnosticTests(unittest.TestCase):
         }
         cls.runtime = {
             "python": "3.12.0",
+            "python_executable": "/frozen/venv/bin/python",
+            "python_executable_sha256": "a" * 64,
+            "platform_system": "Linux",
+            "platform_release": "test-kernel",
+            "platform_machine": "x86_64",
+            "numpy_version": "test",
             "jax_version": "test",
             "jaxlib_version": "test",
+            "dm_control_version": "test",
+            "mujoco_version": "test",
+            "environment_package_count": 5,
+            "environment_packages_sha256": "b" * 64,
             "backend": "cpu",
             "device_platforms": ["cpu"],
             "device_kinds": ["test-cpu"],
