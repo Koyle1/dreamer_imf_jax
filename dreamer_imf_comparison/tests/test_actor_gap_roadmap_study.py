@@ -594,15 +594,13 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
         raw = (
             "JobId=125 ArrayJobId=123 ArrayTaskId=0 JobState=RUNNING "
             f"BatchHost={node} Account=dep_inin_dat Partition=gpu-l40s "
-            "AllocTRES=cpu=8,mem=64G,node=1,gres/gpu:l40s=1 "
-            "TresPerNode=gres:gpu:1 Gres=gpu:l40s:1(IDX:0)"
+            "AllocTRES=cpu=8,mem=64G,node=1,gres/gpu=1,gres/gpu:l40s=1 "
+            "TresPerNode=gres/gpu:1"
         )
         environment = {
-            "SLURM_JOB_GPUS": "3",
-            "SLURM_STEP_GPUS": "3",
             "CUDA_VISIBLE_DEVICES": "0",
         }
-        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
+        with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
             study.subprocess, "check_output", return_value=raw
         ):
             certificate = study._slurm_allocation_certificate(
@@ -618,10 +616,26 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
         self.assertEqual(validated, certificate)
         self.assertEqual(certificate["raw_record"], raw)
         self.assertEqual(certificate["canonical_record"]["ArrayTaskId"], "0")
+        self.assertEqual(certificate["slurm_job_gpus"], "")
+        self.assertEqual(certificate["slurm_step_gpus"], "")
         self.assertEqual(
             certificate["canonical_record_sha256"],
             study.benchmark.object_sha256(certificate["canonical_record"]),
         )
+        with mock.patch.dict(
+            os.environ,
+            {
+                **environment,
+                "SLURM_JOB_GPUS": "3",
+                "SLURM_STEP_GPUS": "3",
+            },
+            clear=True,
+        ), mock.patch.object(study.subprocess, "check_output", return_value=raw):
+            hinted = study._slurm_allocation_certificate(
+                "125", array_job_id="123", array_task_id=0
+            )
+        self.assertEqual(hinted["slurm_job_gpus"], "3")
+        self.assertEqual(hinted["slurm_step_gpus"], "3")
         tampered = {**certificate, "array_task_id": 1}
         tampered["certificate_sha256"] = study._unsigned_digest(
             tampered, "certificate_sha256"
@@ -634,6 +648,41 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
                 array_job_id="123",
                 array_task_id=0,
             )
+        malformed_allocations = (
+            raw.replace("gres/gpu=1,", "gres/gpu=2,"),
+            raw.replace("gres/gpu=1,", ""),
+            raw.replace("gres/gpu:l40s=1", "gres/gpu:a100=1"),
+            raw.replace("TresPerNode=gres/gpu:1", "TresPerNode=gres/gpu:2"),
+            raw.replace("cpu=8", "cpu=7"),
+            raw.replace("mem=64G", "mem=32G"),
+            raw.replace("node=1", "node=2"),
+        )
+        for malformed in malformed_allocations:
+            with self.subTest(malformed=malformed), mock.patch.dict(
+                os.environ, environment, clear=True
+            ), mock.patch.object(
+                study.subprocess, "check_output", return_value=malformed
+            ), self.assertRaisesRegex(
+                ValueError, "one-GPU"
+            ):
+                study._slurm_allocation_certificate(
+                    "125", array_job_id="123", array_task_id=0
+                )
+        for variable in (
+            "SLURM_JOB_GPUS",
+            "SLURM_STEP_GPUS",
+            "CUDA_VISIBLE_DEVICES",
+        ):
+            with self.subTest(variable=variable), mock.patch.dict(
+                os.environ, {**environment, variable: "0,1"}, clear=True
+            ), mock.patch.object(
+                study.subprocess, "check_output", return_value=raw
+            ), self.assertRaisesRegex(
+                ValueError, "one-GPU"
+            ):
+                study._slurm_allocation_certificate(
+                    "125", array_job_id="123", array_task_id=0
+                )
         tampered_raw = {
             **certificate,
             "raw_record": raw.replace("Account=dep_inin_dat", "Account=other"),
@@ -647,6 +696,37 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "allocation certificate"):
             study._validate_slurm_allocation_certificate(
                 tampered_raw,
+                job_id="125",
+                node_name=node,
+                array_job_id="123",
+                array_task_id=0,
+            )
+        multi_gpu_raw = raw.replace(
+            "gres/gpu=1,gres/gpu:l40s=1",
+            "gres/gpu=2,gres/gpu:l40s=1",
+        ).replace("TresPerNode=gres/gpu:1", "TresPerNode=gres/gpu:2")
+        forged_multi_gpu = {
+            **certificate,
+            "raw_record": multi_gpu_raw,
+            "alloc_tres": certificate["alloc_tres"].replace(
+                "gres/gpu=1,gres/gpu:l40s=1",
+                "gres/gpu=2,gres/gpu:l40s=1",
+            ),
+            "tres_per_node": "gres/gpu:2",
+            "canonical_record": study._parse_scontrol_record(multi_gpu_raw),
+        }
+        forged_multi_gpu["raw_record_sha256"] = study.benchmark.object_sha256(
+            forged_multi_gpu["raw_record"]
+        )
+        forged_multi_gpu["canonical_record_sha256"] = study.benchmark.object_sha256(
+            forged_multi_gpu["canonical_record"]
+        )
+        forged_multi_gpu["certificate_sha256"] = study._unsigned_digest(
+            forged_multi_gpu, "certificate_sha256"
+        )
+        with self.assertRaisesRegex(ValueError, "allocation certificate"):
+            study._validate_slurm_allocation_certificate(
+                forged_multi_gpu,
                 job_id="125",
                 node_name=node,
                 array_job_id="123",
@@ -670,6 +750,18 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
         self.assertEqual(study._require_single_gpu_runtime(runtime), runtime)
         with self.assertRaisesRegex(ValueError, "one-GPU/compiler"):
             study._require_single_gpu_runtime({**runtime, "backend": "cpu"})
+        with self.assertRaisesRegex(ValueError, "one-GPU/compiler"):
+            study._require_single_gpu_runtime(
+                {
+                    **runtime,
+                    "device_platforms": ["gpu", "gpu"],
+                    "device_kinds": ["NVIDIA L40S", "NVIDIA L40S"],
+                    "visible_device_count": 2,
+                    "cuda_visible_devices": "0,1",
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "one-GPU/compiler"):
+            study._require_single_gpu_runtime({**runtime, "cuda_visible_devices": None})
         creation = {
             "node_name": "gpu01",
             "boot_id": "boot-a",

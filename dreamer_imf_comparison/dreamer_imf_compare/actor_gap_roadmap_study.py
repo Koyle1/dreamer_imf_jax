@@ -19,7 +19,6 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import pickle
-import re
 import subprocess
 import tempfile
 import time
@@ -41,7 +40,7 @@ PREFLIGHT_MARKER_SCHEMA = "trajectory-imf-actor-gap-preflight-marker-v1"
 PREFLIGHT_GATE_SCHEMA = "trajectory-imf-actor-gap-preflight-gate-v1"
 SUBMISSION_MAP_SCHEMA = "trajectory-imf-actor-gap-submission-map-v1"
 SUBMISSION_RECORD_SCHEMA = "trajectory-imf-actor-gap-slurm-submission-record-v1"
-SLURM_ALLOCATION_SCHEMA = "trajectory-imf-actor-gap-slurm-allocation-v1"
+SLURM_ALLOCATION_SCHEMA = "trajectory-imf-actor-gap-slurm-allocation-v2"
 STAGE_MARKER_SCHEMA = "trajectory-imf-actor-gap-stage-marker-v1"
 REPORT_SCHEMA = "trajectory-imf-actor-gap-report-v1"
 CHECKPOINT_VERSION = 1
@@ -1448,6 +1447,33 @@ def _parse_scontrol_record(line: str) -> dict[str, str]:
     return fields
 
 
+def _is_single_l40s_allocation(alloc_tres: str, tres_per_node: str) -> bool:
+    """Validate the GPU count from Slurm's allocation, not optional env hints."""
+
+    entries: dict[str, str] = {}
+    for token in alloc_tres.split(","):
+        if "=" not in token:
+            return False
+        key, value = token.split("=", 1)
+        if not key or key in entries:
+            return False
+        entries[key] = value
+    gpu_entries = {
+        key: value
+        for key, value in entries.items()
+        if key == "gres/gpu" or key.startswith("gres/gpu:")
+    }
+    return (
+        entries.get("cpu") == "8"
+        and entries.get("mem") == "64G"
+        and entries.get("node") == "1"
+        and entries.get("gres/gpu") == "1"
+        and entries.get("gres/gpu:l40s") == "1"
+        and all(value == "1" for value in gpu_entries.values())
+        and tres_per_node == "gres/gpu:1"
+    )
+
+
 def _slurm_allocation_certificate(
     job_id: str,
     *,
@@ -1479,14 +1505,14 @@ def _slurm_allocation_certificate(
     step_gpus = str(os.environ.get("SLURM_STEP_GPUS") or "")
     cuda_selector = str(os.environ.get("CUDA_VISIBLE_DEVICES") or "")
     alloc_tres = str(record.get("AllocTRES") or "")
+    tres_per_node = str(record.get("TresPerNode") or "")
     if (
         record.get("JobState") != "RUNNING"
         or record.get("BatchHost") != os.uname().nodename
         or record.get("Account") != "dep_inin_dat"
         or record.get("Partition") != "gpu-l40s"
-        or re.search(r"(?:^|,)gres/gpu(?::[^=,]+)?=1(?:,|$)", alloc_tres) is None
-        or not job_gpus
-        or "," in job_gpus
+        or not _is_single_l40s_allocation(alloc_tres, tres_per_node)
+        or (job_gpus and "," in job_gpus)
         or (step_gpus and "," in step_gpus)
         or not cuda_selector
         or "," in cuda_selector
@@ -1503,7 +1529,7 @@ def _slurm_allocation_certificate(
         "account": record["Account"],
         "partition": record["Partition"],
         "alloc_tres": alloc_tres,
-        "tres_per_node": str(record.get("TresPerNode") or ""),
+        "tres_per_node": tres_per_node,
         "gres": str(record.get("Gres") or ""),
         "slurm_job_gpus": job_gpus,
         "slurm_step_gpus": step_gpus,
@@ -1604,13 +1630,14 @@ def _validate_slurm_allocation_certificate(
         or canonical.get("alloc_tres") != str(record.get("AllocTRES") or "")
         or canonical.get("tres_per_node") != str(record.get("TresPerNode") or "")
         or canonical.get("gres") != str(record.get("Gres") or "")
-        or re.search(
-            r"(?:^|,)gres/gpu(?::[^=,]+)?=1(?:,|$)",
+        or not _is_single_l40s_allocation(
             str(canonical.get("alloc_tres") or ""),
+            str(canonical.get("tres_per_node") or ""),
         )
-        is None
-        or not str(canonical.get("slurm_job_gpus") or "")
-        or "," in str(canonical.get("slurm_job_gpus"))
+        or (
+            bool(canonical.get("slurm_job_gpus"))
+            and "," in str(canonical.get("slurm_job_gpus"))
+        )
         or (
             bool(canonical.get("slurm_step_gpus"))
             and "," in str(canonical.get("slurm_step_gpus"))
