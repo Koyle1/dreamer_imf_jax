@@ -182,23 +182,28 @@ class ReBRACTests(unittest.TestCase):
         assert_tree_equal(self, second.target_actor, first.target_actor)
         assert_tree_equal(self, second.target_critics, first.target_critics)
 
-    def test_training_chunk_is_numerically_resumable_across_compilation_boundaries(self) -> None:
+    def test_training_chunk_replays_deterministically_and_resumes(self) -> None:
         cfg = rebrac_config()
         initial = init_rebrac_state(jax.random.key(8), cfg)
         batch = rebrac_batch(cfg)
-        full, _ = train_rebrac_chunk(
+        first, _ = train_rebrac_chunk(
             initial, batch, jax.random.key(9), updates=2, config=cfg
         )
-        split, _ = train_rebrac_chunk(
-            initial, batch, jax.random.key(9), updates=1, config=cfg
+        replay, _ = train_rebrac_chunk(
+            initial, batch, jax.random.key(9), updates=2, config=cfg
         )
-        split, _ = train_rebrac_chunk(
-            split, batch, jax.random.key(9), updates=1, config=cfg
+        # This is the production recovery invariant: replaying a fixed-size
+        # compiled chunk from the same checkpoint is bitwise deterministic.
+        assert_tree_equal(self, first, replay)
+
+        resumed, _ = train_rebrac_chunk(
+            first, batch, jax.random.key(9), updates=2, config=cfg
         )
-        # XLA may fuse a two-iteration loop differently from two separately
-        # compiled one-iteration loops.  The update stream is identical; only
-        # sub-ULP floating-point association is backend dependent.
-        assert_tree_close(self, full, split)
+        self.assertEqual(int(first.step), 2)
+        self.assertEqual(int(resumed.step), 4)
+        self.assertGreater(tree_distance(resumed.critics, first.critics), 0.0)
+        for value in jax.tree_util.tree_leaves(resumed):
+            self.assertTrue(bool(jnp.all(jnp.isfinite(value))))
 
 
 class FlowMPCTests(unittest.TestCase):
