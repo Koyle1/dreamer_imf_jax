@@ -14,6 +14,96 @@ from dreamer_imf_compare.artifacts import write_json_atomic
 
 
 class ActorGapRoadmapStudyTests(unittest.TestCase):
+    def test_live_a0_context_rejects_one_ulp_action_drift(self) -> None:
+        action = np.asarray([0.5, -0.25], dtype=np.float32)
+        trace = {"actions": action[None, None]}
+        context = {
+            "step": 0,
+            "world_model_seed": 211,
+            "actor_seed": 311,
+            "evaluation_seed": 401,
+            "host_action": action.copy(),
+        }
+        selected = study._validated_a0_noise_contexts(
+            trace,
+            [context],
+            [0],
+            world_seed=211,
+            actor_seed=311,
+            evaluation_seed=401,
+        )
+        self.assertIs(selected[0][1], context)
+
+        changed = dict(context)
+        changed_action = action.copy()
+        changed_action[0] = np.nextafter(changed_action[0], np.float32(np.inf))
+        changed["host_action"] = changed_action
+        with self.assertRaisesRegex(ValueError, r"step 0: max_abs="):
+            study._validated_a0_noise_contexts(
+                trace,
+                [changed],
+                [0],
+                world_seed=211,
+                actor_seed=311,
+                evaluation_seed=401,
+            )
+
+    def test_live_a0_context_rejects_missing_duplicate_or_wrong_identity(self) -> None:
+        trace = {"actions": np.zeros((1, 2, 2), dtype=np.float32)}
+        context = {
+            "step": 0,
+            "world_model_seed": 211,
+            "actor_seed": 311,
+            "evaluation_seed": 401,
+            "host_action": np.zeros((2,), dtype=np.float32),
+        }
+        with self.assertRaisesRegex(ValueError, "duplicates step 0"):
+            study._validated_a0_noise_contexts(
+                trace,
+                [context, dict(context)],
+                [0],
+                world_seed=211,
+                actor_seed=311,
+                evaluation_seed=401,
+            )
+        with self.assertRaisesRegex(ValueError, "missing step 1"):
+            study._validated_a0_noise_contexts(
+                trace,
+                [context],
+                [1],
+                world_seed=211,
+                actor_seed=311,
+                evaluation_seed=401,
+            )
+        with self.assertRaisesRegex(ValueError, "identity differs at step 0"):
+            study._validated_a0_noise_contexts(
+                trace,
+                [context],
+                [0],
+                world_seed=223,
+                actor_seed=311,
+                evaluation_seed=401,
+            )
+
+    def test_diagnostics_consume_ephemeral_live_a0_contexts(self) -> None:
+        for diagnostic in (
+            study._one_step_prediction_rows,
+            study._independent_noise_result,
+            study._exact_counterfactual_result,
+        ):
+            source = inspect.getsource(diagnostic)
+            self.assertNotIn("observe_step(", source)
+        independent = inspect.getsource(study._independent_noise_result)
+        self.assertNotIn("jit_flowmpc_adapt_actor", independent)
+        self.assertIn("captured_during_exact_live_a0_rollout", independent)
+
+        compute = inspect.getsource(study._compute_diagnostic_cell)
+        capture = compute.index("diagnostic_capture=a0_capture")
+        bridge = compute.index("_assert_trace_subset_close", capture)
+        diagnostics = compute.index("_independent_noise_result", bridge)
+        self.assertLess(capture, bridge)
+        self.assertLess(bridge, diagnostics)
+
     def test_diagnostic_strict_replay_discards_first_full_execution(self) -> None:
         first = ({"execution": 1}, {"trace": np.asarray([1])})
         second = ({"execution": 2}, {"trace": np.asarray([2])})

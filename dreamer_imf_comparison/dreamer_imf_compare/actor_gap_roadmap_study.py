@@ -2985,6 +2985,7 @@ def _one_step_prediction_rows(
     observations: np.ndarray,
     next_observations: np.ndarray,
     trace: Mapping[str, np.ndarray],
+    a0_beliefs: Sequence[Sequence[Any]],
     *,
     world_seed: int,
     actor_seed: int,
@@ -2997,8 +2998,6 @@ def _one_step_prediction_rows(
     from imf_dreamer_jax import (
         RSSMState,
         decode,
-        initial_state,
-        observe_step,
         rebrac_actor,
         rebrac_critics,
         sample_prior,
@@ -3029,28 +3028,12 @@ def _one_step_prediction_rows(
     output_target_continuations: list[float] = []
     horizon_rows: list[tuple[int, float, float, float]] = []
 
+    if len(a0_beliefs) != len(lengths):
+        raise ValueError("captured A0 belief episodes do not match the trace")
     for episode in range(len(lengths)):
-        belief = initial_state(dreamer_config, 1)
-        previous_action = jnp.zeros((1, dreamer_config.action_dim), jnp.float32)
-        posterior_key = benchmark.derive_jax_key(
-            "flowmpc-posterior",
-            TASK,
-            world_seed,
-            actor_seed,
-            int(np.asarray(trace["evaluation_seeds"])[episode]),
-        )
-        beliefs: list[Any] = []
-        for step in range(int(lengths[episode])):
-            belief = observe_step(
-                world_model,
-                jnp.asarray(observations[episode, step][None]),
-                previous_action,
-                belief,
-                jax.random.fold_in(posterior_key, step),
-                dreamer_config,
-            )[0]
-            beliefs.append(belief)
-            previous_action = jnp.asarray(actions[episode, step][None])
+        beliefs = list(a0_beliefs[episode])
+        if len(beliefs) != int(lengths[episode]):
+            raise ValueError("captured A0 beliefs do not match the episode length")
 
         for step, belief in enumerate(beliefs):
             if (episode, step) not in selected_set:
@@ -3321,26 +3304,71 @@ def _imagined_action_sequence_points(
     return jnp.stack(observation_rows, axis=2), jnp.stack(action_rows, axis=2)
 
 
+def _validated_a0_noise_contexts(
+    trace: Mapping[str, np.ndarray],
+    contexts: Sequence[Mapping[str, Any]],
+    chosen_steps: Sequence[int],
+    *,
+    world_seed: int,
+    actor_seed: int,
+    evaluation_seed: int,
+) -> list[tuple[int, Mapping[str, Any]]]:
+    """Bind ephemeral live controller contexts to exact retained A0 actions."""
+
+    contexts_by_step: dict[int, Mapping[str, Any]] = {}
+    for context in contexts:
+        step = int(context.get("step", -1))
+        if step in contexts_by_step:
+            raise ValueError(f"captured A0 context duplicates step {step}")
+        contexts_by_step[step] = context
+    selected: list[tuple[int, Mapping[str, Any]]] = []
+    for step_value in chosen_steps:
+        step = int(step_value)
+        if step not in contexts_by_step:
+            raise ValueError(f"captured A0 context is missing step {step}")
+        context = contexts_by_step[step]
+        if (
+            int(context.get("world_model_seed", -1)) != world_seed
+            or int(context.get("actor_seed", -1)) != actor_seed
+            or int(context.get("evaluation_seed", -1)) != evaluation_seed
+        ):
+            raise ValueError(f"captured A0 context identity differs at step {step}")
+        retained_action = np.asarray(trace["actions"][0, step], dtype=np.float32)
+        live_action = np.asarray(context["host_action"], dtype=np.float32)
+        if not np.array_equal(live_action, retained_action):
+            maximum = (
+                float(
+                    np.max(
+                        np.abs(
+                            live_action.astype(np.float64)
+                            - retained_action.astype(np.float64)
+                        )
+                    )
+                )
+                if live_action.shape == retained_action.shape and live_action.size
+                else math.inf
+            )
+            raise ValueError(
+                "captured persistent FlowMPC action differs from A0 trace at "
+                f"step {step}: max_abs={maximum}"
+            )
+        selected.append((step, context))
+    return selected
+
+
 def _independent_noise_result(
     world_model: Any,
     dreamer_config: Any,
     rebrac_state: Any,
     rebrac_config: Any,
-    observations: np.ndarray,
     trace: Mapping[str, np.ndarray],
+    a0_contexts: Sequence[Mapping[str, Any]],
     *,
     world_seed: int,
     actor_seed: int,
 ) -> dict[str, Any]:
     import jax
-    import jax.numpy as jnp
-    from imf_dreamer_jax import (
-        initial_state,
-        jit_flowmpc_adapt_actor,
-        jit_flowmpc_objective,
-        observe_step,
-        rebrac_actor,
-    )
+    from imf_dreamer_jax import jit_flowmpc_objective
     from .actor_gap_diagnostics import independent_noise_diagnostics
 
     config = _flowmpc_config(rebrac_config)
@@ -3354,12 +3382,7 @@ def _independent_noise_result(
         sorted({min(step, length - 1) for step in (0, 1, 5, 15)}),
         dtype=np.int64,
     )
-    belief = initial_state(dreamer_config, 1)
-    previous_action = jnp.zeros((1, dreamer_config.action_dim), jnp.float32)
     evaluation_seed = int(np.asarray(trace["evaluation_seeds"])[0])
-    posterior_key = benchmark.derive_jax_key(
-        "flowmpc-posterior", TASK, world_seed, actor_seed, evaluation_seed
-    )
     proposal_key = benchmark.derive_jax_key(
         "flowmpc-noise", TASK, world_seed, actor_seed, evaluation_seed
     )
@@ -3370,61 +3393,41 @@ def _independent_noise_result(
         actor_seed,
         evaluation_seed,
     )
-    persistent_actor = rebrac_state.actor
-    actor_function = jax.jit(rebrac_actor)
     proposal_objectives: list[float] = []
     heldout_objectives: list[float] = []
     proposal_gradients: list[np.ndarray] = []
     heldout_gradients: list[np.ndarray] = []
     proposal_ids: list[str] = []
     heldout_ids: list[str] = []
-    chosen_set = set(int(value) for value in chosen)
-    for step in range(length):
-        current = jnp.asarray(observations[0, step][None])
-        belief = observe_step(
-            world_model,
-            current,
-            previous_action,
-            belief,
-            jax.random.fold_in(posterior_key, step),
-            dreamer_config,
-        )[0]
+    context_rows: list[dict[str, Any]] = []
+    selected_contexts = _validated_a0_noise_contexts(
+        trace,
+        a0_contexts,
+        chosen,
+        world_seed=world_seed,
+        actor_seed=actor_seed,
+        evaluation_seed=evaluation_seed,
+    )
+    for step, context in selected_contexts:
+        belief = context["belief"]
+        current = context["current_observation"]
+        adaptation_start = context["adaptation_start_actor"]
+        updated_actor = context["updated_actor"]
+        proposal_noise = context["proposal_noise"]
         shape = (
             config.particles,
             config.horizon,
             dreamer_config.stochastic_dim,
         )
-        proposal_noise = jax.random.normal(
+        regenerated_proposal_noise = jax.random.normal(
             jax.random.fold_in(proposal_key, step), shape
         )
-        heldout_noise = jax.random.normal(jax.random.fold_in(heldout_key, step), shape)
-        adaptation_start = persistent_actor
-        update = jit_flowmpc_adapt_actor(
-            adaptation_start,
-            rebrac_state.critics,
-            world_model,
-            belief,
-            current,
-            proposal_noise,
-            dreamer_config,
-            rebrac_config,
-            config,
-        )
-        persistent_actor = update.actor
-        reconstructed_action = actor_function(persistent_actor, current)
-        retained_action = np.asarray(trace["actions"][0, step], dtype=np.float32)
         if not np.array_equal(
-            np.asarray(jax.device_get(reconstructed_action[0]), dtype=np.float32),
-            retained_action,
+            np.asarray(jax.device_get(proposal_noise), dtype=np.float32),
+            np.asarray(jax.device_get(regenerated_proposal_noise), dtype=np.float32),
         ):
-            raise ValueError(
-                "persistent FlowMPC controller reconstruction differs from A0 trace"
-            )
-        previous_action = jnp.asarray(retained_action[None])
-        if step not in chosen_set:
-            if step >= int(chosen[-1]):
-                break
-            continue
+            raise ValueError(f"captured FlowMPC proposal noise differs at step {step}")
+        heldout_noise = jax.random.normal(jax.random.fold_in(heldout_key, step), shape)
 
         def objective(actor: Any, noises: Any) -> Any:
             return jit_flowmpc_objective(
@@ -3442,11 +3445,11 @@ def _independent_noise_result(
         proposal_before, proposal_gradient = jax.value_and_grad(objective)(
             adaptation_start, proposal_noise
         )
-        proposal_after = objective(update.actor, proposal_noise)
+        proposal_after = objective(updated_actor, proposal_noise)
         heldout_before, heldout_gradient = jax.value_and_grad(objective)(
             adaptation_start, heldout_noise
         )
-        heldout_after = objective(update.actor, heldout_noise)
+        heldout_after = objective(updated_actor, heldout_noise)
         proposal_objectives.append(float(proposal_after - proposal_before))
         heldout_objectives.append(float(heldout_after - heldout_before))
         proposal_gradients.append(_flatten_jax_tree(proposal_gradient))
@@ -3457,8 +3460,23 @@ def _independent_noise_result(
         heldout_ids.append(
             f"heldout-{world_seed}-{actor_seed}-{evaluation_seed}-{step}"
         )
-        if step >= int(chosen[-1]):
-            break
+        context_rows.append(
+            {
+                "step": step,
+                "belief_sha256": benchmark._tree_digest(belief),
+                "adaptation_start_actor_sha256": benchmark._tree_digest(
+                    adaptation_start
+                ),
+                "updated_actor_sha256": benchmark._tree_digest(updated_actor),
+                "proposal_noise_sha256": benchmark.array_sha256(
+                    {
+                        "proposal_noise": np.asarray(
+                            jax.device_get(proposal_noise), dtype=np.float32
+                        )
+                    }
+                ),
+            }
+        )
     result = independent_noise_diagnostics(
         proposal_objectives,
         heldout_objectives,
@@ -3475,6 +3493,8 @@ def _independent_noise_result(
             "heldout_noise_key_namespace": "actor-gap-independent-noise",
             "evaluated_steps": chosen.tolist(),
             "persistent_controller_action_replay_verified": True,
+            "controller_context_source": "captured_during_exact_live_a0_rollout",
+            "controller_contexts": context_rows,
         }
     )
     return result
@@ -3487,6 +3507,7 @@ def _exact_counterfactual_result(
     rebrac_config: Any,
     observations: np.ndarray,
     trace: Mapping[str, np.ndarray],
+    a0_beliefs: Sequence[Any],
     evaluation_seed: int,
     *,
     world_seed: int,
@@ -3495,8 +3516,6 @@ def _exact_counterfactual_result(
     import jax
     import jax.numpy as jnp
     from imf_dreamer_jax import (
-        initial_state,
-        observe_step,
         rebrac_actor,
         rebrac_critics,
     )
@@ -3535,11 +3554,8 @@ def _exact_counterfactual_result(
     imagined_best_actions: list[np.ndarray] = []
     imagined_reference_observations: list[np.ndarray] = []
     imagined_reference_actions: list[np.ndarray] = []
-    belief = initial_state(dreamer_config, 1)
-    previous_action = jnp.zeros((1, dreamer_config.action_dim), jnp.float32)
-    posterior_key = benchmark.derive_jax_key(
-        "flowmpc-posterior", TASK, world_seed, actor_seed, evaluation_seed
-    )
+    if len(a0_beliefs) != length:
+        raise ValueError("captured A0 beliefs do not match counterfactual episode")
     planner_noise_key = benchmark.derive_jax_key(
         "actor-gap-exact-h5-planner-noise",
         TASK,
@@ -3629,14 +3645,7 @@ def _exact_counterfactual_result(
         for step in range(length):
             reference = np.asarray(trace["actions"][0, step], dtype=np.float32)
             current = jnp.asarray(observation[None], dtype=jnp.float32)
-            belief = observe_step(
-                world_model,
-                current,
-                previous_action,
-                belief,
-                jax.random.fold_in(posterior_key, step),
-                dreamer_config,
-            )[0]
+            belief = a0_beliefs[step]
             if step in selected:
                 candidates = np.stack(
                     (
@@ -3780,7 +3789,6 @@ def _exact_counterfactual_result(
                 )
             transition = environment.step(reference)
             observation = transition.observation
-            previous_action = jnp.asarray(reference[None])
             if transition.is_last:
                 break
     finally:
@@ -3887,6 +3895,7 @@ def _compute_diagnostic_cell(
         ]
         row = _calibration_row(root, manifest, world_seed, actor_seed)
         anchors = calibration_arrays[f"world_{world_seed}_anchor_observations"]
+        a0_capture: dict[str, Any] = {}
         _, trace, _ = _run_flowmpc_arm(
             world,
             dreamer,
@@ -3900,6 +3909,7 @@ def _compute_diagnostic_cell(
             persistence="persistent",
             heldout_acceptance_enabled=False,
             anchor_observations=anchors,
+            diagnostic_capture=a0_capture,
         )
         retained, retained_path = _load_dependency_evaluation_trace(
             manifest,
@@ -3912,6 +3922,14 @@ def _compute_diagnostic_cell(
             prefix="flowmpc",
             episodes=len(evaluation_seeds),
         )
+        if a0_capture.get("schema_version") != "trajectory-imf-live-a0-context-v1":
+            raise ValueError("live A0 diagnostic context was not captured")
+        captured_beliefs = a0_capture.get("beliefs_by_episode")
+        captured_noise_contexts = a0_capture.get("noise_contexts")
+        if not isinstance(captured_beliefs, list) or not isinstance(
+            captured_noise_contexts, list
+        ):
+            raise ValueError("live A0 diagnostic context is incomplete")
         observations, next_observations = _replay_observations(evaluation_seeds, trace)
         lengths = np.asarray(trace["lengths"], dtype=np.int64)
         mask = np.arange(trace["actions"].shape[1])[None] < lengths[:, None]
@@ -3930,6 +3948,7 @@ def _compute_diagnostic_cell(
             observations,
             next_observations,
             trace,
+            captured_beliefs,
             world_seed=world_seed,
             actor_seed=actor_seed,
         )
@@ -3956,8 +3975,8 @@ def _compute_diagnostic_cell(
             dreamer,
             rebrac_state,
             rebrac,
-            observations,
             trace,
+            captured_noise_contexts,
             world_seed=world_seed,
             actor_seed=actor_seed,
         )
@@ -3968,6 +3987,7 @@ def _compute_diagnostic_cell(
             rebrac,
             observations,
             trace,
+            captured_beliefs[0],
             evaluation_seeds[0],
             world_seed=world_seed,
             actor_seed=actor_seed,
@@ -4319,6 +4339,7 @@ def _run_flowmpc_arm(
     persistence: str,
     heldout_acceptance_enabled: bool,
     anchor_observations: np.ndarray,
+    diagnostic_capture: dict[str, Any] | None = None,
 ) -> tuple[list[float], dict[str, np.ndarray], dict[str, float]]:
     """Run one FlowMPC arm with isolated trust/persistence/acceptance factors."""
 
@@ -4348,6 +4369,18 @@ def _run_flowmpc_arm(
 
     if persistence not in ("persistent", "reset"):
         raise ValueError("unknown persistence mode")
+    if diagnostic_capture is not None:
+        if trust or persistence != "persistent" or heldout_acceptance_enabled:
+            raise ValueError("diagnostic capture is restricted to the exact A0 arm")
+        if diagnostic_capture:
+            raise ValueError("diagnostic capture must be empty before the A0 rollout")
+        diagnostic_capture.update(
+            {
+                "schema_version": "trajectory-imf-live-a0-context-v1",
+                "beliefs_by_episode": [],
+                "noise_contexts": [],
+            }
+        )
     flow_config = _flowmpc_config(rebrac_config)
     persistence_config = PersistenceConfig(mode=persistence)
     trust_config = ActionTrustRegionConfig(
@@ -4539,9 +4572,10 @@ def _run_flowmpc_arm(
     total_timed_seconds = 0.0
     timed_steps = 0
     warmed = False
-    for evaluation_seed in evaluation_seeds:
+    for episode_index, evaluation_seed in enumerate(evaluation_seeds):
         environment = DMCAdapter(TASK, seed=int(evaluation_seed), action_repeat=1)
         episode: dict[str, list[Any]] = {name: [] for name in sequence_names}
+        episode_beliefs: list[Any] = []
         try:
             observation = environment.reset()
             belief = initial_state(dreamer_config, 1)
@@ -4608,6 +4642,11 @@ def _run_flowmpc_arm(
                     belief,
                     jax.random.fold_in(posterior_key, step),
                 )
+                adaptation_start_actor = (
+                    reference_state.carried_actor
+                    if persistence_config.mode == "persistent"
+                    else reference_state.frozen_reference_actor
+                )
                 (
                     reference_state,
                     selected_actor,
@@ -4623,6 +4662,23 @@ def _run_flowmpc_arm(
                 action = actor_function(selected_actor, current)
                 host_action = np.asarray(jax.device_get(action[0]), dtype=np.float32)
                 jax.block_until_ready(action)
+                if diagnostic_capture is not None:
+                    episode_beliefs.append(candidate_belief)
+                    if episode_index == 0 and step <= 15:
+                        diagnostic_capture["noise_contexts"].append(
+                            {
+                                "world_model_seed": int(world_seed),
+                                "actor_seed": int(actor_seed),
+                                "evaluation_seed": int(evaluation_seed),
+                                "step": int(step),
+                                "belief": candidate_belief,
+                                "current_observation": current,
+                                "adaptation_start_actor": adaptation_start_actor,
+                                "updated_actor": proposed_actor,
+                                "proposal_noise": noises,
+                                "host_action": host_action.copy(),
+                            }
+                        )
                 elapsed = time.perf_counter() - started
                 total_timed_seconds += elapsed
                 timed_steps += 1
@@ -4661,6 +4717,8 @@ def _run_flowmpc_arm(
                     break
         finally:
             environment.close()
+        if diagnostic_capture is not None:
+            diagnostic_capture["beliefs_by_episode"].append(tuple(episode_beliefs))
         returns.append(float(np.sum(np.asarray(episode["rewards"], np.float64))))
         for name in sequence_names:
             if name in ("actions",):

@@ -57,6 +57,16 @@ selecting or changing a model.  It records:
 The diagnostics are descriptive.  They cannot select an arm or tune an
 evaluation-time threshold.
 
+The diagnostic code does not regenerate the persistent controller between
+measurements.  During the exact `A0` rollout it retains the live posterior
+beliefs and, for steps 0, 1, 5, and 15 of the first episode, the in-memory
+adaptation-start actor, updated actor, current observation, and proposal-noise
+bank.  Only after the complete rollout reproduces the authenticated dependency
+trace exactly are independent-noise gradients and counterfactual measurements
+computed from those contexts.  The actor trees remain ephemeral; the result
+publishes only their SHA-256 digests.  This avoids treating a numerically close
+second persistent rollout as the same causal controller state.
+
 Every fresh evaluation arm also records bounded live-planner imagined
 occupancy every 50 environment steps using the first 8 particles from the
 actual shared planner-noise bank. Coverage is reported separately for the
