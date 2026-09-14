@@ -876,6 +876,7 @@ def _run_controller(
     parameter_delta_sequences: list[np.ndarray] = []
     timed_seconds = 0.0
     timed_steps = 0
+    controller_warmed = False
     for episode, evaluation_seed in enumerate(evaluation_seeds):
         environment = DMCAdapter(TASK, seed=int(evaluation_seed), action_repeat=1)
         actions: list[np.ndarray] = []
@@ -898,6 +899,45 @@ def _run_controller(
                 "flowmpc-noise", TASK, world_seed, actor_seed, evaluation_seed
             )
             for step in range(maximum_steps):
+                # A pure discarded call stabilizes the compiled GPU reduction
+                # before it can enter the persistent closed-loop policy state.
+                # The first-ever execution can otherwise choose a numerically
+                # different reduction schedule; a tiny gradient difference is
+                # then amplified by persistent test-time policy optimization.
+                # This does not touch the environment, belief, or live actor.
+                if adapted and not controller_warmed:
+                    warm_belief = observe_function(
+                        jnp.asarray(observation[None]),
+                        previous_action,
+                        belief,
+                        jax.random.fold_in(posterior_key, step),
+                    )
+                    warm_noises = jax.random.normal(
+                        jax.random.fold_in(noise_key, step),
+                        (
+                            flowmpc_config.particles,
+                            flowmpc_config.horizon,
+                            dreamer_config.stochastic_dim,
+                        ),
+                        dtype=jnp.float32,
+                    )
+                    warm_update = jit_flowmpc_adapt_actor(
+                        actor,
+                        rebrac_state.critics,
+                        world_model,
+                        warm_belief,
+                        jnp.asarray(observation[None]),
+                        warm_noises,
+                        dreamer_config,
+                        rebrac_config,
+                        flowmpc_config,
+                    )
+                    warm_action = actor_function(
+                        warm_update.actor,
+                        jnp.asarray(observation[None], dtype=jnp.float32),
+                    )
+                    jax.block_until_ready(warm_action)
+                    controller_warmed = True
                 started = time.perf_counter()
                 if adapted:
                     belief = observe_function(
@@ -1010,6 +1050,7 @@ def _run_controller(
     timing = {
         "timed_steps": float(timed_steps),
         "total_timed_seconds": timed_seconds,
+        "discarded_compile_warmup_steps": float(int(adapted)),
         "mean_milliseconds_per_step": (
             1000.0 * timed_seconds / timed_steps if timed_steps else 0.0
         ),
@@ -1379,6 +1420,7 @@ def run_evaluation_cell(
         "terminal_critic_frozen": True,
         "base_actor_reset_each_episode": True,
         "adapted_actor_persistent_within_episode": True,
+        "discarded_compile_warmup_before_closed_loop": True,
         "trace_file_sha256": benchmark.file_sha256(trace_path),
         "trace_sha256": benchmark.array_sha256(traces),
         "wall_seconds": time.perf_counter() - started,
@@ -1496,6 +1538,7 @@ def verify_evaluation_cell(
         or result.get("terminal_critic_frozen") is not True
         or result.get("base_actor_reset_each_episode") is not True
         or result.get("adapted_actor_persistent_within_episode") is not True
+        or result.get("discarded_compile_warmup_before_closed_loop") is not True
         or not _finite_tree(result)
     ):
         raise ValueError("FlowMPC evaluation result contract differs")

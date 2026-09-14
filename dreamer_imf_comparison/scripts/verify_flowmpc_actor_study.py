@@ -34,6 +34,9 @@ def verify_implementation() -> None:
         "actor = rebrac_state.actor",
         "belief = observe_function(",
         "jax.random.fold_in(noise_key, step)",
+        "if adapted and not controller_warmed:",
+        "jax.block_until_ready(warm_action)",
+        "controller_warmed = True",
     )
     required_manifest = (
         '"old_learned_actors_reused": False',

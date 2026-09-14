@@ -19,6 +19,10 @@ controller used by the ITPO/FlowMPC paper. It asks one narrow question:
   rewards plus the frozen terminal minimum twin-Q value;
 - newly sampled Monte Carlo noise at each real state, held fixed across the
   inner gradient step;
+- one pure discarded controller call before each adapted evaluation process,
+  so GPU compilation and reduction initialization cannot perturb the first
+  persistent policy update; it changes no environment or live policy state and
+  is excluded from per-step latency;
 - one tuning environment seed that is disjoint from evaluation seeds;
 - a paired comparison against the exact same unadapted ReBRAC checkpoint.
 
