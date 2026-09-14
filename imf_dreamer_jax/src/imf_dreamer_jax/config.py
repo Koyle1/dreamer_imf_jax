@@ -12,7 +12,7 @@ from .fidelity import IMFNoiseCoupling
 PriorKind = Literal["gaussian", "imf", "shortcut"]
 ActorGradient = Literal["reinforce", "dynamics", "pmpo"]
 ImaginationStartMode = Literal["all", "one_per_sequence"]
-RewardLoss = Literal["mse", "binary_cross_entropy"]
+RewardLoss = Literal["mse", "binary_cross_entropy", "symexp_twohot"]
 
 
 def _positive_int(name: str, value: int) -> None:
@@ -49,6 +49,10 @@ class DreamerConfig:
     reward_initial_value: float = 0.0
     reward_output_init_scale: float = 0.0
     reward_loss: RewardLoss = "mse"
+    reward_prediction_horizon: int = 0
+    reward_bins: int = 1
+    reward_symlog_min: float = -20.0
+    reward_symlog_max: float = 20.0
     continuation_scale: float = 1.0
     overshooting_horizon: int = 1
     burn_in: int = 0
@@ -74,6 +78,10 @@ class DreamerConfig:
     imf_trajectory_corrupted_probability: float = 1.0 / 3.0
     imf_trajectory_suffix_probability: float = 1.0 / 3.0
     imf_trajectory_history_noise_max: float = 1.0
+    imf_causal_consistency_scale: float = 0.0
+    imf_causal_reward_scale: float = 1.0
+    imf_causal_huber_delta: float = 1.0
+    imf_causal_normalization_epsilon: float = 1e-3
     shortcut_training_k_max: int | None = None
     shortcut_sampling_steps: int = 4
     shortcut_bootstrap_ema_decay: float | None = 0.999
@@ -104,6 +112,7 @@ class DreamerConfig:
     actor_critic_warmup_steps: int = 0
     slow_critic_fraction: float = 0.02
     return_normalization_epsilon: float = 1e-6
+    return_scale_ema_decay: float = 0.99
     model_learning_rate: float = 3e-4
     actor_learning_rate: float = 3e-4
     critic_learning_rate: float = 3e-4
@@ -126,6 +135,7 @@ class DreamerConfig:
             "overshooting_horizon",
             "imagination_horizon",
             "critic_bins",
+            "reward_bins",
             "imf_sampling_steps",
             "shortcut_sampling_steps",
         ):
@@ -178,8 +188,36 @@ class DreamerConfig:
             value = getattr(self, name)
             if value is not None and (not math.isfinite(value) or value <= 0.0):
                 raise ValueError(f"{name} must be None or finite and positive")
-        if self.reward_loss not in ("mse", "binary_cross_entropy"):
-            raise ValueError("reward_loss must be 'mse' or 'binary_cross_entropy'")
+        if self.reward_loss not in ("mse", "binary_cross_entropy", "symexp_twohot"):
+            raise ValueError(
+                "reward_loss must be 'mse', 'binary_cross_entropy', or 'symexp_twohot'"
+            )
+        if (
+            not isinstance(self.reward_prediction_horizon, int)
+            or isinstance(self.reward_prediction_horizon, bool)
+            or self.reward_prediction_horizon < 0
+        ):
+            raise ValueError("reward_prediction_horizon must be a nonnegative integer")
+        if self.reward_loss == "symexp_twohot":
+            if self.reward_bins <= 1:
+                raise ValueError("symexp_twohot reward loss requires reward_bins > 1")
+            if self.reward_min is not None or self.reward_max is not None:
+                raise ValueError("symexp_twohot reward loss uses symlog support, not reward bounds")
+        elif self.reward_bins != 1:
+            raise ValueError("scalar reward losses require reward_bins == 1")
+        if (
+            not math.isfinite(self.reward_symlog_min)
+            or not math.isfinite(self.reward_symlog_max)
+            or self.reward_symlog_min >= 0.0
+            or self.reward_symlog_max <= 0.0
+            or not math.isclose(
+                -self.reward_symlog_min,
+                self.reward_symlog_max,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError("reward symlog support must be finite and symmetric around zero")
         if (self.reward_min is None) != (self.reward_max is None):
             raise ValueError("reward_min and reward_max must either both be set or both be None")
         if self.reward_min is not None:
@@ -214,6 +252,8 @@ class DreamerConfig:
             "imf_shortcut_scale",
             "imf_signal_weight_floor",
             "imf_signal_weight_scale",
+            "imf_causal_consistency_scale",
+            "imf_causal_reward_scale",
             "actor_action_l2_scale",
             "reward_output_init_scale",
             "critic_output_init_scale",
@@ -241,6 +281,8 @@ class DreamerConfig:
             raise ValueError("trajectory iMF requires prior='imf'")
         if self.imf_trajectory_enabled and self.imf_noise_coupling != "independent":
             raise ValueError("trajectory iMF requires independent base noise")
+        if self.imf_causal_consistency_scale > 0.0 and not self.imf_trajectory_enabled:
+            raise ValueError("causal consistency requires trajectory iMF mode")
         trajectory_probabilities = (
             self.imf_trajectory_clean_probability,
             self.imf_trajectory_corrupted_probability,
@@ -267,6 +309,8 @@ class DreamerConfig:
         for name in (
             "imf_time_std",
             "imf_adaptive_epsilon",
+            "imf_causal_huber_delta",
+            "imf_causal_normalization_epsilon",
             "actor_init_scale",
             "actor_mean_bound",
             "actor_min_std",
@@ -317,6 +361,11 @@ class DreamerConfig:
             or not 0 < self.slow_critic_fraction <= 1
         ):
             raise ValueError("slow_critic_fraction must be finite and in (0, 1]")
+        if (
+            not math.isfinite(self.return_scale_ema_decay)
+            or not 0.0 <= self.return_scale_ema_decay < 1.0
+        ):
+            raise ValueError("return_scale_ema_decay must be finite and in [0, 1)")
         if not 0 <= self.discount <= 1 or not 0 <= self.lambda_ <= 1:
             raise ValueError("discount and lambda_ must be in [0, 1]")
         for name in (
@@ -340,6 +389,12 @@ class DreamerConfig:
     @property
     def feature_dim(self) -> int:
         return self.deterministic_dim + self.stochastic_dim
+
+    @property
+    def reward_head_output_dim(self) -> int:
+        """Number of logits emitted by the flattened multi-token reward head."""
+
+        return (self.reward_prediction_horizon + 1) * self.reward_bins
 
     @property
     def method_name(self) -> str:

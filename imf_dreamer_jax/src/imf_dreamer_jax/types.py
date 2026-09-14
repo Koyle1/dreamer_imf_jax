@@ -92,6 +92,9 @@ class WorldModelLoss(NamedTuple):
     imf_shortcut: Array
     overshooting_distance_5: Array
     overshooting_distance_15: Array
+    causal_consistency: Array
+    causal_observation: Array
+    causal_reward: Array
 
 
 class Imagination(NamedTuple):
@@ -116,6 +119,48 @@ class ActorCriticMetrics(NamedTuple):
     squashed_entropy: Array
     return_scale: Array
     slow_critic_delta: Array
+    deterministic_action_mean: Array
+    pre_tanh_mean: Array
+    policy_std_mean: Array
+    behavior_kl: Array
+    advantage_mean: Array
+    advantage_positive_fraction: Array
+
+
+class RunningRMSState(NamedTuple):
+    """Online root-mean-square state used by policy-aligned objectives."""
+
+    mean_square: Array
+    count: Array
+
+
+class AdvantageConsistencyLoss(NamedTuple):
+    """Decomposed short-horizon, action-advantage consistency loss."""
+
+    total: Array
+    magnitude: Array
+    ranking: Array
+    flat: Array
+    predicted_advantages: Array
+    target_advantages: Array
+    informative_pair_fraction: Array
+
+
+class BootstrapRewardEnsembleState(NamedTuple):
+    """Independent bootstrap reward heads and their joint optimizer state."""
+
+    params: PyTree
+    optimizer: PyTree
+
+
+class PolicyConsistencyLoss(NamedTuple):
+    """World-model objective with optional decision and exposure terms."""
+
+    total: Array
+    base: WorldModelLoss
+    advantage: AdvantageConsistencyLoss
+    exposure_meanflow: Array
+    endpoint: Array
 
 
 class AgentParams(NamedTuple):

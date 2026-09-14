@@ -341,6 +341,12 @@ class ActorMetricTests(unittest.TestCase):
             "squashed_entropy",
             "return_scale",
             "slow_critic_delta",
+            "deterministic_action_mean",
+            "pre_tanh_mean",
+            "policy_std_mean",
+            "behavior_kl",
+            "advantage_mean",
+            "advantage_positive_fraction",
         )
         self.assertEqual(metrics._fields, expected_names)
         values = np.asarray([float(value) for value in metrics])
@@ -352,6 +358,11 @@ class ActorMetricTests(unittest.TestCase):
         self.assertLessEqual(float(metrics.mean_pre_tanh_abs), cfg.actor_mean_bound)
         self.assertGreaterEqual(float(metrics.return_scale), 1.0)
         self.assertGreaterEqual(float(metrics.slow_critic_delta), 0.0)
+        self.assertGreaterEqual(float(metrics.policy_std_mean), cfg.actor_min_std)
+        self.assertLessEqual(float(metrics.policy_std_mean), cfg.actor_max_std)
+        self.assertGreaterEqual(float(metrics.behavior_kl), 0.0)
+        self.assertGreaterEqual(float(metrics.advantage_positive_fraction), 0.0)
+        self.assertLessEqual(float(metrics.advantage_positive_fraction), 1.0)
         self.assertEqual(int(updated.actor_optimizer.step), 1)
         self.assertEqual(int(updated.critic_optimizer.step), 1)
 

@@ -1,0 +1,448 @@
+from __future__ import annotations
+
+import unittest
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from imf_dreamer_jax import (
+    ActionRewardResidualConfig,
+    DreamerConfig,
+    attach_action_reward_residual,
+    best_candidate_relative_error_penalties,
+    create_agent,
+    dense_prefix_quadratic_form,
+    dense_reward_objective,
+    discounted_prefix_quadratic_matrix,
+    imagine,
+    init_running_rms,
+    predict_action_reward_residual,
+    predict_reward,
+    predict_transition_reward,
+    residual_return_regression_loss,
+    train_action_reward_residual,
+)
+from imf_dreamer_jax.nn import tree_global_norm
+from imf_dreamer_jax.types import RSSMState
+
+
+def config(**overrides: object) -> DreamerConfig:
+    values: dict[str, object] = {
+        "observation_shape": (3,),
+        "action_dim": 2,
+        "deterministic_dim": 5,
+        "stochastic_dim": 3,
+        "embedding_dim": 4,
+        "hidden_dim": 12,
+        "prior": "imf",
+        "imf_trajectory_enabled": True,
+        "imf_sampling_steps": 1,
+        "imagination_horizon": 2,
+        "reward_output_init_scale": 1.0,
+        "model_learning_rate": 1e-2,
+    }
+    values.update(overrides)
+    return DreamerConfig(**values)
+
+
+def tree_delta(left: object, right: object) -> float:
+    return float(
+        tree_global_norm(jax.tree_util.tree_map(lambda x, y: y - x, left, right))
+    )
+
+
+def decision_batch(
+    cfg: DreamerConfig, horizons: tuple[int, ...] = (1, 3, 5)
+) -> dict[str, jax.Array]:
+    batch, steps, candidates, horizon = 2, 3, 2, max(horizons)
+    candidate_actions = jnp.zeros(
+        (batch, steps, candidates, horizon, cfg.action_dim)
+    )
+    candidate_actions = candidate_actions.at[:, :, 0, :, 0].set(-0.75)
+    candidate_actions = candidate_actions.at[:, :, 1, :, 0].set(0.75)
+    targets = jnp.zeros((batch, steps, candidates, len(horizons)))
+    targets = targets.at[:, :, 0, :].set(-1.0)
+    targets = targets.at[:, :, 1, :].set(1.0)
+    return {
+        "observations": jax.random.normal(
+            jax.random.key(10), (batch, steps, *cfg.observation_shape)
+        ),
+        "actions": jnp.zeros((batch, steps, cfg.action_dim)),
+        "is_first": jnp.zeros((batch, steps), dtype=jnp.bool_).at[:, 0].set(True),
+        "advantage_action_sequences": candidate_actions,
+        "advantage_target_returns": targets,
+        "advantage_mask": jnp.ones((batch, steps, len(horizons))),
+    }
+
+
+class ActionRewardResidualTests(unittest.TestCase):
+    @classmethod
+    def tearDownClass(cls) -> None:
+        print("ACTION_REWARD_RESIDUAL_LIBRARY_VERIFIED")
+
+    def test_zero_initialized_residual_is_an_exact_identity(self) -> None:
+        cfg = config()
+        source = create_agent(cfg, jax.random.key(1))
+        attached = attach_action_reward_residual(source, cfg, jax.random.key(2))
+        previous = jax.random.normal(jax.random.key(3), (7, cfg.feature_dim))
+        following = jax.random.normal(jax.random.key(4), (7, cfg.feature_dim))
+        actions = jax.random.normal(jax.random.key(5), (7, cfg.action_dim))
+        expected = predict_reward(source.params.world_model, following, cfg)
+        actual = predict_transition_reward(
+            attached.params.world_model, previous, actions, following, cfg
+        )
+        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(
+            predict_action_reward_residual(
+                attached.params.world_model, previous, actions, following, cfg
+            ),
+            jnp.zeros((7,)),
+        )
+        self.assertEqual(
+            set(attached.model_optimizer.first_moment)
+            - set(source.model_optimizer.first_moment),
+            {"reward_action_residual"},
+        )
+
+    def test_residual_inputs_are_gradient_isolated(self) -> None:
+        cfg = config()
+        state = attach_action_reward_residual(
+            create_agent(cfg, jax.random.key(20)), cfg, jax.random.key(21)
+        )
+        residual = state.params.world_model["reward_action_residual"]
+        layers = list(residual["layers"])
+        output = dict(layers[-1])
+        output["weight"] = jnp.ones_like(output["weight"])
+        layers[-1] = output
+        model = {
+            **state.params.world_model,
+            "reward_action_residual": {"layers": tuple(layers)},
+        }
+        previous = jnp.ones((1, cfg.feature_dim))
+        action = jnp.ones((1, cfg.action_dim))
+        following = 2.0 * jnp.ones((1, cfg.feature_dim))
+
+        def objective(p, a, n):
+            return jnp.sum(predict_action_reward_residual(model, p, a, n, cfg))
+
+        gradients = jax.grad(objective, argnums=(0, 1, 2))(
+            previous, action, following
+        )
+        self.assertEqual(float(tree_global_norm(gradients)), 0.0)
+
+    def test_uncentered_loss_is_exact_and_breaks_translation_nullspace(self) -> None:
+        target = jnp.asarray(
+            [[[-1.0, 0.5], [0.0, -0.5], [2.0, 1.5]]], dtype=jnp.float32
+        )
+        error = jnp.asarray(
+            [[[0.25, -0.5], [0.75, 0.25], [-0.5, 1.0]]], dtype=jnp.float32
+        )
+        predicted = target + error
+        scale = 1.7
+        delta = 0.8
+        actual = residual_return_regression_loss(
+            predicted,
+            target,
+            mask=jnp.ones((1, 2)),
+            normalization_scale=scale,
+            huber_delta=delta,
+        )
+        normalized = np.asarray(error) / scale
+        direct = delta**2 * (np.sqrt(1.0 + np.square(normalized / delta)) - 1.0)
+        self.assertAlmostEqual(float(actual), float(np.mean(direct)), places=7)
+
+        centered_error = error - jnp.mean(error, axis=-2, keepdims=True)
+        shifted_error = error + 2.0
+        np.testing.assert_allclose(
+            np.asarray(
+                shifted_error - jnp.mean(shifted_error, axis=-2, keepdims=True)
+            ),
+            np.asarray(centered_error),
+            atol=1e-7,
+        )
+        shifted = residual_return_regression_loss(
+            target + shifted_error,
+            target,
+            normalization_scale=scale,
+            huber_delta=delta,
+        )
+        self.assertNotAlmostEqual(float(shifted), float(actual), places=6)
+
+    def test_squared_center_and_mean_terms_equal_raw_error(self) -> None:
+        error = np.asarray([1.5, -0.25, 2.0, 0.75], dtype=np.float64)
+        mean = np.mean(error)
+        centered = np.mean(np.square(error - mean))
+        gauge = np.square(mean)
+        raw = np.mean(np.square(error))
+        self.assertAlmostEqual(centered + gauge, raw, places=14)
+
+    def test_trace_form_exactly_equals_explicit_dense_prefix_loss(self) -> None:
+        errors = jnp.asarray(
+            [
+                [[0.2, -0.4, 0.7, 0.1], [-0.3, 0.5, 0.2, -0.6]],
+                [[0.8, 0.1, -0.2, 0.4], [0.0, -0.7, 0.3, 0.2]],
+            ],
+            dtype=jnp.float32,
+        )
+        discount = 0.93
+        weights = jnp.asarray([0.5, 1.0, 1.5, 2.0], dtype=jnp.float32)
+        actual = dense_prefix_quadratic_form(
+            errors, discount, horizon_weights=weights
+        )
+        discounted_steps = errors * jnp.power(
+            jnp.asarray(discount, errors.dtype), jnp.arange(errors.shape[-1])
+        )
+        prefixes = jnp.cumsum(discounted_steps, axis=-1)
+        expected = jnp.sum(weights * jnp.square(prefixes), axis=-1)
+        np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
+
+        matrix = discounted_prefix_quadratic_matrix(
+            errors.shape[-1], discount, horizon_weights=weights
+        )
+        np.testing.assert_allclose(matrix, matrix.T, rtol=0.0, atol=1e-7)
+        eigenvalues = np.linalg.eigvalsh(np.asarray(matrix))
+        self.assertGreater(float(np.min(eigenvalues)), 0.0)
+
+    def test_trace_form_gradient_matches_explicit_prefix_gradient(self) -> None:
+        errors = jnp.asarray(
+            [[0.2, -0.4, 0.7], [-0.3, 0.5, 0.2]], dtype=jnp.float32
+        )
+        discount = 0.97
+
+        def trace_loss(value):
+            return jnp.sum(dense_prefix_quadratic_form(value, discount))
+
+        def explicit_loss(value):
+            powers = jnp.power(
+                jnp.asarray(discount, value.dtype), jnp.arange(value.shape[-1])
+            )
+            return jnp.sum(jnp.square(jnp.cumsum(value * powers, axis=-1)))
+
+        np.testing.assert_allclose(
+            jax.grad(trace_loss)(errors),
+            jax.grad(explicit_loss)(errors),
+            rtol=2e-6,
+            atol=2e-6,
+        )
+
+    def test_relative_error_penalty_is_exact_gap_cancellation(self) -> None:
+        target = jnp.asarray(
+            [[3.0, 1.0, 2.0, -1.0], [0.5, 2.5, 1.5, 0.0]],
+            dtype=jnp.float32,
+        )
+        predicted = jnp.asarray(
+            [[2.0, 2.5, 2.2, -0.5], [1.5, 1.0, 1.7, 0.2]],
+            dtype=jnp.float32,
+        )
+
+        def original(value):
+            best = jnp.argmax(target, axis=-1)
+            best_target = jnp.take_along_axis(target, best[:, None], axis=-1)
+            best_prediction = jnp.take_along_axis(value, best[:, None], axis=-1)
+            gap = best_target - target
+            predicted_gap = best_prediction - value
+            penalty = jax.nn.relu(gap - predicted_gap)
+            return penalty * (
+                1.0 - jax.nn.one_hot(best, target.shape[-1], dtype=target.dtype)
+            )
+
+        actual = best_candidate_relative_error_penalties(predicted, target)
+        np.testing.assert_allclose(actual, original(predicted), atol=1e-7)
+        np.testing.assert_allclose(
+            jax.grad(lambda value: jnp.sum(
+                best_candidate_relative_error_penalties(value, target)
+            ))(predicted),
+            jax.grad(lambda value: jnp.sum(original(value)))(predicted),
+            atol=1e-7,
+        )
+
+        selected = np.argmax(np.asarray(predicted), axis=-1)
+        best = np.argmax(np.asarray(target), axis=-1)
+        regret = np.asarray(target)[np.arange(target.shape[0]), best] - np.asarray(
+            target
+        )[np.arange(target.shape[0]), selected]
+        self.assertTrue(np.all(regret <= np.sum(np.asarray(actual), axis=-1) + 1e-7))
+
+    def test_dense_reward_objective_matches_direct_formula_and_mask(self) -> None:
+        target = jnp.asarray(
+            [
+                [[1.0, 1.5, 2.0], [0.0, 1.0, 1.0], [-1.0, 0.0, 0.5]],
+                [[2.0, 2.5, 3.0], [1.0, 1.5, 2.0], [0.0, 0.5, 1.0]],
+            ],
+            dtype=jnp.float32,
+        )
+        error = jnp.asarray(
+            [
+                [[0.1, -0.2, -0.5], [0.2, 0.4, 0.8], [-0.1, 0.3, 0.1]],
+                [[0.5, 0.4, 0.3], [-0.2, -0.1, 0.0], [0.1, 0.2, 0.3]],
+            ],
+            dtype=jnp.float32,
+        )
+        mask = jnp.asarray([[1.0, 1.0, 1.0], [1.0, 0.0, 0.0]])
+        scale = 2.0
+        control_scale = 0.7
+        details = dense_reward_objective(
+            target + error,
+            target,
+            mask=mask,
+            normalization_scale=scale,
+            control_scale=control_scale,
+        )
+        normalized = error / scale
+        expected_dense = jnp.sum(
+            jnp.mean(jnp.square(normalized), axis=-2) * mask
+        ) / jnp.sum(mask)
+        terminal_penalties = best_candidate_relative_error_penalties(
+            target[..., -1] + normalized[..., -1], target[..., -1]
+        )
+        expected_control = jnp.sum(terminal_penalties * mask[..., -1, None]) / (
+            jnp.sum(mask[..., -1]) * (target.shape[-2] - 1)
+        )
+        self.assertAlmostEqual(float(details.dense_prefix), float(expected_dense), places=7)
+        self.assertAlmostEqual(float(details.control), float(expected_control), places=7)
+        self.assertAlmostEqual(
+            float(details.total),
+            float(expected_dense + control_scale * expected_control),
+            places=7,
+        )
+
+    def test_dense_reward_objective_corrects_a_misranked_best_action(self) -> None:
+        target = jnp.asarray(
+            [[[0.5, 1.5, 3.0], [0.4, 1.0, 2.0], [0.2, 0.8, 1.0]]],
+            dtype=jnp.float32,
+        )
+        predicted = jnp.asarray(
+            [[[0.0, 0.0, 0.0], [0.5, 1.5, 4.0], [0.1, 0.5, 1.5]]],
+            dtype=jnp.float32,
+        )
+        initial = dense_reward_objective(predicted, target, control_scale=1.0)
+        self.assertEqual(int(jnp.argmax(predicted[..., -1], axis=-1)[0]), 1)
+
+        def loss_fn(value):
+            return dense_reward_objective(value, target, control_scale=1.0).total
+
+        for _ in range(40):
+            predicted = predicted - 0.2 * jax.grad(loss_fn)(predicted)
+        final = dense_reward_objective(predicted, target, control_scale=1.0)
+        self.assertLess(float(final.total), float(initial.total))
+        self.assertEqual(int(jnp.argmax(predicted[..., -1], axis=-1)[0]), 0)
+
+    def test_dense_control_mode_requires_all_prefixes(self) -> None:
+        with self.assertRaisesRegex(ValueError, "every prefix horizon"):
+            ActionRewardResidualConfig(
+                horizons=(1, 3, 5), objective="dense_quadratic_control"
+            )
+        configured = ActionRewardResidualConfig(
+            horizons=tuple(range(1, 16)),
+            objective="dense_quadratic_control",
+            control_scale=0.5,
+        )
+        self.assertEqual(configured.objective, "dense_quadratic_control")
+
+    def test_training_changes_only_the_residual_and_its_moments(self) -> None:
+        cfg = config()
+        source = create_agent(cfg, jax.random.key(30))
+        state = attach_action_reward_residual(source, cfg, jax.random.key(31))
+        initial = state
+        rms = init_running_rms()
+        data = decision_batch(cfg)
+        objective = ActionRewardResidualConfig()
+        details = None
+        for update in range(3):
+            state, details, rms = train_action_reward_residual(
+                state,
+                data,
+                jax.random.fold_in(jax.random.key(32), update),
+                cfg,
+                objective,
+                rms,
+            )
+        self.assertIsNotNone(details)
+        self.assertTrue(np.isfinite(float(details.total)))
+        self.assertGreater(
+            tree_delta(
+                initial.params.world_model["reward_action_residual"],
+                state.params.world_model["reward_action_residual"],
+            ),
+            0.0,
+        )
+        for name in source.params.world_model:
+            self.assertEqual(
+                tree_delta(source.params.world_model[name], state.params.world_model[name]),
+                0.0,
+            )
+            self.assertEqual(
+                tree_delta(
+                    source.model_optimizer.first_moment[name],
+                    state.model_optimizer.first_moment[name],
+                ),
+                0.0,
+            )
+            self.assertEqual(
+                tree_delta(
+                    source.model_optimizer.second_moment[name],
+                    state.model_optimizer.second_moment[name],
+                ),
+                0.0,
+            )
+
+    def test_dense_horizon_training_is_finite_and_updates_the_residual(self) -> None:
+        cfg = config()
+        horizons = tuple(range(1, 16))
+        state = attach_action_reward_residual(
+            create_agent(cfg, jax.random.key(35)), cfg, jax.random.key(36)
+        )
+        initial_residual = state.params.world_model["reward_action_residual"]
+        updated, details, rms = train_action_reward_residual(
+            state,
+            decision_batch(cfg, horizons),
+            jax.random.key(37),
+            cfg,
+            ActionRewardResidualConfig(
+                horizons=horizons,
+                objective="dense_quadratic_control",
+                control_scale=0.5,
+            ),
+            init_running_rms(),
+        )
+        self.assertTrue(np.isfinite(float(details.uncentered_return)))
+        self.assertGreater(float(rms.count), 0.0)
+        self.assertGreater(
+            tree_delta(
+                initial_residual,
+                updated.params.world_model["reward_action_residual"],
+            ),
+            0.0,
+        )
+
+    def test_imagination_uses_the_residual_without_mutating_dynamics(self) -> None:
+        cfg = config()
+        source = create_agent(cfg, jax.random.key(40))
+        state = attach_action_reward_residual(source, cfg, jax.random.key(41))
+        residual = state.params.world_model["reward_action_residual"]
+        layers = list(residual["layers"])
+        output = dict(layers[-1])
+        output["bias"] = jnp.ones_like(output["bias"])
+        layers[-1] = output
+        shifted_world = {
+            **state.params.world_model,
+            "reward_action_residual": {"layers": tuple(layers)},
+        }
+        start = RSSMState(
+            jnp.zeros((2, cfg.deterministic_dim)),
+            jnp.zeros((2, cfg.stochastic_dim)),
+        )
+        base = imagine(source.params, start, jax.random.key(42), cfg)
+        shifted = imagine(
+            source.params._replace(world_model=shifted_world),
+            start,
+            jax.random.key(42),
+            cfg,
+        )
+        np.testing.assert_allclose(shifted.rewards, base.rewards + 1.0, atol=1e-6)
+        np.testing.assert_array_equal(shifted.features, base.features)
+
+
+if __name__ == "__main__":
+    unittest.main()

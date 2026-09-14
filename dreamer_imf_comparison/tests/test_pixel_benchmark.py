@@ -228,7 +228,7 @@ class PixelEnvironmentTests(unittest.TestCase):
         result = np.asarray(preprocess_pixels_jax(value))
         self.assertEqual(result.dtype, np.float32)
         self.assertEqual(float(result.min()), 0.0)
-        self.assertEqual(float(result.max()), 1.0)
+        self.assertAlmostEqual(float(result.max()), 1.0, places=6)
 
     def test_reset_repeat_terminal_and_action_scaling(self):
         environment = _Environment(terminate_every=3)

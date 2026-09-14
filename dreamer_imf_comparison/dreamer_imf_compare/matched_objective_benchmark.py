@@ -136,28 +136,38 @@ _LIBRARY_TEST_BASENAMES = (
 _COMPARISON_SOURCE_BASENAMES = (
     "__init__.py",
     "artifacts.py",
+    "causal_reacher_study.py",
     "dmc.py",
     "matched_objective_benchmark.py",
     "matched_objective_diagnostics.py",
     "matched_objective_protocol.py",
     "neurips_controls.py",
     "pixel_benchmark.py",
+    "policy_alignment_diagnostics.py",
     "protocol.py",
     "shortcut_stability_study.py",
 )
 _COMPARISON_SCRIPT_BASENAMES = (
     "generate_matched_objective_matrix.py",
+    "run_causal_reacher_study.py",
     "run_matched_objective_benchmark.py",
     "run_matched_objective_diagnostics.py",
     "run_neurips_controls.py",
     "run_pixel_benchmark.py",
+    "run_policy_alignment_diagnostics.py",
     "run_shortcut_stability_study.py",
     "verify_matched_objective_benchmark.py",
     "verify_matched_objective_protocol.py",
+    "verify_causal_consistency.sh",
     "verify_neurips_controls.py",
     "verify_neurips_core.py",
     "verify_neurips_report.py",
     "verify_pixel_benchmark.py",
+    "verify_pendulum_and_tests.sh",
+    "verify_policy_alignment_diagnostics.py",
+    "verify_reacher_imf_small_comparison.sh",
+    "verify_reacher_imf_small_manifest.sh",
+    "verify_remote_reacher_imf_small.sh",
     "verify_shortcut_stability_study.py",
     "verify_smoke_idempotence.py",
     "verify_trajectory_imf_novelty.py",
@@ -165,6 +175,7 @@ _COMPARISON_SCRIPT_BASENAMES = (
 )
 _COMPARISON_TEST_BASENAMES = (
     "__init__.py",
+    "test_causal_reacher_study.py",
     "test_cluster_workflow.py",
     "test_matched_objective_artifact_manifest.py",
     "test_matched_objective_benchmark.py",
@@ -175,12 +186,15 @@ _COMPARISON_TEST_BASENAMES = (
     "test_neurips_report.py",
     "test_neurips_verifiers.py",
     "test_pixel_benchmark.py",
+    "test_policy_alignment_diagnostics.py",
     "test_rollout_replay_validation.py",
     "test_shortcut_stability_study.py",
     "test_trajectory_imf_theory.py",
 )
 _CLUSTER_SOURCE_BASENAMES = (
     "bootstrap_environment.sh",
+    "causal_reacher_preflight.sbatch",
+    "causal_reacher_small.sbatch",
     "cluster_spec.json",
     "controls_array.sbatch",
     "controls_finalize.sbatch",
@@ -195,6 +209,7 @@ _CLUSTER_SOURCE_BASENAMES = (
     "pixel_finalize.sbatch",
     "pixel_freeze.sbatch",
     "pixel_retry_audit.sbatch",
+    "policy_alignment_diagnostics.sbatch",
     "preflight.sbatch",
     "profile_finalize.sbatch",
     "retry_audit.sbatch",
@@ -496,10 +511,17 @@ def _source_files(root: Path) -> list[str]:
         "dreamer_imf_comparison/dreamer_imf_compare/protocol.py",
         "dreamer_imf_comparison/dreamer_imf_compare/matched_objective*.py",
         "dreamer_imf_comparison/dreamer_imf_compare/neurips_controls.py",
+        "dreamer_imf_comparison/dreamer_imf_compare/causal_reacher_study.py",
         "dreamer_imf_comparison/dreamer_imf_compare/pixel_benchmark.py",
+        "dreamer_imf_comparison/dreamer_imf_compare/policy_alignment_diagnostics.py",
+        "dreamer_imf_comparison/scripts/*causal*.py",
+        "dreamer_imf_comparison/scripts/verify_causal_consistency.sh",
         "dreamer_imf_comparison/scripts/*matched_objective*.py",
         "dreamer_imf_comparison/scripts/*neurips*.py",
         "dreamer_imf_comparison/scripts/*pixel*.py",
+        "dreamer_imf_comparison/scripts/*pendulum*.sh",
+        "dreamer_imf_comparison/scripts/*policy_alignment*.py",
+        "dreamer_imf_comparison/scripts/*reacher_imf_small*.sh",
         "dreamer_imf_comparison/scripts/verify_smoke_idempotence.py",
         "dreamer_imf_comparison/scripts/*trajectory_imf*.py",
         "dreamer_imf_comparison/dreamer_imf_compare/shortcut_stability_study.py",
@@ -511,6 +533,8 @@ def _source_files(root: Path) -> list[str]:
         "dreamer_imf_comparison/tests/test_matched_objective*.py",
         "dreamer_imf_comparison/tests/test_neurips_*.py",
         "dreamer_imf_comparison/tests/test_pixel*.py",
+        "dreamer_imf_comparison/tests/test_policy_alignment*.py",
+        "dreamer_imf_comparison/tests/test_causal_reacher*.py",
         "dreamer_imf_comparison/tests/test_trajectory_imf*.py",
         "dreamer_imf_comparison/tests/test_rollout_replay_validation.py",
         "dreamer_imf_comparison/tests/test_cluster_*.py",
@@ -1994,6 +2018,19 @@ def make_config(
 
     common = dict(
         protocol["canonical_executable_config"]["dreamer_config_non_task_shape_common"]
+    )
+    # These fields were added after the matched-objective protocol was frozen.
+    # Resolve them explicitly to a no-op rather than changing that protocol's
+    # identity or silently relying on future library defaults.
+    common.update(
+        imf_causal_consistency_scale=0.0,
+        imf_causal_reward_scale=1.0,
+        imf_causal_huber_delta=1.0,
+        imf_causal_normalization_epsilon=1e-3,
+        reward_prediction_horizon=0,
+        reward_bins=1,
+        reward_symlog_min=-20.0,
+        reward_symlog_max=20.0,
     )
     common["overshooting_distances"] = tuple(common["overshooting_distances"])
     common["observation_shape"] = tuple(int(value) for value in observation_shape)
@@ -3958,7 +3995,17 @@ def _materialize_batch(
     episodes = schedule["episode_ids"][update]
     starts = schedule["starts"][update]
     batch: dict[str, np.ndarray] = {}
-    for name in ("observations", "actions", "rewards", "continuations", "is_first"):
+    base_names = ("observations", "actions", "rewards", "continuations", "is_first")
+    causal_names = (
+        "causal_actions_lower",
+        "causal_actions_upper",
+        "causal_observations_lower",
+        "causal_observations_upper",
+        "causal_rewards_lower",
+        "causal_rewards_upper",
+        "causal_mask",
+    )
+    for name in base_names + tuple(name for name in causal_names if name in arrays):
         batch[name] = np.stack(
             [
                 arrays[name][int(episode), int(start) : int(start) + sequence_length]

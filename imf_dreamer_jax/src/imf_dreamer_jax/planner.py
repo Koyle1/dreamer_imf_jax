@@ -13,7 +13,7 @@ from .config import DreamerConfig, PlannerConfig
 from .types import PlanResult, PyTree, RSSMState
 from .world_model import (
     predict_continuation_logits,
-    predict_reward,
+    predict_transition_reward,
     sample_prior,
     transition_deterministic,
 )
@@ -32,6 +32,7 @@ def _rollout_single(
 
     def step(carry: RSSMState, inputs: tuple[Array, Array]):
         action_value, noise = inputs
+        previous_feature = carry.feature
         deterministic = transition_deterministic(
             params, carry, action_value[None], config
         )
@@ -41,7 +42,9 @@ def _rollout_single(
         next_state = RSSMState(deterministic, stochastic)
         feature = next_state.feature
         output = (
-            predict_reward(params, feature, config)[0],
+            predict_transition_reward(
+                params, previous_feature, action_value[None], feature, config
+            )[0],
             jax.nn.sigmoid(predict_continuation_logits(params, feature))[0],
             feature[0],
         )
