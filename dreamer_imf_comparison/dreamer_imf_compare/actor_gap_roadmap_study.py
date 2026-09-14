@@ -40,7 +40,8 @@ PREFLIGHT_MARKER_SCHEMA = "trajectory-imf-actor-gap-preflight-marker-v1"
 PREFLIGHT_GATE_SCHEMA = "trajectory-imf-actor-gap-preflight-gate-v1"
 SUBMISSION_MAP_SCHEMA = "trajectory-imf-actor-gap-submission-map-v1"
 SUBMISSION_RECORD_SCHEMA = "trajectory-imf-actor-gap-slurm-submission-record-v1"
-SLURM_ALLOCATION_SCHEMA = "trajectory-imf-actor-gap-slurm-allocation-v2"
+SLURM_ALLOCATION_SCHEMA = "trajectory-imf-actor-gap-slurm-allocation-v3"
+SLURM_NODE_FQDN_SUFFIX = ".sc.intern.uni-leipzig.de"
 STAGE_MARKER_SCHEMA = "trajectory-imf-actor-gap-stage-marker-v1"
 REPORT_SCHEMA = "trajectory-imf-actor-gap-report-v1"
 CHECKPOINT_VERSION = 1
@@ -1474,6 +1475,39 @@ def _is_single_l40s_allocation(alloc_tres: str, tres_per_node: str) -> bool:
     )
 
 
+def _same_slurm_node(batch_host: str, runtime_node: str) -> bool:
+    """Match Slurm's short host label to the kernel's FQDN without prefix guessing."""
+
+    names = []
+    for value in (batch_host, runtime_node):
+        normalized = value.lower()
+        if normalized.endswith("."):
+            normalized = normalized[:-1]
+        if (
+            not normalized
+            or not normalized.isascii()
+            or any(
+                not label
+                or label.startswith("-")
+                or label.endswith("-")
+                or any(
+                    not (character.isalnum() or character == "-") for character in label
+                )
+                for label in normalized.split(".")
+            )
+        ):
+            return False
+        names.append(normalized)
+    slurm_name, kernel_name = names
+    if slurm_name == kernel_name:
+        return True
+    if "." not in slurm_name:
+        return kernel_name == slurm_name + SLURM_NODE_FQDN_SUFFIX
+    if "." not in kernel_name:
+        return slurm_name == kernel_name + SLURM_NODE_FQDN_SUFFIX
+    return False
+
+
 def _slurm_allocation_certificate(
     job_id: str,
     *,
@@ -1508,7 +1542,7 @@ def _slurm_allocation_certificate(
     tres_per_node = str(record.get("TresPerNode") or "")
     if (
         record.get("JobState") != "RUNNING"
-        or record.get("BatchHost") != os.uname().nodename
+        or not _same_slurm_node(str(record.get("BatchHost") or ""), os.uname().nodename)
         or record.get("Account") != "dep_inin_dat"
         or record.get("Partition") != "gpu-l40s"
         or not _is_single_l40s_allocation(alloc_tres, tres_per_node)
@@ -1622,7 +1656,7 @@ def _validate_slurm_allocation_certificate(
         or canonical.get("job_state") != record.get("JobState")
         or canonical.get("job_state") != "RUNNING"
         or canonical.get("batch_host") != record.get("BatchHost")
-        or canonical.get("batch_host") != node_name
+        or not _same_slurm_node(str(canonical.get("batch_host") or ""), node_name)
         or canonical.get("account") != record.get("Account")
         or canonical.get("account") != "dep_inin_dat"
         or canonical.get("partition") != record.get("Partition")

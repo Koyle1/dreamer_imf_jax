@@ -590,10 +590,11 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
                     )
 
     def test_live_slurm_certificate_binds_array_parent_task_node_and_gpu(self) -> None:
-        node = os.uname().nodename
+        node = "firehorse01.sc.intern.uni-leipzig.de"
+        batch_host = "firehorse01"
         raw = (
             "JobId=125 ArrayJobId=123 ArrayTaskId=0 JobState=RUNNING "
-            f"BatchHost={node} Account=dep_inin_dat Partition=gpu-l40s "
+            f"BatchHost={batch_host} Account=dep_inin_dat Partition=gpu-l40s "
             "AllocTRES=cpu=8,mem=64G,node=1,gres/gpu=1,gres/gpu:l40s=1 "
             "TresPerNode=gres/gpu:1"
         )
@@ -601,8 +602,8 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
             "CUDA_VISIBLE_DEVICES": "0",
         }
         with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
-            study.subprocess, "check_output", return_value=raw
-        ):
+            study.os, "uname", return_value=mock.Mock(nodename=node)
+        ), mock.patch.object(study.subprocess, "check_output", return_value=raw):
             certificate = study._slurm_allocation_certificate(
                 "125", array_job_id="123", array_task_id=0
             )
@@ -630,7 +631,11 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
                 "SLURM_STEP_GPUS": "3",
             },
             clear=True,
-        ), mock.patch.object(study.subprocess, "check_output", return_value=raw):
+        ), mock.patch.object(
+            study.os, "uname", return_value=mock.Mock(nodename=node)
+        ), mock.patch.object(
+            study.subprocess, "check_output", return_value=raw
+        ):
             hinted = study._slurm_allocation_certificate(
                 "125", array_job_id="123", array_task_id=0
             )
@@ -661,6 +666,8 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
             with self.subTest(malformed=malformed), mock.patch.dict(
                 os.environ, environment, clear=True
             ), mock.patch.object(
+                study.os, "uname", return_value=mock.Mock(nodename=node)
+            ), mock.patch.object(
                 study.subprocess, "check_output", return_value=malformed
             ), self.assertRaisesRegex(
                 ValueError, "one-GPU"
@@ -676,9 +683,38 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
             with self.subTest(variable=variable), mock.patch.dict(
                 os.environ, {**environment, variable: "0,1"}, clear=True
             ), mock.patch.object(
+                study.os, "uname", return_value=mock.Mock(nodename=node)
+            ), mock.patch.object(
                 study.subprocess, "check_output", return_value=raw
             ), self.assertRaisesRegex(
                 ValueError, "one-GPU"
+            ):
+                study._slurm_allocation_certificate(
+                    "125", array_job_id="123", array_task_id=0
+                )
+
+        self.assertTrue(study._same_slurm_node(batch_host, node))
+        self.assertTrue(study._same_slurm_node(node, batch_host))
+        self.assertTrue(study._same_slurm_node("FIREHORSE01", node + "."))
+        for other in (
+            "",
+            "firehorse010.sc.intern.uni-leipzig.de",
+            "firehorse01.evil.example",
+            "firehorse01..sc.intern.uni-leipzig.de",
+            "-firehorse01.sc.intern.uni-leipzig.de",
+            "firehorse01/sc.intern.uni-leipzig.de",
+        ):
+            with self.subTest(other=other):
+                self.assertFalse(study._same_slurm_node(batch_host, other))
+        with self.assertRaisesRegex(ValueError, "one-GPU"):
+            with mock.patch.dict(
+                os.environ, environment, clear=True
+            ), mock.patch.object(
+                study.os,
+                "uname",
+                return_value=mock.Mock(nodename="firehorse02.sc.intern.uni-leipzig.de"),
+            ), mock.patch.object(
+                study.subprocess, "check_output", return_value=raw
             ):
                 study._slurm_allocation_certificate(
                     "125", array_job_id="123", array_task_id=0
@@ -696,6 +732,30 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "allocation certificate"):
             study._validate_slurm_allocation_certificate(
                 tampered_raw,
+                job_id="125",
+                node_name=node,
+                array_job_id="123",
+                array_task_id=0,
+            )
+        wrong_host_raw = raw.replace("BatchHost=firehorse01", "BatchHost=firehorse02")
+        forged_wrong_host = {
+            **certificate,
+            "raw_record": wrong_host_raw,
+            "batch_host": "firehorse02",
+            "canonical_record": study._parse_scontrol_record(wrong_host_raw),
+        }
+        forged_wrong_host["raw_record_sha256"] = study.benchmark.object_sha256(
+            forged_wrong_host["raw_record"]
+        )
+        forged_wrong_host["canonical_record_sha256"] = study.benchmark.object_sha256(
+            forged_wrong_host["canonical_record"]
+        )
+        forged_wrong_host["certificate_sha256"] = study._unsigned_digest(
+            forged_wrong_host, "certificate_sha256"
+        )
+        with self.assertRaisesRegex(ValueError, "allocation certificate"):
+            study._validate_slurm_allocation_certificate(
+                forged_wrong_host,
                 job_id="125",
                 node_name=node,
                 array_job_id="123",
