@@ -84,6 +84,31 @@ def init_action_reward_residual(config: DreamerConfig, key: Array) -> Params:
     )
 
 
+def init_transition_reward_head(config: DreamerConfig, key: Array) -> Params:
+    """Initialize a direct scalar reward model for a latent transition.
+
+    The head consumes ``(feature_t, action_t, feature_{t+1} - feature_t)``.
+    It predicts the complete reward rather than correcting the legacy
+    state-only reward decoder.  Three hidden layers match the simple direct
+    reward MLP used by recent differentiable MeanFlow world models while the
+    existing ``hidden_dim`` keeps this intervention deliberately small.
+    """
+
+    head = init_mlp(
+        key,
+        2 * config.feature_dim + config.action_dim,
+        config.hidden_dim,
+        1,
+        depth=3,
+        output_gain=0.0,
+    )
+    layers = list(head["layers"])
+    output = dict(layers[-1])
+    output["bias"] = jnp.full_like(output["bias"], config.reward_initial_value)
+    layers[-1] = output
+    return {"layers": tuple(layers)}
+
+
 def init_world_model(config: DreamerConfig, key: Array) -> Params:
     """Initialize all recurrent world-model parameters."""
 
@@ -840,6 +865,35 @@ def predict_action_reward_residual(
     return mlp(params["reward_action_residual"], inputs)[..., 0]
 
 
+def predict_direct_transition_reward(
+    params: Params,
+    previous_feature: Array,
+    action: Array,
+    next_feature: Array,
+    config: DreamerConfig,
+) -> Array:
+    """Predict a complete scalar reward from one causal latent transition.
+
+    Gradients are intentionally preserved.  Reward-head-only fitting stops
+    gradients at the frozen latent features, whereas imagined actor training
+    needs the reward derivative with respect to actions and future features.
+    """
+
+    leading = next_feature.shape[:-1]
+    if previous_feature.shape != next_feature.shape:
+        raise ValueError("previous_feature and next_feature must have identical shape")
+    if next_feature.shape[-1] != config.feature_dim:
+        raise ValueError("transition features have the wrong final dimension")
+    if action.shape != (*leading, config.action_dim):
+        raise ValueError("transition action has the wrong shape")
+    if "reward_transition" not in params:
+        raise ValueError("direct transition reward head is not attached")
+    inputs = jnp.concatenate(
+        (previous_feature, action, next_feature - previous_feature), axis=-1
+    )
+    return mlp(params["reward_transition"], inputs)[..., 0]
+
+
 def predict_transition_reward(
     params: Params,
     previous_feature: Array,
@@ -847,7 +901,16 @@ def predict_transition_reward(
     next_feature: Array,
     config: DreamerConfig,
 ) -> Array:
-    """Compose the calibrated base reward with an optional causal residual."""
+    """Predict transition reward with an explicit backwards-compatible order.
+
+    A direct transition head replaces the legacy state-only decoder.  Without
+    it, existing checkpoints retain their exact base-plus-residual behavior.
+    """
+
+    if "reward_transition" in params:
+        return predict_direct_transition_reward(
+            params, previous_feature, action, next_feature, config
+        )
 
     return predict_reward(params, next_feature, config) + predict_action_reward_residual(
         params, previous_feature, action, next_feature, config
