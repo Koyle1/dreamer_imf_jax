@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed checks for the iMF direct transition-reward study."""
+"""Fail-closed checks for the iMF ITPO-style state-action reward study."""
 
 from __future__ import annotations
 
@@ -25,6 +25,8 @@ def verify_implementation() -> None:
         "init_transition_reward_state(",
         "jit_train_transition_reward_step(",
         "attach_transition_reward_head(",
+        "_training_observation_statistics(arrays)",
+        'hidden_dim=int(manifest["reward_hidden_dim"])',
         "source_world_model_parameter_delta",
     )
     required_actor = (
@@ -36,9 +38,9 @@ def verify_implementation() -> None:
         "frozen_world_digest",
     )
     if any(token not in reward_source for token in required_reward):
-        raise ValueError("direct reward implementation lost an isolation operation")
+        raise ValueError("state-action reward implementation lost an isolation operation")
     if any(token not in actor_source for token in required_actor):
-        raise ValueError("direct reward actor lost a corrected training operation")
+        raise ValueError("state-action reward actor lost a corrected training operation")
     print("IMF_TRANSITION_REWARD_IMPLEMENTATION_VERIFIED")
 
 

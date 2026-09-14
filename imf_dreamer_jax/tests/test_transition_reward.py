@@ -81,18 +81,25 @@ class TransitionRewardTests(unittest.TestCase):
     def test_direct_head_is_a_replacement_and_preserves_actor_gradients(self) -> None:
         cfg = config()
         source = create_agent(cfg, jax.random.key(10))
-        reward_state = init_transition_reward_state(cfg, jax.random.key(11))
+        reward_state = init_transition_reward_state(
+            cfg, jax.random.key(11), hidden_dim=16
+        )
         # Make every layer active so the derivative test does not rely on
         # random cancellation or on training convergence.
         layers = []
-        for layer in reward_state.params["layers"]:
+        for layer in reward_state.params["network"]["layers"]:
             layers.append(
                 {
                     "weight": jnp.full_like(layer["weight"], 0.05),
                     "bias": jnp.full_like(layer["bias"], 0.01),
                 }
             )
-        reward_state = reward_state._replace(params={"layers": tuple(layers)})
+        reward_state = reward_state._replace(
+            params={
+                **reward_state.params,
+                "network": {"layers": tuple(layers)},
+            }
+        )
         attached = attach_transition_reward_head(source, reward_state)
         previous = jnp.ones((2, cfg.feature_dim))
         following = 1.1 * previous
@@ -113,6 +120,30 @@ class TransitionRewardTests(unittest.TestCase):
             prediction,
             predict_transition_reward(altered, previous, actions, following, cfg),
         )
+        np.testing.assert_array_equal(
+            prediction,
+            predict_transition_reward(
+                attached.params.world_model,
+                previous,
+                actions,
+                following + 100.0,
+                cfg,
+            ),
+        )
+        altered_decoder = jax.tree_util.tree_map(
+            lambda value: value + 0.25,
+            attached.params.world_model["decoder"],
+        )
+        decoder_sensitive = {
+            **attached.params.world_model,
+            "decoder": altered_decoder,
+        }
+        changed_prediction = predict_transition_reward(
+            decoder_sensitive, previous, actions, following, cfg
+        )
+        self.assertGreater(
+            float(jnp.linalg.norm(changed_prediction - prediction)), 0.0
+        )
         action_gradient = jax.grad(
             lambda value: jnp.sum(
                 predict_transition_reward(
@@ -126,7 +157,13 @@ class TransitionRewardTests(unittest.TestCase):
         cfg = config()
         source = create_agent(cfg, jax.random.key(20))
         frozen = source.params.world_model
-        reward_state = init_transition_reward_state(cfg, jax.random.key(21))
+        reward_state = init_transition_reward_state(
+            cfg,
+            jax.random.key(21),
+            observation_mean=jnp.asarray([1.0, -2.0, 0.5]),
+            observation_std=jnp.asarray([2.0, 0.5, 4.0]),
+            hidden_dim=16,
+        )
         data = batch(cfg)
         objective = TransitionRewardConfig(learning_rate=1e-2, grad_clip=1.0)
         loss_key = jax.random.key(22)
@@ -134,6 +171,8 @@ class TransitionRewardTests(unittest.TestCase):
             reward_state.params, frozen, data, loss_key, cfg
         ).loss
         original_source = jax.tree_util.tree_map(lambda value: value.copy(), frozen)
+        original_mean = reward_state.params["observation_mean"].copy()
+        original_std = reward_state.params["observation_std"].copy()
         for _ in range(200):
             reward_state, metrics = jit_train_transition_reward_step(
                 reward_state, frozen, data, loss_key, cfg, objective
@@ -144,6 +183,12 @@ class TransitionRewardTests(unittest.TestCase):
         self.assertTrue(np.isfinite(float(metrics.grad_norm)))
         self.assertLess(float(final), 0.05 * float(initial))
         assert_tree_equal(self, frozen, original_source)
+        np.testing.assert_array_equal(
+            reward_state.params["observation_mean"], original_mean
+        )
+        np.testing.assert_array_equal(
+            reward_state.params["observation_std"], original_std
+        )
 
         attached = attach_transition_reward_head(source, reward_state)
         for name, subtree in source.params.world_model.items():
@@ -158,10 +203,13 @@ class TransitionRewardTests(unittest.TestCase):
             init_transition_reward_state(
                 config(prior="gaussian", imf_trajectory_enabled=False),
                 jax.random.key(30),
+                hidden_dim=16,
             )
         with self.assertRaisesRegex(ValueError, "scalar one-step MSE"):
             init_transition_reward_state(
-                config(reward_prediction_horizon=1), jax.random.key(31)
+                config(reward_prediction_horizon=1),
+                jax.random.key(31),
+                hidden_dim=16,
             )
 
 

@@ -1,4 +1,4 @@
-"""iMF-only Reacher study for a direct transition-conditioned reward head."""
+"""iMF-only Reacher study for the published ITPO state-action reward head."""
 
 from __future__ import annotations
 
@@ -18,11 +18,11 @@ from . import correct_actor_training as corrected
 from . import matched_objective_benchmark as benchmark
 
 
-SCHEMA = "trajectory-imf-direct-transition-reward-study-v1"
-REWARD_RESULT_SCHEMA = "trajectory-imf-direct-transition-reward-cell-v1"
-ACTOR_RESULT_SCHEMA = "trajectory-imf-direct-transition-reward-actor-v1"
-MARKER_SCHEMA = "trajectory-imf-direct-transition-reward-marker-v1"
-REPORT_SCHEMA = "trajectory-imf-direct-transition-reward-report-v1"
+SCHEMA = "trajectory-imf-itpo-state-action-reward-study-v2"
+REWARD_RESULT_SCHEMA = "trajectory-imf-itpo-state-action-reward-cell-v2"
+ACTOR_RESULT_SCHEMA = "trajectory-imf-itpo-state-action-reward-actor-v2"
+MARKER_SCHEMA = "trajectory-imf-itpo-state-action-reward-marker-v2"
+REPORT_SCHEMA = "trajectory-imf-itpo-state-action-reward-report-v2"
 TASK = "dmc_reacher_easy"
 REWARD_UPDATES = 10_000
 HELDOUT_BATCHES = 32
@@ -376,7 +376,7 @@ def build_manifest(
         {
             "index": index,
             "world_model_seed": seed,
-            "cell_id": f"transition-reward-{seed}",
+            "cell_id": f"itpo-state-action-reward-{seed}",
             "result_path": f"reward/seed-{seed}/result.json",
             "checkpoint_path": f"reward/seed-{seed}/checkpoint.pkl",
             "schedule_path": f"reward/seed-{seed}/schedule.npz",
@@ -391,7 +391,7 @@ def build_manifest(
             "world_model_seed": reference["world_model_seed"],
             "actor_seed": reference["actor_seed"],
             "cell_id": (
-                f"transition-reward-actor-{reference['world_model_seed']}"
+                f"itpo-state-action-reward-actor-{reference['world_model_seed']}"
                 f"-{reference['actor_seed']}"
             ),
             "result_path": (
@@ -440,8 +440,18 @@ def build_manifest(
         "reward_updates": int(reward_updates),
         "heldout_batches": int(heldout_batches),
         "reward_objective": "masked_one_step_scalar_mse",
-        "reward_inputs": ["previous_feature", "action", "feature_delta"],
+        "reward_head_reference": {
+            "name": "ITPO/FlowMPC state-action reward model",
+            "url": "https://arxiv.org/abs/2603.22430",
+            "published_updates": 200_000,
+            "published_batch_size": 2048,
+        },
+        "reward_inputs": ["standardized_decoded_current_state", "action"],
         "reward_hidden_layers": 3,
+        "reward_hidden_dim": 512,
+        "reward_activation": "relu",
+        "reward_state_statistics": "training_episodes_only",
+        "reward_actions_normalized": False,
         "reward_learning_rate": 3e-4,
         "reward_grad_clip": 1.0,
         "source_world_model_frozen": True,
@@ -475,8 +485,14 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
         or manifest.get("arm") != "trajectory_imf"
         or manifest.get("reward_objective") != "masked_one_step_scalar_mse"
         or manifest.get("reward_inputs")
-        != ["previous_feature", "action", "feature_delta"]
+        != ["standardized_decoded_current_state", "action"]
         or int(manifest.get("reward_hidden_layers", -1)) != 3
+        or int(manifest.get("reward_hidden_dim", -1)) != 512
+        or manifest.get("reward_activation") != "relu"
+        or manifest.get("reward_state_statistics") != "training_episodes_only"
+        or manifest.get("reward_actions_normalized") is not False
+        or manifest.get("reward_head_reference", {}).get("url")
+        != "https://arxiv.org/abs/2603.22430"
         or manifest.get("source_world_model_frozen") is not True
         or manifest.get("claim_eligible") is not False
         or len(manifest.get("reward_cells", [])) != EXPECTED_REWARD_CELLS
@@ -601,7 +617,7 @@ def _reward_schedules(
         arrays,
         task=TASK,
         world_model_seed=benchmark.derive_seed(
-            "direct-transition-reward-train", seed
+            "itpo-state-action-reward-train", seed
         ),
         updates=int(manifest["reward_updates"]),
         **settings,
@@ -610,7 +626,7 @@ def _reward_schedules(
         arrays,
         task=TASK,
         world_model_seed=benchmark.derive_seed(
-            "direct-transition-reward-heldout", seed
+            "itpo-state-action-reward-heldout", seed
         ),
         updates=int(manifest["heldout_batches"]),
         **settings,
@@ -618,6 +634,29 @@ def _reward_schedules(
     if benchmark.array_sha256(train) == benchmark.array_sha256(heldout):
         raise ValueError("training and held-out reward schedules unexpectedly match")
     return train, heldout
+
+
+def _training_observation_statistics(
+    arrays: Mapping[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Compute the published state normalization from training episodes only."""
+
+    train_ids = np.asarray(arrays["train_episode_ids"], dtype=np.int64)
+    observations = np.asarray(arrays["observations"][train_ids, :-1], dtype=np.float32)
+    continuations = np.asarray(
+        arrays["continuations"][train_ids, :-1], dtype=np.float32
+    )
+    valid = continuations > 0.0
+    flat = observations.reshape((observations.shape[0], observations.shape[1], -1))
+    values = flat[valid]
+    if values.ndim != 2 or values.shape[0] <= 0:
+        raise ValueError("training replay contains no valid reward states")
+    mean = np.mean(values, axis=0, dtype=np.float64).astype(np.float32)
+    std = np.std(values, axis=0, dtype=np.float64).astype(np.float32)
+    std = np.maximum(std, np.float32(1e-6))
+    if not np.all(np.isfinite(mean)) or not np.all(np.isfinite(std)):
+        raise FloatingPointError("reward state normalization is not finite")
+    return mean, std, int(values.shape[0])
 
 
 def _evaluate_reward_mse(
@@ -651,7 +690,7 @@ def _evaluate_reward_mse(
             burn_in=config.burn_in,
         )
         key = benchmark.derive_jax_key(
-            "direct-transition-reward-evaluation", seed, index
+            "itpo-state-action-reward-evaluation", seed, index
         )
         direct = transition_reward_loss(
             reward_params, frozen_world, batch, key, config
@@ -667,7 +706,9 @@ def _evaluate_reward_mse(
         source_prediction = predict_reward(
             frozen_world, sequence.states.feature, config
         )
-        mask = np.asarray(batch["loss_mask"], dtype=np.float64)
+        # Use the head's effective mask so evaluation exactly matches the
+        # causal state-action objective (including first-transition removal).
+        mask = np.asarray(jax.device_get(direct.mask), dtype=np.float64)
         targets = np.asarray(batch["rewards"], dtype=np.float64)
         direct_prediction = np.asarray(jax.device_get(direct.predictions), dtype=np.float64)
         source_prediction = np.asarray(jax.device_get(source_prediction), dtype=np.float64)
@@ -677,7 +718,7 @@ def _evaluate_reward_mse(
     if count <= 0.0:
         raise ValueError("held-out reward schedule has no valid targets")
     metrics = {
-        "direct_transition_mse": direct_squared / count,
+        "state_action_mse": direct_squared / count,
         "source_state_only_mse": source_squared / count,
         "valid_targets": count,
     }
@@ -735,9 +776,15 @@ def train_reward_cell(
     heldout_path = Path(output_root) / str(cell["heldout_schedule_path"])
     benchmark._write_npz_atomic(schedule_path, train_schedule)
     benchmark._write_npz_atomic(heldout_path, heldout_schedule)
+    observation_mean, observation_std, normalization_count = (
+        _training_observation_statistics(arrays)
+    )
     reward_state = init_transition_reward_state(
         config,
-        benchmark.derive_jax_key("direct-transition-reward-init", seed),
+        benchmark.derive_jax_key("itpo-state-action-reward-init", seed),
+        observation_mean=observation_mean,
+        observation_std=observation_std,
+        hidden_dim=int(manifest["reward_hidden_dim"]),
     )
     initial_reward = jax.tree_util.tree_map(
         lambda value: value.copy(), reward_state.params
@@ -753,10 +800,11 @@ def train_reward_cell(
     objective = TransitionRewardConfig(
         learning_rate=float(manifest["reward_learning_rate"]),
         grad_clip=float(manifest["reward_grad_clip"]),
+        hidden_dim=int(manifest["reward_hidden_dim"]),
     )
     execution = benchmark._profile_execution("pilot")
     sequence_length = int(execution["sequence_length"])
-    train_key = benchmark.derive_jax_key("direct-transition-reward-loss", seed)
+    train_key = benchmark.derive_jax_key("itpo-state-action-reward-loss", seed)
     latest = None
     started = time.perf_counter()
     for update in range(int(manifest["reward_updates"])):
@@ -799,9 +847,9 @@ def train_reward_cell(
         )
     )
     if head_delta <= 0.0:
-        raise RuntimeError("direct transition reward parameters did not update")
+        raise RuntimeError("state-action reward parameters did not update")
     fresh = create_agent(
-        config, benchmark.derive_jax_key("direct-transition-reward-shell", seed)
+        config, benchmark.derive_jax_key("itpo-state-action-reward-shell", seed)
     )
     shell = AgentState(
         AgentParams(frozen_world, fresh.params.actor, fresh.params.critic),
@@ -825,7 +873,7 @@ def train_reward_cell(
         attached,
         config,
         metadata={
-            "stage": "direct_transition_reward",
+            "stage": "itpo_state_action_reward",
             "cell_id": cell["cell_id"],
             "manifest_sha256": manifest["manifest_sha256"],
             "source_world_model_checkpoint_sha256": source[
@@ -851,9 +899,20 @@ def train_reward_cell(
         "source_world_model_parameter_sha256": source_digest,
         "source_world_model_parameter_delta": 0.0,
         "trainable_subtrees": ["reward_transition"],
+        "reward_head_family": "itpo_state_action_mlp",
+        "reward_input_space": "decoded_environment_observation",
+        "observation_normalization_count": normalization_count,
+        "observation_mean": observation_mean.tolist(),
+        "observation_std": observation_std.tolist(),
+        "observation_statistics_frozen": True,
         "reward_parameter_delta": head_delta,
         "reward_parameter_count": int(
-            sum(value.size for value in jax.tree_util.tree_leaves(reward_state.params))
+            sum(
+                value.size
+                for value in jax.tree_util.tree_leaves(
+                    reward_state.params["network"]
+                )
+            )
         ),
         "final_training_metrics": latest,
         "initial_heldout_metrics": initial_metrics,
@@ -904,6 +963,10 @@ def verify_reward_cell(output_root: str | Path, index: int) -> dict[str, Any]:
     if (
         result.get("source_world_model_parameter_delta") != 0.0
         or result.get("trainable_subtrees") != ["reward_transition"]
+        or result.get("reward_head_family") != "itpo_state_action_mlp"
+        or result.get("reward_input_space") != "decoded_environment_observation"
+        or result.get("observation_statistics_frozen") is not True
+        or int(result.get("observation_normalization_count", 0)) <= 0
         or float(result.get("reward_parameter_delta", 0.0)) <= 0.0
         or int(result.get("reward_updates", -1)) != int(manifest["reward_updates"])
         or result.get("checkpoint_sha256") != benchmark.file_sha256(checkpoint)
@@ -924,7 +987,7 @@ def verify_reward_cell(output_root: str | Path, index: int) -> dict[str, Any]:
     )
     if (
         config != _source_config(source)
-        or metadata.get("stage") != "direct_transition_reward"
+        or metadata.get("stage") != "itpo_state_action_reward"
         or metadata.get("cell_id") != cell["cell_id"]
         or metadata.get("manifest_sha256") != manifest["manifest_sha256"]
         or int(metadata.get("completed_reward_updates", -1))
@@ -933,6 +996,31 @@ def verify_reward_cell(output_root: str | Path, index: int) -> dict[str, Any]:
         != {"reward_transition"}
     ):
         raise ValueError("transition reward checkpoint structure differs")
+    head = state.params.world_model["reward_transition"]
+    layers = head.get("network", {}).get("layers", ())
+    expected_mean, expected_std, expected_count = _training_observation_statistics(
+        benchmark.load_npz(source["dataset"])
+    )
+    if (
+        len(layers) != 4
+        or layers[0]["weight"].shape
+        != (config.observation_dim + config.action_dim, 512)
+        or any(layer["weight"].shape != (512, 512) for layer in layers[1:3])
+        or layers[-1]["weight"].shape != (512, 1)
+        or not np.array_equal(
+            np.asarray(head["observation_mean"]),
+            np.asarray(result["observation_mean"], dtype=np.float32),
+        )
+        or not np.array_equal(np.asarray(head["observation_mean"]), expected_mean)
+        or not np.array_equal(
+            np.asarray(head["observation_std"]),
+            np.asarray(result["observation_std"], dtype=np.float32),
+        )
+        or not np.array_equal(np.asarray(head["observation_std"]), expected_std)
+        or int(result["observation_normalization_count"]) != expected_count
+        or not np.all(np.asarray(head["observation_std"]) > 0.0)
+    ):
+        raise ValueError("published state-action reward head structure differs")
     for name, subtree in source_state.params.world_model.items():
         if benchmark._tree_digest(subtree) != benchmark._tree_digest(
             state.params.world_model[name]
@@ -970,7 +1058,7 @@ def _actor_checkpoint_metadata(
     wall_seconds: float,
 ) -> dict[str, Any]:
     return {
-        "stage": "direct_transition_reward_actor",
+        "stage": "itpo_state_action_reward_actor",
         "cell_id": cell["cell_id"],
         "reward_checkpoint_sha256": reward_result["checkpoint_sha256"],
         "completed_preparation_updates": int(preparation_updates),
@@ -1240,7 +1328,7 @@ def train_actor_cell(
         "cell_id": cell["cell_id"],
         "cell_index": int(cell["index"]),
         "task": TASK,
-        "arm": "trajectory_imf_direct_transition_reward",
+        "arm": "trajectory_imf_itpo_state_action_reward",
         "world_model_seed": seed,
         "actor_seed": actor_seed,
         "preparation_updates": total_prep,
@@ -1314,7 +1402,7 @@ def verify_actor_cell(
         "cell_id": cell["cell_id"],
         "cell_index": int(cell["index"]),
         "task": TASK,
-        "arm": "trajectory_imf_direct_transition_reward",
+        "arm": "trajectory_imf_itpo_state_action_reward",
         "world_model_seed": int(cell["world_model_seed"]),
         "actor_seed": int(cell["actor_seed"]),
     }
@@ -1358,7 +1446,7 @@ def verify_actor_cell(
     reward_state, reward_config, _ = load_checkpoint(reward_checkpoint)
     if (
         config != reward_config
-        or metadata.get("stage") != "direct_transition_reward_actor"
+        or metadata.get("stage") != "itpo_state_action_reward_actor"
         or metadata.get("cell_id") != cell["cell_id"]
         or benchmark._tree_digest(state.params.world_model)
         != benchmark._tree_digest(reward_state.params.world_model)
@@ -1481,7 +1569,9 @@ def finalize(output_root: str | Path) -> dict[str, Any]:
         ]
         if len(direct_rows) != 2 or len(references) != 2:
             raise ValueError("paired world-seed actor unit is incomplete")
-        direct = float(np.mean([row["normalized_episode_return_mean"] for row in direct_rows]))
+        state_action = float(
+            np.mean([row["normalized_episode_return_mean"] for row in direct_rows])
+        )
         trajectory = float(
             np.mean(
                 [
@@ -1502,25 +1592,25 @@ def finalize(output_root: str | Path) -> dict[str, Any]:
             {
                 "task": TASK,
                 "world_model_seed": int(world_seed),
-                "direct_transition_reward": direct,
+                "state_action_reward": state_action,
                 "original_trajectory_imf": trajectory,
                 "shortcut_forcing": shortcut,
-                "direct_minus_original_imf": direct - trajectory,
-                "direct_minus_shortcut": direct - shortcut,
+                "state_action_minus_original_imf": state_action - trajectory,
+                "state_action_minus_shortcut": state_action - shortcut,
             }
         )
     iqm = {
         name: benchmark.interquartile_mean([float(row[name]) for row in paired_units])
         for name in (
-            "direct_transition_reward",
+            "state_action_reward",
             "original_trajectory_imf",
             "shortcut_forcing",
         )
     }
-    direct_minus_original = iqm["direct_transition_reward"] - iqm[
+    state_action_minus_original = iqm["state_action_reward"] - iqm[
         "original_trajectory_imf"
     ]
-    direct_minus_shortcut = iqm["direct_transition_reward"] - iqm[
+    state_action_minus_shortcut = iqm["state_action_reward"] - iqm[
         "shortcut_forcing"
     ]
     report = {
@@ -1534,13 +1624,20 @@ def finalize(output_root: str | Path) -> dict[str, Any]:
         "strict_actor_replay_markers": len(actor_results),
         "paired_units": paired_units,
         "normalized_return_iqm": iqm,
-        "direct_minus_original_imf_iqm": direct_minus_original,
-        "direct_minus_shortcut_iqm": direct_minus_shortcut,
+        "state_action_minus_original_imf_iqm": state_action_minus_original,
+        "state_action_minus_shortcut_iqm": state_action_minus_shortcut,
         "favorable_world_seed_fraction_vs_original_imf": float(
-            np.mean([row["direct_minus_original_imf"] > 0.0 for row in paired_units])
+            np.mean(
+                [
+                    row["state_action_minus_original_imf"] > 0.0
+                    for row in paired_units
+                ]
+            )
         ),
         "favorable_world_seed_fraction_vs_shortcut": float(
-            np.mean([row["direct_minus_shortcut"] > 0.0 for row in paired_units])
+            np.mean(
+                [row["state_action_minus_shortcut"] > 0.0 for row in paired_units]
+            )
         ),
         "reward_heldout_mse": {
             "source_state_only_mean": float(
@@ -1551,10 +1648,10 @@ def finalize(output_root: str | Path) -> dict[str, Any]:
                     ]
                 )
             ),
-            "direct_transition_mean": float(
+            "state_action_mean": float(
                 np.mean(
                     [
-                        row["final_heldout_metrics"]["direct_transition_mse"]
+                        row["final_heldout_metrics"]["state_action_mse"]
                         for row in reward_results
                     ]
                 )
@@ -1581,13 +1678,15 @@ def finalize(output_root: str | Path) -> dict[str, Any]:
         ),
         "claim_status": "exploratory_selected_reacher_intervention_only",
         "supports_reward_head_hypothesis": bool(
-            direct_minus_original > 0.0 and direct_minus_shortcut > 0.0
+            state_action_minus_original > 0.0
+            and state_action_minus_shortcut > 0.0
         ),
         "limitations": [
             "Reacher only; no task-level replication",
             "selected pilot candidates and pilot seeds are reused, so this is diagnostic evidence",
             "shortcut is an immutable paired reference and was not retrained",
-            "the intervention adds a small direct reward MLP while freezing all source dynamics",
+            "the intervention adapts the published state-action MLP to decoded latent states while freezing all source dynamics",
+            "the published 200k-update D4RL budget is scaled to the existing 10k-update matched pilot budget",
         ],
         "runtime": benchmark.runtime_fingerprint(),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
@@ -1625,7 +1724,7 @@ def aggregate_synthetic_units(units: list[Mapping[str, float]]) -> dict[str, flo
     """Small pure helper used to verify paired aggregation logic."""
 
     required = {
-        "direct_transition_reward",
+        "state_action_reward",
         "original_trajectory_imf",
         "shortcut_forcing",
     }
@@ -1640,30 +1739,30 @@ def aggregate_synthetic_units(units: list[Mapping[str, float]]) -> dict[str, flo
 def self_test() -> None:
     units = [
         {
-            "direct_transition_reward": 0.4,
+            "state_action_reward": 0.4,
             "original_trajectory_imf": 0.2,
             "shortcut_forcing": 0.3,
         },
         {
-            "direct_transition_reward": 0.6,
+            "state_action_reward": 0.6,
             "original_trajectory_imf": 0.5,
             "shortcut_forcing": 0.45,
         },
         {
-            "direct_transition_reward": 0.5,
+            "state_action_reward": 0.5,
             "original_trajectory_imf": 0.3,
             "shortcut_forcing": 0.4,
         },
     ]
     summary = aggregate_synthetic_units(units)
     expected = {
-        "direct_transition_reward": 0.5,
+        "state_action_reward": 0.5,
         "original_trajectory_imf": 0.31666666666666665,
         "shortcut_forcing": 0.39166666666666666,
     }
     if any(not math.isclose(summary[name], value) for name, value in expected.items()):
         raise AssertionError("paired aggregation positive control failed")
-    for invalid in ([], [{"direct_transition_reward": 1.0}]):
+    for invalid in ([], [{"state_action_reward": 1.0}]):
         try:
             aggregate_synthetic_units(invalid)
         except ValueError:

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=imf-transition-reward
+#SBATCH --job-name=imf-itpo-reward
 #SBATCH --account=dep_inin_dat
 #SBATCH --partition=gpu-l40s
 #SBATCH --gres=gpu:1

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the focused direct transition-reward acceptance tests."""
+"""Run the focused ITPO-style state-action reward acceptance tests."""
 
 from __future__ import annotations
 

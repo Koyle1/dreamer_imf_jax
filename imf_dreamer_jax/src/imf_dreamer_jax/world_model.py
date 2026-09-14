@@ -84,29 +84,54 @@ def init_action_reward_residual(config: DreamerConfig, key: Array) -> Params:
     )
 
 
-def init_transition_reward_head(config: DreamerConfig, key: Array) -> Params:
-    """Initialize a direct scalar reward model for a latent transition.
+def init_transition_reward_head(
+    config: DreamerConfig,
+    key: Array,
+    *,
+    observation_mean: Array | None = None,
+    observation_std: Array | None = None,
+    hidden_dim: int = 512,
+) -> Params:
+    """Initialize the state-action reward model used by ITPO/FlowMPC.
 
-    The head consumes ``(feature_t, action_t, feature_{t+1} - feature_t)``.
-    It predicts the complete reward rather than correcting the legacy
-    state-only reward decoder.  Three hidden layers match the simple direct
-    reward MLP used by recent differentiable MeanFlow world models while the
-    existing ``hidden_dim`` keeps this intervention deliberately small.
+    The published model is a three-hidden-layer, width-512 MLP over a
+    standardized state and an unnormalized action.  Our dynamics remain
+    latent, so imagined latent features are decoded into the environment
+    observation space before this head is evaluated.  Dataset statistics are
+    stored with the head and are constants, not learned parameters.
     """
 
-    head = init_mlp(
-        key,
-        2 * config.feature_dim + config.action_dim,
-        config.hidden_dim,
-        1,
-        depth=3,
-        output_gain=0.0,
+    if hidden_dim <= 0:
+        raise ValueError("transition reward hidden_dim must be positive")
+    mean = (
+        jnp.zeros((config.observation_dim,), dtype=jnp.float32)
+        if observation_mean is None
+        else jnp.asarray(observation_mean, dtype=jnp.float32)
     )
-    layers = list(head["layers"])
-    output = dict(layers[-1])
-    output["bias"] = jnp.full_like(output["bias"], config.reward_initial_value)
-    layers[-1] = output
-    return {"layers": tuple(layers)}
+    std = (
+        jnp.ones((config.observation_dim,), dtype=jnp.float32)
+        if observation_std is None
+        else jnp.asarray(observation_std, dtype=jnp.float32)
+    )
+    if mean.shape != (config.observation_dim,) or std.shape != (
+        config.observation_dim,
+    ):
+        raise ValueError("reward observation statistics have the wrong shape")
+    if not bool(jnp.all(jnp.isfinite(mean))) or not bool(
+        jnp.all(jnp.isfinite(std) & (std > 0.0))
+    ):
+        raise ValueError("reward observation statistics must be finite and positive")
+    return {
+        "network": init_mlp(
+            key,
+            config.observation_dim + config.action_dim,
+            hidden_dim,
+            1,
+            depth=3,
+        ),
+        "observation_mean": mean,
+        "observation_std": std,
+    }
 
 
 def init_world_model(config: DreamerConfig, key: Array) -> Params:
@@ -872,11 +897,12 @@ def predict_direct_transition_reward(
     next_feature: Array,
     config: DreamerConfig,
 ) -> Array:
-    """Predict a complete scalar reward from one causal latent transition.
+    """Predict the complete reward from the current decoded state and action.
 
-    Gradients are intentionally preserved.  Reward-head-only fitting stops
-    gradients at the frozen latent features, whereas imagined actor training
-    needs the reward derivative with respect to actions and future features.
+    This preserves the published causal ordering ``r(s_t, a_t)``: the reward
+    at step ``t`` cannot depend on the sampled ``s_{t+1}``.  Gradients remain
+    available through the action and through the frozen decoder into the
+    current latent state.
     """
 
     leading = next_feature.shape[:-1]
@@ -887,11 +913,43 @@ def predict_direct_transition_reward(
     if action.shape != (*leading, config.action_dim):
         raise ValueError("transition action has the wrong shape")
     if "reward_transition" not in params:
-        raise ValueError("direct transition reward head is not attached")
-    inputs = jnp.concatenate(
-        (previous_feature, action, next_feature - previous_feature), axis=-1
+        raise ValueError("state-action reward head is not attached")
+    observation = decode(params, previous_feature, config)
+    return predict_state_action_reward_from_observation(
+        params["reward_transition"], observation, action, config
     )
-    return mlp(params["reward_transition"], inputs)[..., 0]
+
+
+def predict_state_action_reward_from_observation(
+    reward_params: Params,
+    observation: Array,
+    action: Array,
+    config: DreamerConfig,
+) -> Array:
+    """Evaluate a frozen-statistics state-action reward head on observations."""
+
+    expected_ndim = 1 + len(config.observation_shape)
+    if observation.ndim < expected_ndim or observation.shape[
+        -len(config.observation_shape) :
+    ] != config.observation_shape:
+        raise ValueError("reward observation has the wrong trailing shape")
+    leading = observation.shape[: -len(config.observation_shape)]
+    if action.shape != (*leading, config.action_dim):
+        raise ValueError("reward action has the wrong shape")
+    if set(reward_params) != {"network", "observation_mean", "observation_std"}:
+        raise ValueError("state-action reward head structure is invalid")
+    mean = jax.lax.stop_gradient(reward_params["observation_mean"])
+    std = jax.lax.stop_gradient(reward_params["observation_std"])
+    if mean.shape != (config.observation_dim,) or std.shape != (
+        config.observation_dim,
+    ):
+        raise ValueError("reward observation statistics have the wrong shape")
+    flat = preprocess_observation(observation).reshape(
+        (*leading, config.observation_dim)
+    )
+    normalized = (flat - mean) / jnp.maximum(std, 1e-6)
+    inputs = jnp.concatenate((normalized, action), axis=-1)
+    return mlp(reward_params["network"], inputs, activation=jax.nn.relu)[..., 0]
 
 
 def predict_transition_reward(
@@ -903,7 +961,7 @@ def predict_transition_reward(
 ) -> Array:
     """Predict transition reward with an explicit backwards-compatible order.
 
-    A direct transition head replaces the legacy state-only decoder.  Without
+    A direct state-action head replaces the legacy state-only decoder. Without
     it, existing checkpoints retain their exact base-plus-residual behavior.
     """
 

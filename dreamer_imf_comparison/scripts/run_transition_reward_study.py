@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute the iMF-only direct transition-reward study."""
+"""Execute the iMF-only ITPO-style state-action reward study."""
 
 from __future__ import annotations
 
