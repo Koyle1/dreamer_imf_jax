@@ -39,6 +39,7 @@ from .agent import (
 )
 from .checkpoint import CHECKPOINT_VERSION, load_checkpoint, save_checkpoint
 from .config import DreamerConfig, PlannerConfig, PriorKind, RewardLoss
+from . import control_aware_imf, robust_flowmpc
 from .fidelity import (
     IMFNoiseCoupling,
     posterior_sequence_noise,
@@ -257,6 +258,8 @@ from .world_model import (
 __version__ = "0.6.0"
 
 __all__ = [
+    "control_aware_imf",
+    "robust_flowmpc",
     "ImaginationSignalFn",
     "CHECKPOINT_VERSION",
     "ActionRewardResidualConfig",
