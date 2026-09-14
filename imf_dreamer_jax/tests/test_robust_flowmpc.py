@@ -75,12 +75,19 @@ def assert_tree_equal(test: unittest.TestCase, left: object, right: object) -> N
         np.testing.assert_array_equal(left_value, right_value)
 
 
-def assert_tree_close(test: unittest.TestCase, left: object, right: object) -> None:
+def assert_tree_close(
+    test: unittest.TestCase,
+    left: object,
+    right: object,
+    *,
+    rtol: float = 1e-6,
+    atol: float = 1e-7,
+) -> None:
     left_values, left_structure = jax.tree_util.tree_flatten(left)
     right_values, right_structure = jax.tree_util.tree_flatten(right)
     test.assertEqual(left_structure, right_structure)
     for left_value, right_value in zip(left_values, right_values, strict=True):
-        np.testing.assert_allclose(left_value, right_value, rtol=1e-6, atol=1e-7)
+        np.testing.assert_allclose(left_value, right_value, rtol=rtol, atol=atol)
 
 
 def constant_actor(logits: jax.Array, *, state_dim: int = 3) -> dict[str, object]:
@@ -962,7 +969,11 @@ class ExistingFlowMPCAdapterTests(unittest.TestCase):
             self.flow,
             config,
         )
-        assert_tree_close(self, metrics, jitted)
+        # XLA may fuse the long stochastic rollout differently from eager JAX;
+        # this tolerance is far below the controller's decision margin.
+        self.assertEqual(bool(metrics.accepted), bool(jitted.accepted))
+        self.assertEqual(bool(metrics.used_fallback), bool(jitted.used_fallback))
+        assert_tree_close(self, metrics, jitted, rtol=1e-5, atol=2e-6)
 
 
 if __name__ == "__main__":

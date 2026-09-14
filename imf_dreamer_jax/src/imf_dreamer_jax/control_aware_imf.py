@@ -382,7 +382,7 @@ def _bounded_mean_one_weights(
         (lower_log_scale, upper_log_scale),
     )
     scale = jnp.exp(0.5 * (lower_log_scale + upper_log_scale))
-    return jnp.where(
+    projected = jnp.where(
         valid,
         jnp.clip(
             scale * base_weights,
@@ -390,6 +390,18 @@ def _bounded_mean_one_weights(
             config.maximum_weight,
         ),
         0.0,
+    )
+    already_feasible = jnp.all(
+        (~valid)
+        | (
+            (base_weights >= config.minimum_weight)
+            & (base_weights <= config.maximum_weight)
+        )
+    )
+    return jnp.where(
+        already_feasible,
+        jnp.where(valid, base_weights, 0.0),
+        projected,
     )
 
 
@@ -442,7 +454,12 @@ def policy_density_tilt_weights(
         * valid_count
         / jnp.maximum(jnp.sum(unnormalized), jnp.finfo(unnormalized.dtype).tiny)
     )
-    weights = _bounded_mean_one_weights(base_weights, valid, config)
+    if config.eta == 0.0:
+        # This is the exact algebraic reduction, not a limiting numerical case.
+        # Avoid routing uniform weights through logarithms and bisection.
+        weights = valid.astype(log_probabilities.dtype)
+    else:
+        weights = _bounded_mean_one_weights(base_weights, valid, config)
     weights = jax.lax.stop_gradient(weights)
 
     if not return_details:
