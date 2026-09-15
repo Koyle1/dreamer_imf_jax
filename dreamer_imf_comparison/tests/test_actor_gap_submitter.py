@@ -364,6 +364,12 @@ class ActorGapSubmitterTests(unittest.TestCase):
                         "index": 0,
                         "result_path": "diagnostics/result.json",
                         "trace_path": "diagnostics/trace.npz",
+                        "creation_cache_seal_path": (
+                            "verified/cache-seals/diagnostic-creation.json"
+                        ),
+                        "verification_cache_seal_path": (
+                            "verified/cache-seals/diagnostic-verification.json"
+                        ),
                         "marker_path": "verified/diagnostic.json",
                     }
                 ],
@@ -372,6 +378,9 @@ class ActorGapSubmitterTests(unittest.TestCase):
             (root / "diagnostics").mkdir()
             (root / "diagnostics/result.json").write_text("result", encoding="utf-8")
             (root / "diagnostics/trace.npz").write_text("trace", encoding="utf-8")
+            creation_seal = root / "verified/cache-seals/diagnostic-creation.json"
+            creation_seal.parent.mkdir(parents=True)
+            creation_seal.write_text("seal", encoding="utf-8")
             cell = manifest["diagnostic_cells"][0]
             entry = {
                 "index": 0,

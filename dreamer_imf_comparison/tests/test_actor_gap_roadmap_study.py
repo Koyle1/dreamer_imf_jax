@@ -107,18 +107,20 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
         self.assertLess(capture, bridge)
         self.assertLess(bridge, diagnostics)
 
-    def test_diagnostic_strict_replay_discards_first_full_execution(self) -> None:
-        first = ({"execution": 1}, {"trace": np.asarray([1])})
-        second = ({"execution": 2}, {"trace": np.asarray([2])})
-        with mock.patch.object(
-            study, "_compute_diagnostic_cell", side_effect=[first, second]
-        ) as compute:
-            retained = study._compute_diagnostic_cell_after_discarded_warmup(
-                Path("/unused"), {}, {}
-            )
-        self.assertEqual(compute.call_count, 2)
-        self.assertEqual(retained[0], second[0])
-        np.testing.assert_array_equal(retained[1]["trace"], second[1]["trace"])
+    def test_diagnostic_primer_and_each_reader_execute_one_full_cell(self) -> None:
+        primer = inspect.getsource(study.prime_diagnostic_cell)
+        creation = inspect.getsource(study.run_diagnostic_cell)
+        verification = inspect.getsource(study.verify_diagnostic_cell)
+        self.assertLess(
+            primer.index("_prime_diagnostic_a0_only"),
+            primer.index("_compute_diagnostic_cell"),
+        )
+        self.assertEqual(creation.count("_compute_diagnostic_cell("), 1)
+        self.assertEqual(verification.count("_compute_diagnostic_cell("), 1)
+        self.assertNotIn("_compute_diagnostic_cell_after_discarded_warmup", creation)
+        self.assertNotIn(
+            "_compute_diagnostic_cell_after_discarded_warmup", verification
+        )
 
     def test_calibration_strict_replay_discards_first_full_derivation(self) -> None:
         first = ([{"execution": 1}], {"trace": np.asarray([1])})
@@ -362,6 +364,119 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
             self.assertEqual(result_path.read_bytes(), b"primer-must-not-publish-this")
             self.assertFalse((root / cell["trace_path"]).exists())
             self.assertFalse((root / cell["marker_path"]).exists())
+
+    def test_diagnostic_primer_is_a0_both_seeds_then_full_and_discard_only(
+        self,
+    ) -> None:
+        commit = "c" * 40
+        cell = {
+            "index": 1,
+            "cell_id": "diagnostic-223",
+            "world_model_seed": 223,
+            "result_path": "diagnostics/diagnostic-223/result.json",
+            "trace_path": "diagnostics/diagnostic-223/traces.npz",
+            "creation_cache_seal_path": (
+                "verified/cache-seals/diagnostic-223-creation.json"
+            ),
+            "verification_cache_seal_path": (
+                "verified/cache-seals/diagnostic-223-verification.json"
+            ),
+            "marker_path": "verified/diagnostic-223.json",
+        }
+        manifest = {
+            "source_commit": commit,
+            "manifest_sha256": "m" * 64,
+            "diagnostic_cells": [cell],
+        }
+        scheduler = {
+            "job_id": "12345",
+            "array_job_id": "12000",
+            "array_task_id": 1,
+        }
+        computed = (
+            {"finite": 1.0},
+            {"actions": np.asarray([[0.25]], dtype=np.float32)},
+        )
+        events: list[str] = []
+
+        def a0_prepass(*_args: object) -> dict:
+            events.append("a0")
+            return {
+                "actor_seeds": list(study.ACTOR_SEEDS),
+                "trace_sha256": ["a" * 64, "b" * 64],
+                "wall_seconds": 1.0,
+                "dependency_equality_gate_applied": False,
+            }
+
+        def full_diagnostic(*_args: object) -> tuple[dict, dict]:
+            events.append("full")
+            return computed
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json_atomic(root / "manifest.json", manifest)
+            cache = (
+                root
+                / "jax-compilation-cache"
+                / "actor-gap-roadmap"
+                / commit
+                / "job-12345-task-1"
+            )
+            cache.mkdir(parents=True)
+            (cache / "compiled-entry").write_bytes(b"compiled")
+            execution = (
+                scheduler,
+                {"receipt": "primer"},
+                {"jax_compilation_cache_dir": str(cache)},
+            )
+            with mock.patch.object(study, "validate_manifest"), mock.patch.object(
+                study,
+                "_validate_retained_submission_authorization",
+                return_value={"mode": "new"},
+            ), mock.patch.object(
+                study,
+                "_validate_calibration_marker",
+                return_value={"training_only": True},
+            ), mock.patch.object(
+                study, "_live_array_execution_binding", return_value=execution
+            ), mock.patch.object(
+                study, "_prime_diagnostic_a0_only", side_effect=a0_prepass
+            ), mock.patch.object(
+                study, "_compute_diagnostic_cell", side_effect=full_diagnostic
+            ), mock.patch.dict(
+                os.environ,
+                {"JAX_COMPILATION_CACHE_DIR": str(cache)},
+                clear=False,
+            ):
+                receipt = study.prime_diagnostic_cell(
+                    root,
+                    1,
+                    submission_authorization={"authorized": True},
+                )
+            self.assertEqual(events, ["a0", "full"])
+            self.assertEqual(
+                receipt["a0_only_prepass_actor_seeds"], list(study.ACTOR_SEEDS)
+            )
+            self.assertEqual(
+                receipt["a0_only_prepass_trace_sha256"], ["a" * 64, "b" * 64]
+            )
+            self.assertTrue(receipt["a0_only_prepass_before_full_diagnostic"])
+            self.assertFalse(
+                receipt["a0_only_prepass_dependency_equality_gate_applied"]
+            )
+            self.assertTrue(receipt["publication_artifacts_unchanged"])
+            self.assertEqual(
+                receipt["receipt_sha256"],
+                study._unsigned_digest(receipt, "receipt_sha256"),
+            )
+            for key in (
+                "result_path",
+                "trace_path",
+                "creation_cache_seal_path",
+                "verification_cache_seal_path",
+                "marker_path",
+            ):
+                self.assertFalse((root / cell[key]).exists())
 
     def test_cache_mutation_fails_before_evaluation_bundle_publication(self) -> None:
         commit = "c" * 40
@@ -620,6 +735,92 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
             publish_marker.assert_not_called()
             self.assertFalse((root / cell["marker_path"]).exists())
 
+    def test_cache_mutation_fails_before_diagnostic_bundle_publication(self) -> None:
+        commit = "c" * 40
+        cell = {
+            "index": 1,
+            "cell_id": "diagnostic-223",
+            "world_model_seed": 223,
+            "result_path": "diagnostics/diagnostic-223/result.json",
+            "trace_path": "diagnostics/diagnostic-223/traces.npz",
+            "creation_cache_seal_path": (
+                "verified/cache-seals/diagnostic-223-creation.json"
+            ),
+            "verification_cache_seal_path": (
+                "verified/cache-seals/diagnostic-223-verification.json"
+            ),
+            "marker_path": "verified/diagnostic-223.json",
+        }
+        manifest = {
+            "source_commit": commit,
+            "manifest_sha256": "m" * 64,
+            "diagnostic_cells": [cell],
+        }
+        scheduler = {
+            "job_id": "12345",
+            "array_job_id": "12000",
+            "array_task_id": 1,
+        }
+        computed = (
+            {
+                "schema_version": study.DIAGNOSTIC_SCHEMA,
+                "status": "complete",
+                "finite": 1.0,
+            },
+            {"actions": np.asarray([[0.25]], dtype=np.float32)},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            execution = (
+                scheduler,
+                {"receipt": "creation"},
+                {"jax_compilation_cache_dir": "/cache/job-12345-task-1"},
+            )
+            with mock.patch.object(
+                study, "write_manifest", return_value=manifest
+            ), mock.patch.object(
+                study,
+                "_validate_retained_submission_authorization",
+                return_value={"mode": "new"},
+            ), mock.patch.object(
+                study, "_live_array_execution_binding", return_value=execution
+            ), mock.patch.object(
+                study,
+                "_evaluation_cache_reader_certificate",
+                return_value={"cache": "reader"},
+            ), mock.patch.object(
+                study,
+                "_current_evaluation_primer_receipt_reference",
+                return_value={"receipt_sha256": "p" * 64},
+            ), mock.patch.object(
+                study,
+                "_validate_calibration_marker",
+                return_value={"training_only": True},
+            ), mock.patch.object(
+                study, "_compute_diagnostic_cell", return_value=computed
+            ) as compute, mock.patch.object(
+                study,
+                "_assert_evaluation_cache_sealed",
+                side_effect=ValueError("diagnostic cache changed after primer"),
+            ) as seal:
+                with self.assertRaisesRegex(ValueError, "cache changed"):
+                    study.run_diagnostic_cell(
+                        "/unused-dependency",
+                        root,
+                        1,
+                        submission_authorization={"authorized": True},
+                    )
+            compute.assert_called_once()
+            seal.assert_called_once()
+            for key in (
+                "result_path",
+                "trace_path",
+                "creation_cache_seal_path",
+                "verification_cache_seal_path",
+                "marker_path",
+            ):
+                self.assertFalse((root / cell[key]).exists())
+
     def test_existing_evaluation_marker_is_invalid_without_verification_seal(
         self,
     ) -> None:
@@ -683,12 +884,14 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
                 seal_manifest: dict,
                 seal_cell: dict,
                 phase: str,
+                *,
+                stage: str = "evaluation",
             ) -> dict:
                 phases.append(phase)
                 if phase == "creation":
                     return {"seal_sha256": "s" * 64}
                 return original_seal_validator(
-                    seal_root, seal_manifest, seal_cell, phase
+                    seal_root, seal_manifest, seal_cell, phase, stage=stage
                 )
 
             scheduler = {
@@ -719,6 +922,140 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
                     study._validate_cell_marker(root, manifest, cell, "evaluation")
             self.assertEqual(phases, ["creation", "verification"])
             self.assertFalse((root / cell["verification_cache_seal_path"]).exists())
+
+    def test_cache_mutation_fails_before_diagnostic_marker_publication(self) -> None:
+        commit = "c" * 40
+        cell = {
+            "index": 1,
+            "cell_id": "diagnostic-223",
+            "world_model_seed": 223,
+            "result_path": "diagnostics/diagnostic-223/result.json",
+            "trace_path": "diagnostics/diagnostic-223/traces.npz",
+            "creation_cache_seal_path": (
+                "verified/cache-seals/diagnostic-223-creation.json"
+            ),
+            "verification_cache_seal_path": (
+                "verified/cache-seals/diagnostic-223-verification.json"
+            ),
+            "marker_path": "verified/diagnostic-223.json",
+        }
+        manifest = {
+            "source_commit": commit,
+            "manifest_sha256": "m" * 64,
+            "diagnostic_cells": [cell],
+        }
+        creation_scheduler = {
+            "job_id": "12345",
+            "array_job_id": "12000",
+            "array_task_id": 1,
+        }
+        verification_scheduler = {
+            "job_id": "99999",
+            "array_job_id": "99000",
+            "array_task_id": 1,
+        }
+        creation_authorization = {"mode": "new"}
+        verification_authorization = {"mode": "verification_only"}
+        creation_runtime = {"jax_compilation_cache_dir": "/cache/job-12345-task-1"}
+        verification_runtime = {"jax_compilation_cache_dir": "/cache/job-99999-task-1"}
+        base_core = {
+            "schema_version": study.DIAGNOSTIC_SCHEMA,
+            "status": "complete",
+            "source_commit": commit,
+            "manifest_sha256": manifest["manifest_sha256"],
+            "cell_id": cell["cell_id"],
+            "cell_index": 1,
+            "task": study.TASK,
+            "world_model_seed": 223,
+            "actor_rows": [],
+            "diagnostic_only_no_selection_or_mutation": True,
+        }
+        creation_certificate = {"cache": "creation"}
+        creation_primer = {"receipt_sha256": "c" * 64}
+        core = {
+            **base_core,
+            "separate_discarded_full_diagnostic_primer": True,
+            "diagnostic_primer_a0_actor_seeds": list(study.ACTOR_SEEDS),
+            "creation_cache_reader_certificate": creation_certificate,
+            "creation_primer_receipt": creation_primer,
+            "creation_submission_authorization": creation_authorization,
+            "creation_scheduler_provenance": creation_scheduler,
+            "creation_submission_receipt": {"receipt": "creation"},
+        }
+        trace = {"actions": np.asarray([[[0.25, -0.25]]], dtype=np.float32)}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json_atomic(root / "manifest.json", manifest)
+            trace_path = root / cell["trace_path"]
+            trace_path.parent.mkdir(parents=True)
+            np.savez(trace_path, **trace)
+            result = {
+                **core,
+                "core_sha256": study.benchmark.object_sha256(core),
+                "trace_file_sha256": study.benchmark.file_sha256(trace_path),
+                "trace_sha256": study.benchmark.array_sha256(trace),
+                "wall_seconds": 1.0,
+                "runtime": creation_runtime,
+            }
+            write_json_atomic(root / cell["result_path"], result)
+            with mock.patch.object(study, "validate_manifest"), mock.patch.object(
+                study,
+                "_validate_retained_submission_authorization",
+                return_value=verification_authorization,
+            ), mock.patch.object(
+                study,
+                "_live_array_execution_binding",
+                return_value=(
+                    verification_scheduler,
+                    {"receipt": "verification"},
+                    verification_runtime,
+                ),
+            ), mock.patch.object(
+                study,
+                "_evaluation_cache_reader_certificate",
+                return_value={"cache": "verification"},
+            ), mock.patch.object(
+                study,
+                "_current_evaluation_primer_receipt_reference",
+                return_value={"receipt_sha256": "v" * 64},
+            ), mock.patch.object(
+                study,
+                "_validate_retained_creation_binding",
+                return_value=(
+                    creation_authorization,
+                    creation_scheduler,
+                    {"receipt": "creation"},
+                    creation_runtime,
+                ),
+            ), mock.patch.object(
+                study, "_validate_evaluation_cache_reader_certificate"
+            ), mock.patch.object(
+                study, "_validate_evaluation_primer_receipt_reference"
+            ), mock.patch.object(
+                study,
+                "_validate_evaluation_cache_seal",
+                return_value={"seal_sha256": "s" * 64},
+            ), mock.patch.object(
+                study, "_require_distinct_replay_processes"
+            ), mock.patch.object(
+                study, "_compute_diagnostic_cell", return_value=(base_core, trace)
+            ) as compute, mock.patch.object(
+                study,
+                "_assert_evaluation_cache_sealed",
+                side_effect=ValueError("diagnostic cache changed after primer"),
+            ) as cache_check, mock.patch.object(
+                study, "_write_verified_marker"
+            ) as publish_marker:
+                with self.assertRaisesRegex(ValueError, "cache changed"):
+                    study.verify_diagnostic_cell(
+                        root,
+                        1,
+                        submission_authorization={"authorized": True},
+                    )
+            compute.assert_called_once()
+            cache_check.assert_called_once()
+            publish_marker.assert_not_called()
+            self.assertFalse((root / cell["marker_path"]).exists())
 
     def test_nonfinite_retained_and_replayed_traces_cannot_publish_marker(
         self,
@@ -1354,9 +1691,28 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
             for index in range(2):
                 marker_path = root / f"verified/cell-{index}.json"
                 write_json_atomic(marker_path, {"immutable": index})
+                creation_seal_path = (
+                    root / f"verified/cache-seals/cell-{index}-creation.json"
+                )
+                verification_seal_path = (
+                    root / f"verified/cache-seals/cell-{index}-verification.json"
+                )
+                write_json_atomic(
+                    creation_seal_path, {"seal_sha256": f"creation-{index}"}
+                )
+                write_json_atomic(
+                    verification_seal_path,
+                    {"seal_sha256": f"verification-{index}"},
+                )
                 cell = {
                     "index": index,
                     "cell_id": f"cell-{index}",
+                    "creation_cache_seal_path": str(
+                        creation_seal_path.relative_to(root)
+                    ),
+                    "verification_cache_seal_path": str(
+                        verification_seal_path.relative_to(root)
+                    ),
                     "marker_path": str(marker_path.relative_to(root)),
                 }
                 cells.append(cell)
@@ -1443,6 +1799,12 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
                 "cell_id": "diagnostic-211",
                 "result_path": "diagnostics/diagnostic-211/result.json",
                 "trace_path": "diagnostics/diagnostic-211/traces.npz",
+                "creation_cache_seal_path": (
+                    "verified/cache-seals/diagnostic-211-creation.json"
+                ),
+                "verification_cache_seal_path": (
+                    "verified/cache-seals/diagnostic-211-verification.json"
+                ),
                 "marker_path": "verified/diagnostic-211.json",
             }
             manifest = {
@@ -1486,6 +1848,9 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
                 write_json_atomic(result_path, {"complete": True})
                 study.benchmark._write_npz_atomic(
                     trace_path, {"value": np.asarray([1], dtype=np.int32)}
+                )
+                write_json_atomic(
+                    root / cell["creation_cache_seal_path"], {"sealed": True}
                 )
                 verified = study.validate_submission_map(
                     root,
@@ -1965,6 +2330,12 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
                 "cell_id": "diagnostic-211",
                 "result_path": "diagnostics/diagnostic-211/result.json",
                 "trace_path": "diagnostics/diagnostic-211/traces.npz",
+                "creation_cache_seal_path": (
+                    "verified/cache-seals/diagnostic-211-creation.json"
+                ),
+                "verification_cache_seal_path": (
+                    "verified/cache-seals/diagnostic-211-verification.json"
+                ),
                 "marker_path": "verified/diagnostic-211.json",
             }
             manifest = {

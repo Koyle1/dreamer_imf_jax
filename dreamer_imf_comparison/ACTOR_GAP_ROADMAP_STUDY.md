@@ -24,9 +24,12 @@ is used to choose a hyperparameter, alter an arm, or mutate the frozen matrix.
   rate `3e-4`, global gradient clip 10, and a fresh zero-moment Adam state.
 - Every live controller has one pure, discarded compiled warm-up call.  It
   cannot touch the environment, belief, or persistent actor and is excluded
-  from latency. Diagnostic creation/replay separately discard one complete
-  deterministic diagnostic execution; that pass opens isolated simulator
-  instances but publishes nothing and mutates no checkpoint.
+  from latency. Each diagnostic task additionally starts from a fresh
+  job/index-scoped cache. A separate discard-only process runs the exact `A0`
+  path for both actor seeds without applying the dependency-equality gate,
+  then runs one complete diagnostic before result creation and replay become
+  cache readers. The primer opens isolated simulator instances but publishes
+  no scientific artifact and mutates no checkpoint.
 
 The matrix contains 3 diagnostic cells, 21 model-training cells, and 90 fresh
 evaluation cells.  The 90 evaluations are the Cartesian product of 15 fresh
@@ -241,14 +244,16 @@ The manifest freezes these comparisons:
 6. Every cell has deterministic keys, immutable outputs, and a digest-bound
    marker. Creation and strict replay are separate Python processes. Their
    Linux process identities must differ, while both must identify the same
-   registered Slurm array index and exactly one visible JAX GPU. Evaluation
-   tasks additionally start from a fresh job-scoped compilation cache, run one
-   exact full-cell discard-only primer process, fingerprint the populated
-   cache, and then run creation and replay as two cache-reader processes. Each
-   reader rechecks the actual tree before publication. After that reader exits,
-   a separate process rechecks the tree and publishes a digest-bound creation
-   or verification cache seal. Missing creation seals cannot be retried as
-   retained data, and markers without verification seals cannot be promoted.
+   registered Slurm array index and exactly one visible JAX GPU. Diagnostic and
+   evaluation tasks additionally start from fresh job/index-scoped compilation
+   caches, run exact discard-only primer processes, fingerprint the populated
+   caches, and then run creation and replay as two cache-reader processes. The
+   diagnostic primer performs its two-actor-seed `A0` prepass before the full
+   discarded diagnostic. Each reader rechecks the actual tree before
+   publication. After that reader exits, a separate process rechecks the tree
+   and publishes a digest-bound creation or verification cache seal. Missing
+   creation seals cannot be retried as retained data, and markers without
+   verification seals cannot be promoted.
 7. The canonical submitter holds each array before release, persists an
    immutable receipt first, and only then releases the workers. Results bind
    their creation map and receipt; markers independently bind their replay map
@@ -267,7 +272,8 @@ contrast, favorable-seed fractions, saturation, objective improvement,
 gradient and parameter deltas, trust backtracks, frozen-reference fallbacks,
 held-out acceptance improvement, empirical executed/imagined coverage, causal
 horizon-5 ranking diagnostics, and runtime. Controller latency excludes only
-discarded compilation warm-ups, including the separate evaluation primer; it
+discarded compilation warm-ups, including the separate diagnostic and
+evaluation primers; it
 includes the first live step of every retained episode. Each primer publishes
 only a runtime receipt—not scientific cell output—and the final report adds
 the unique receipt times to total accounted compute. Failed attempts remain
@@ -296,7 +302,11 @@ The only valid order is:
 ```
 preflight
   -> calibration
-  -> diagnostic-cell[0:3] -> fresh-process replay -> verify-diagnostics
+  -> diagnostic-primer[0:3] -> diagnostic-cell[0:3]
+                              -> post-exit creation cache seal
+                              -> fresh-process replay
+                              -> post-exit verification cache seal
+                              -> verify-diagnostics
   -> model-cell[0:21]      -> fresh-process replay -> verify-models
   -> evaluation-primer[0:90] -> evaluation-cell[0:90]
                               -> post-exit creation cache seal

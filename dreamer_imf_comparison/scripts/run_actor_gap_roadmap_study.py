@@ -22,7 +22,9 @@ COMMANDS = (
     "seal-preflight",
     "validate-submission",
     "calibration",
+    "prime-diagnostic-cell",
     "diagnostic-cell",
+    "seal-diagnostic-cache-reader",
     "verify-diagnostic-cell",
     "verify-diagnostics",
     "model-cell",
@@ -156,6 +158,17 @@ def main() -> int:
         )
         payload = result
         token = "ACTOR_GAP_ROADMAP_CALIBRATION_DATA_READY"
+    elif arguments.command == "prime-diagnostic-cell":
+        index = _require_index(parser, arguments)
+        authorization = _authorize_submission(
+            parser, arguments, "diagnostic", action="create"
+        )
+        payload = study.prime_diagnostic_cell(
+            arguments.output_root,
+            index,
+            submission_authorization=authorization,
+        )
+        token = "ACTOR_GAP_ROADMAP_DIAGNOSTIC_CACHE_PRIMED"
     elif arguments.command == "diagnostic-cell":
         dependency_root = _require_dependency(parser, arguments)
         index = _require_index(parser, arguments)
@@ -171,6 +184,21 @@ def main() -> int:
         )
         payload = result
         token = "ACTOR_GAP_ROADMAP_DIAGNOSTIC_CELL_DATA_READY"
+    elif arguments.command == "seal-diagnostic-cache-reader":
+        index = _require_index(parser, arguments)
+        if arguments.cache_seal_phase is None:
+            parser.error("seal-diagnostic-cache-reader requires --cache-seal-phase")
+        authorization = _authorize_submission(
+            parser, arguments, "diagnostic", action="read"
+        )
+        payload = study.seal_evaluation_cache_reader(
+            arguments.output_root,
+            index,
+            phase=arguments.cache_seal_phase,
+            submission_authorization=authorization,
+            stage="diagnostic",
+        )
+        token = "ACTOR_GAP_ROADMAP_DIAGNOSTIC_CACHE_READER_SEALED"
     elif arguments.command == "verify-diagnostic-cell":
         index = _require_index(parser, arguments)
         authorization = _authorize_submission(

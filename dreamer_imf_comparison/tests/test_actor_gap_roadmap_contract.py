@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 from pathlib import Path
 import subprocess
 import sys
@@ -33,13 +34,24 @@ class ActorGapRoadmapContractTests(unittest.TestCase):
             creation = sbatch.index(f'"${{RUNNER}}" {stage}-cell')
             verification = sbatch.index(f'"${{RUNNER}}" verify-{stage}-cell')
             self.assertLess(creation, verification)
-        primer = sbatch.index('"${RUNNER}" prime-evaluation-cell')
-        evaluation = sbatch.index('"${RUNNER}" evaluation-cell')
-        replay = sbatch.index('"${RUNNER}" verify-evaluation-cell')
-        self.assertLess(primer, evaluation)
-        self.assertLess(evaluation, replay)
+        for stage in ("diagnostic", "evaluation"):
+            primer = sbatch.index(f'"${{RUNNER}}" prime-{stage}-cell')
+            creation = sbatch.index(f'"${{RUNNER}}" {stage}-cell')
+            creation_seal = sbatch.index(
+                f'"${{RUNNER}}" seal-{stage}-cache-reader', creation
+            )
+            replay = sbatch.index(f'"${{RUNNER}}" verify-{stage}-cell')
+            verification_seal = sbatch.index(
+                f'"${{RUNNER}}" seal-{stage}-cache-reader', creation_seal + 1
+            )
+            self.assertLess(primer, creation)
+            self.assertLess(creation, creation_seal)
+            self.assertLess(creation_seal, replay)
+            self.assertLess(replay, verification_seal)
 
-    def test_evaluation_cache_is_fresh_per_job_and_content_sealed(self) -> None:
+    def test_diagnostic_and_evaluation_caches_are_fresh_and_content_sealed(
+        self,
+    ) -> None:
         source_root = Path(study.__file__).resolve().parents[2]
         sbatch = (
             source_root
@@ -47,21 +59,30 @@ class ActorGapRoadmapContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("job-${SLURM_JOB_ID}-task-${SLURM_ARRAY_TASK_ID}", sbatch)
         reuse_guard = sbatch.index('if [[ -e "${JAX_COMPILATION_CACHE_DIR}" ]]')
-        refusal = sbatch.index("refusing reused evaluation cache", reuse_guard)
+        refusal = sbatch.index("refusing reused cache-stable cell cache", reuse_guard)
         cache_creation = sbatch.index(
             'mkdir -p "${JAX_COMPILATION_CACHE_DIR}"', refusal
         )
-        primer = sbatch.index('python "${RUNNER}" prime-evaluation-cell')
         self.assertLess(reuse_guard, refusal)
         self.assertLess(refusal, cache_creation)
-        self.assertLess(cache_creation, primer)
-        self.assertIn("AGR_EVALUATION_CACHE_FINGERPRINT=$(cache_fingerprint)", sbatch)
-        self.assertEqual(
-            sbatch.count(
-                'test "$(cache_fingerprint)" = ' '"${AGR_EVALUATION_CACHE_FINGERPRINT}"'
-            ),
-            2,
-        )
+        for stage, variable in (
+            ("diagnostic", "AGR_DIAGNOSTIC_CACHE_FINGERPRINT"),
+            ("evaluation", "AGR_EVALUATION_CACHE_FINGERPRINT"),
+        ):
+            primer = sbatch.index(f'python "${{RUNNER}}" prime-{stage}-cell')
+            self.assertLess(cache_creation, primer)
+            self.assertIn(f"{variable}=$(cache_fingerprint)", sbatch)
+            self.assertEqual(
+                sbatch.count('test "$(cache_fingerprint)" = ' f'"${{{variable}}}"'),
+                2,
+            )
+        diagnostic_primer = inspect.getsource(study._prime_diagnostic_a0_only)
+        self.assertIn("for actor_seed in ACTOR_SEEDS", diagnostic_primer)
+        self.assertNotIn("_assert_trace_subset_close", diagnostic_primer)
+        full_primer = inspect.getsource(study.prime_diagnostic_cell)
+        a0 = full_primer.index("_prime_diagnostic_a0_only")
+        complete = full_primer.index("_compute_diagnostic_cell", a0)
+        self.assertLess(a0, complete)
         self.assertIn("#SBATCH --no-requeue", sbatch)
 
     def test_cache_fingerprint_is_content_and_path_sensitive(self) -> None:
@@ -234,6 +255,11 @@ class ActorGapRoadmapContractTests(unittest.TestCase):
             self.assertEqual(len({row["cell_id"] for row in rows}), len(rows))
             self.assertEqual(len({row["result_path"] for row in rows}), len(rows))
             self.assertEqual(len({row["marker_path"] for row in rows}), len(rows))
+        for stage in ("diagnostic", "evaluation"):
+            rows = matrix[f"{stage}_cells"]
+            for phase in ("creation", "verification"):
+                key = f"{phase}_cache_seal_path"
+                self.assertEqual(len({row[key] for row in rows}), len(rows))
 
     def test_evaluation_inherits_only_the_declared_dependency_seed_prefix(self) -> None:
         dependency = self._dependency_manifest()

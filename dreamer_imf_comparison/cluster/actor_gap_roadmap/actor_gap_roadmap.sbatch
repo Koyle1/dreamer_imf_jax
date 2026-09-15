@@ -26,12 +26,12 @@ export JAX_ENABLE_X64=0
 export JAX_PLATFORM_NAME=gpu
 export JAX_ENABLE_COMPILATION_CACHE=true
 ACTOR_GAP_CACHE_ROOT="${WORK_ROOT}/jax-compilation-cache/actor-gap-roadmap/${AGR_SOURCE_COMMIT}"
-if [[ "${AGR_STAGE}" == "evaluation-cell" ]]; then
-  : "${SLURM_JOB_ID:?evaluation-cell requires SLURM_JOB_ID}"
-  : "${SLURM_ARRAY_TASK_ID:?evaluation-cell requires SLURM_ARRAY_TASK_ID}"
+if [[ "${AGR_STAGE}" == "diagnostic-cell" || "${AGR_STAGE}" == "evaluation-cell" ]]; then
+  : "${SLURM_JOB_ID:?cache-stable cell requires SLURM_JOB_ID}"
+  : "${SLURM_ARRAY_TASK_ID:?cache-stable cell requires SLURM_ARRAY_TASK_ID}"
   JAX_COMPILATION_CACHE_DIR="${ACTOR_GAP_CACHE_ROOT}/job-${SLURM_JOB_ID}-task-${SLURM_ARRAY_TASK_ID}"
   if [[ -e "${JAX_COMPILATION_CACHE_DIR}" ]]; then
-    echo "refusing reused evaluation cache ${JAX_COMPILATION_CACHE_DIR}" >&2
+    echo "refusing reused cache-stable cell cache ${JAX_COMPILATION_CACHE_DIR}" >&2
     exit 2
   fi
   mkdir -p "${JAX_COMPILATION_CACHE_DIR}"
@@ -104,18 +104,41 @@ case "${AGR_STAGE}" in
   diagnostic-cell)
     require_array_index 3
     submission_arguments
+    # The primer first compiles exact A0 for both nested actor seeds without
+    # applying the dependency gate, then executes and discards one complete
+    # diagnostic. Creation and replay are separate immutable cache readers.
+    python "${RUNNER}" prime-diagnostic-cell --output-root "${AGR_OUTPUT_ROOT}" \
+      --index "${SLURM_ARRAY_TASK_ID}" \
+      --submission-map "${AGR_SUBMISSION_MAP}" \
+      --submission-stage diagnostic \
+      --submission-map-file-sha256 "${AGR_SUBMISSION_MAP_FILE_SHA256}"
+    AGR_DIAGNOSTIC_CACHE_FINGERPRINT=$(cache_fingerprint)
+    export AGR_DIAGNOSTIC_CACHE_FINGERPRINT
+    echo "ACTOR_GAP_ROADMAP_PRIMED_DIAGNOSTIC_CACHE_SHA256=${AGR_DIAGNOSTIC_CACHE_FINGERPRINT}"
     python "${RUNNER}" diagnostic-cell "${COMMON[@]}" \
       --index "${SLURM_ARRAY_TASK_ID}" \
       --submission-map "${AGR_SUBMISSION_MAP}" \
       --submission-stage diagnostic \
       --submission-map-file-sha256 "${AGR_SUBMISSION_MAP_FILE_SHA256}"
-    # A fresh Python interpreter is a required part of strict replay: it
-    # prevents first-process compiler state from authenticating its own output.
+    test "$(cache_fingerprint)" = "${AGR_DIAGNOSTIC_CACHE_FINGERPRINT}"
+    python "${RUNNER}" seal-diagnostic-cache-reader --output-root "${AGR_OUTPUT_ROOT}" \
+      --index "${SLURM_ARRAY_TASK_ID}" \
+      --submission-map "${AGR_SUBMISSION_MAP}" \
+      --submission-stage diagnostic \
+      --submission-map-file-sha256 "${AGR_SUBMISSION_MAP_FILE_SHA256}" \
+      --cache-seal-phase creation
     python "${RUNNER}" verify-diagnostic-cell --output-root "${AGR_OUTPUT_ROOT}" \
       --index "${SLURM_ARRAY_TASK_ID}" \
       --submission-map "${AGR_SUBMISSION_MAP}" \
       --submission-stage diagnostic \
       --submission-map-file-sha256 "${AGR_SUBMISSION_MAP_FILE_SHA256}"
+    test "$(cache_fingerprint)" = "${AGR_DIAGNOSTIC_CACHE_FINGERPRINT}"
+    python "${RUNNER}" seal-diagnostic-cache-reader --output-root "${AGR_OUTPUT_ROOT}" \
+      --index "${SLURM_ARRAY_TASK_ID}" \
+      --submission-map "${AGR_SUBMISSION_MAP}" \
+      --submission-stage diagnostic \
+      --submission-map-file-sha256 "${AGR_SUBMISSION_MAP_FILE_SHA256}" \
+      --cache-seal-phase verification
     ;;
   verify-diagnostics)
     python "${RUNNER}" verify-diagnostics --output-root "${AGR_OUTPUT_ROOT}"
