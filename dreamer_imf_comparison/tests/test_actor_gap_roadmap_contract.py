@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -31,6 +33,127 @@ class ActorGapRoadmapContractTests(unittest.TestCase):
             creation = sbatch.index(f'"${{RUNNER}}" {stage}-cell')
             verification = sbatch.index(f'"${{RUNNER}}" verify-{stage}-cell')
             self.assertLess(creation, verification)
+        primer = sbatch.index('"${RUNNER}" prime-evaluation-cell')
+        evaluation = sbatch.index('"${RUNNER}" evaluation-cell')
+        replay = sbatch.index('"${RUNNER}" verify-evaluation-cell')
+        self.assertLess(primer, evaluation)
+        self.assertLess(evaluation, replay)
+
+    def test_evaluation_cache_is_fresh_per_job_and_content_sealed(self) -> None:
+        source_root = Path(study.__file__).resolve().parents[2]
+        sbatch = (
+            source_root
+            / "dreamer_imf_comparison/cluster/actor_gap_roadmap/actor_gap_roadmap.sbatch"
+        ).read_text(encoding="utf-8")
+        self.assertIn("job-${SLURM_JOB_ID}-task-${SLURM_ARRAY_TASK_ID}", sbatch)
+        reuse_guard = sbatch.index('if [[ -e "${JAX_COMPILATION_CACHE_DIR}" ]]')
+        refusal = sbatch.index("refusing reused evaluation cache", reuse_guard)
+        cache_creation = sbatch.index(
+            'mkdir -p "${JAX_COMPILATION_CACHE_DIR}"', refusal
+        )
+        primer = sbatch.index('python "${RUNNER}" prime-evaluation-cell')
+        self.assertLess(reuse_guard, refusal)
+        self.assertLess(refusal, cache_creation)
+        self.assertLess(cache_creation, primer)
+        self.assertIn("AGR_EVALUATION_CACHE_FINGERPRINT=$(cache_fingerprint)", sbatch)
+        self.assertEqual(
+            sbatch.count(
+                'test "$(cache_fingerprint)" = ' '"${AGR_EVALUATION_CACHE_FINGERPRINT}"'
+            ),
+            2,
+        )
+        self.assertIn("#SBATCH --no-requeue", sbatch)
+
+    def test_cache_fingerprint_is_content_and_path_sensitive(self) -> None:
+        source_root = Path(study.__file__).resolve().parents[2]
+        script = source_root / "dreamer_imf_comparison/scripts/fingerprint_jax_cache.py"
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            (cache / "nested").mkdir()
+            (cache / "a").write_bytes(b"one")
+            (cache / "nested/b").write_bytes(b"two")
+
+            def fingerprint() -> str:
+                completed = subprocess.run(
+                    [sys.executable, str(script), "--cache-root", str(cache)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return completed.stdout.strip()
+
+            first = fingerprint()
+            self.assertRegex(first, r"^[0-9a-f]{64}$")
+            self.assertEqual(first, fingerprint())
+            (cache / "nested/b").write_bytes(b"changed")
+            self.assertNotEqual(first, fingerprint())
+
+    def test_cache_fingerprint_rejects_empty_and_symlinked_trees(self) -> None:
+        source_root = Path(study.__file__).resolve().parents[2]
+        script = source_root / "dreamer_imf_comparison/scripts/fingerprint_jax_cache.py"
+
+        def invoke(cache: Path) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [sys.executable, str(script), "--cache-root", str(cache)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            empty = root / "empty"
+            empty.mkdir()
+            rejected_empty = invoke(empty)
+            self.assertNotEqual(rejected_empty.returncode, 0)
+            self.assertIn("cache root contains no files", rejected_empty.stderr)
+
+            cache = root / "cache"
+            nested = cache / "nested"
+            nested.mkdir(parents=True)
+            (nested / "entry").write_bytes(b"compiled executable")
+            (cache / "linked-directory").symlink_to(nested, target_is_directory=True)
+            rejected_symlink = invoke(cache)
+            self.assertNotEqual(rejected_symlink.returncode, 0)
+            self.assertIn("symbolic link", rejected_symlink.stderr)
+
+    def test_cache_fingerprint_binds_directory_type_and_relative_path(self) -> None:
+        source_root = Path(study.__file__).resolve().parents[2]
+        script = source_root / "dreamer_imf_comparison/scripts/fingerprint_jax_cache.py"
+
+        def fingerprint(cache: Path) -> str:
+            completed = subprocess.run(
+                [sys.executable, str(script), "--cache-root", str(cache)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return completed.stdout.strip()
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "cache"
+            original_parent = cache / "original"
+            original_parent.mkdir(parents=True)
+            payload = original_parent / "entry"
+            payload.write_bytes(b"identical bytes")
+            original = fingerprint(cache)
+
+            moved_parent = cache / "moved"
+            moved_parent.mkdir()
+            payload.rename(moved_parent / payload.name)
+            original_parent.rmdir()
+            moved = fingerprint(cache)
+            self.assertNotEqual(original, moved)
+
+            empty_directory = cache / "empty-but-bound"
+            empty_directory.mkdir()
+            with_empty_directory = fingerprint(cache)
+            self.assertNotEqual(moved, with_empty_directory)
+
+            empty_directory.rmdir()
+            (cache / "standalone-entry").write_bytes(b"identical bytes")
+            additional_path = fingerprint(cache)
+            self.assertNotEqual(moved, additional_path)
 
     def test_source_manifest_closes_over_flowmpc_dependency_module(self) -> None:
         source_root = Path(study.__file__).resolve().parents[2]

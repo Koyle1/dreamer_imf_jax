@@ -19,6 +19,7 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import pickle
+import re
 import subprocess
 import tempfile
 import time
@@ -29,12 +30,18 @@ import numpy as np
 from .artifacts import read_json
 from . import matched_objective_benchmark as benchmark
 from . import flowmpc_actor_study as dependency
+from .cache_fingerprint import cache_tree_sha256
 
 SCHEMA = "trajectory-imf-actor-gap-roadmap-study-v1"
 CALIBRATION_SCHEMA = "trajectory-imf-actor-gap-calibration-v1"
 DIAGNOSTIC_SCHEMA = "trajectory-imf-actor-gap-diagnostic-cell-v1"
 MODEL_SCHEMA = "trajectory-imf-actor-gap-model-cell-v1"
 EVALUATION_SCHEMA = "trajectory-imf-actor-gap-evaluation-cell-v1"
+EVALUATION_CACHE_READER_SCHEMA = "trajectory-imf-actor-gap-evaluation-cache-reader-v1"
+EVALUATION_PRIMER_RECEIPT_SCHEMA = (
+    "trajectory-imf-actor-gap-evaluation-primer-receipt-v1"
+)
+EVALUATION_CACHE_SEAL_SCHEMA = "trajectory-imf-actor-gap-evaluation-cache-seal-v1"
 MARKER_SCHEMA = "trajectory-imf-actor-gap-marker-v1"
 PREFLIGHT_MARKER_SCHEMA = "trajectory-imf-actor-gap-preflight-marker-v1"
 PREFLIGHT_GATE_SCHEMA = "trajectory-imf-actor-gap-preflight-gate-v1"
@@ -511,6 +518,12 @@ def build_study_matrix(
                         "dependency_cell_id": dependency_cell["cell_id"],
                         "result_path": f"evaluation/{cell_id}/result.json",
                         "trace_path": f"evaluation/{cell_id}/traces.npz",
+                        "creation_cache_seal_path": (
+                            f"verified/cache-seals/{cell_id}-creation.json"
+                        ),
+                        "verification_cache_seal_path": (
+                            f"verified/cache-seals/{cell_id}-verification.json"
+                        ),
                         "marker_path": f"verified/{cell_id}.json",
                     }
                 )
@@ -621,6 +634,17 @@ def build_manifest(
             "ensemble_posterior_common_random_numbers": True,
             "equal_objective_calls_not_claimed_equal_flops": True,
             "discarded_pure_compile_warmup": True,
+            "evaluation_cache_scope": "fresh_per_slurm_array_task",
+            "evaluation_process_order": [
+                "discard_only_primer",
+                "result_creation_cache_reader",
+                "post_exit_creation_cache_seal",
+                "strict_replay_cache_reader",
+                "post_exit_verification_cache_seal",
+            ],
+            "evaluation_cache_content_sealed_after_primer": True,
+            "evaluation_primer_runtime_receipt": True,
+            "evaluation_post_exit_cache_seals": ["creation", "verification"],
         },
         "diagnostics": {
             "proposal_and_heldout_objectives": "post_update_minus_pre_update",
@@ -796,6 +820,17 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
         "ensemble_posterior_common_random_numbers": True,
         "equal_objective_calls_not_claimed_equal_flops": True,
         "discarded_pure_compile_warmup": True,
+        "evaluation_cache_scope": "fresh_per_slurm_array_task",
+        "evaluation_process_order": [
+            "discard_only_primer",
+            "result_creation_cache_reader",
+            "post_exit_creation_cache_seal",
+            "strict_replay_cache_reader",
+            "post_exit_verification_cache_seal",
+        ],
+        "evaluation_cache_content_sealed_after_primer": True,
+        "evaluation_primer_runtime_receipt": True,
+        "evaluation_post_exit_cache_seals": ["creation", "verification"],
     }:
         raise ValueError("roadmap controller contract differs")
     if manifest.get("diagnostics") != {
@@ -873,6 +908,8 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
                 "checkpoint_path",
                 "schedule_path",
                 "trace_path",
+                "creation_cache_seal_path",
+                "verification_cache_seal_path",
                 "marker_path",
             ):
                 if key not in row:
@@ -1022,13 +1059,65 @@ def _validate_preflight_gate(
     return body
 
 
+def _actor_gap_runtime_homogeneity_identity(
+    runtime: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Normalize only the declared actor-gap cache scope across Slurm jobs.
+
+    Evaluation cells intentionally use a fresh cache directory per array task,
+    while the other stages retain a source-commit-scoped shared cache.  The
+    concrete path remains recorded in every runtime certificate; only the
+    final scope component is normalized for software/hardware homogeneity.
+    Arbitrary cache paths retain the benchmark's exact-path semantics.
+    """
+
+    identity = benchmark.runtime_homogeneity_identity(runtime)
+    if "jax_compilation_cache_dir" not in identity:
+        return identity
+    raw_cache = str(identity["jax_compilation_cache_dir"])
+    cache = PurePosixPath(raw_cache)
+    parts = cache.parts
+    try:
+        anchor = parts.index("actor-gap-roadmap")
+    except ValueError:
+        return identity
+    suffix = parts[anchor + 1 :]
+    if (
+        len(suffix) != 2
+        or re.fullmatch(r"[0-9a-f]{40}", suffix[0]) is None
+        or re.fullmatch(r"job-[0-9]+-task-[0-9]+", suffix[1]) is None
+    ):
+        return identity
+    normalized = dict(identity)
+    normalized["jax_compilation_cache_dir"] = str(
+        PurePosixPath(*parts[: anchor + 2]) / "<declared-stage-scope>"
+    )
+    return normalized
+
+
 def _require_preflight_runtime_match(
-    root: Path, manifest: Mapping[str, Any], runtime: Mapping[str, Any]
+    root: Path,
+    manifest: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+    *,
+    stage: str,
 ) -> None:
     gate = _validate_preflight_gate(root, manifest, "single_gpu")
-    if benchmark.runtime_homogeneity_identity(
-        runtime
-    ) != benchmark.runtime_homogeneity_identity(gate["runtime"]):
+    worker_identity = benchmark.runtime_homogeneity_identity(runtime)
+    gate_identity = benchmark.runtime_homogeneity_identity(gate["runtime"])
+    worker_cache = PurePosixPath(str(worker_identity["jax_compilation_cache_dir"]))
+    gate_cache = PurePosixPath(str(gate_identity["jax_compilation_cache_dir"]))
+    if stage == "evaluation":
+        if (
+            worker_cache.parent != gate_cache.parent
+            or re.fullmatch(r"job-[0-9]+-task-[0-9]+", worker_cache.name) is None
+        ):
+            raise ValueError("evaluation runtime is not job-cache scoped")
+        worker_identity = dict(worker_identity)
+        worker_identity["jax_compilation_cache_dir"] = str(gate_cache)
+    elif worker_cache != gate_cache or gate_cache.name != "shared":
+        raise ValueError("non-evaluation runtime is not shared-cache scoped")
+    if worker_identity != gate_identity:
         raise ValueError("worker runtime differs from the frozen preflight runtime")
 
 
@@ -1038,7 +1127,7 @@ def _preflight_marker_body(root: Path, manifest: Mapping[str, Any]) -> dict[str,
         gate: _validate_preflight_gate(root, manifest, gate) for gate in PREFLIGHT_GATES
     }
     runtime_identities = [
-        benchmark.runtime_homogeneity_identity(gates[gate]["runtime"])
+        _actor_gap_runtime_homogeneity_identity(gates[gate]["runtime"])
         for gate in PREFLIGHT_GATES
     ]
     if any(identity != runtime_identities[0] for identity in runtime_identities[1:]):
@@ -1081,7 +1170,7 @@ def write_preflight_marker(output_root: str | Path) -> dict[str, Any]:
     scheduler, receipt, runtime = _live_single_execution_binding(
         root, manifest, "preflight"
     )
-    _require_preflight_runtime_match(root, manifest, runtime)
+    _require_preflight_runtime_match(root, manifest, runtime, stage="preflight")
     marker.update(
         {
             "scheduler_provenance": scheduler,
@@ -1115,7 +1204,7 @@ def validate_preflight_marker(output_root: str | Path) -> dict[str, Any]:
         marker.get("submission_receipt", {}),
         marker.get("runtime", {}),
     )
-    _require_preflight_runtime_match(root, manifest, runtime)
+    _require_preflight_runtime_match(root, manifest, runtime, stage="preflight")
     expected = _preflight_marker_body(root, manifest)
     expected.update(
         {
@@ -1171,7 +1260,12 @@ def _cell_artifact_paths(
     keys = {
         "diagnostic": ("result_path", "trace_path", "marker_path"),
         "model": ("result_path", "schedule_path", "checkpoint_path", "marker_path"),
-        "evaluation": ("result_path", "trace_path", "marker_path"),
+        "evaluation": (
+            "result_path",
+            "trace_path",
+            "creation_cache_seal_path",
+            "marker_path",
+        ),
     }[stage]
     return tuple(root / str(cell[key]) for key in keys)
 
@@ -1186,6 +1280,14 @@ def _retained_data_file_records(
         }
         for path in _cell_artifact_paths(root, cell, stage)[:-1]
     ]
+
+
+def _evaluation_verification_cache_seal_path(
+    root: Path, cell: Mapping[str, Any], stage: str
+) -> Path | None:
+    if stage != "evaluation":
+        return None
+    return root / str(cell["verification_cache_seal_path"])
 
 
 def _submission_entry_digest(entry: Mapping[str, Any]) -> str:
@@ -1220,10 +1322,16 @@ def write_submission_map(
         cell = _cell(manifest, stage, entry["index"])
         paths = _cell_artifact_paths(root, cell, stage)
         data_paths, marker_path = paths[:-1], paths[-1]
-        if entry["mode"] == "new" and any(path.exists() for path in paths):
+        verification_seal = _evaluation_verification_cache_seal_path(root, cell, stage)
+        if entry["mode"] == "new" and (
+            any(path.exists() for path in paths)
+            or (verification_seal is not None and verification_seal.exists())
+        ):
             raise ValueError("new submission index already has retained artifacts")
         if entry["mode"] == "verification_only" and (
-            not all(path.is_file() for path in data_paths) or marker_path.exists()
+            not all(path.is_file() for path in data_paths)
+            or marker_path.exists()
+            or (verification_seal is not None and verification_seal.exists())
         ):
             raise ValueError("verification-only submission artifacts differ")
         entry["retained_data_files"] = (
@@ -1268,8 +1376,8 @@ def validate_submission_map(
 ) -> dict[str, Any]:
     """Authorize exactly one array index from an immutable submission map."""
 
-    if action not in {"create", "verify"}:
-        raise ValueError("submission-map action must be create or verify")
+    if action not in {"create", "verify", "read"}:
+        raise ValueError("submission-map action must be create, verify, or read")
 
     root = Path(output_root).resolve(strict=True)
     path = Path(map_path).resolve(strict=True)
@@ -1313,14 +1421,24 @@ def validate_submission_map(
     cell = _cell(manifest, stage, int(index))
     paths = _cell_artifact_paths(root, cell, stage)
     data_paths, marker_path = paths[:-1], paths[-1]
+    verification_seal = _evaluation_verification_cache_seal_path(root, cell, stage)
     if action == "create":
-        if authorized["mode"] == "new" and any(path.exists() for path in paths):
+        if authorized["mode"] == "new" and (
+            any(path.exists() for path in paths)
+            or (verification_seal is not None and verification_seal.exists())
+        ):
             raise ValueError("new submission index already has retained artifacts")
         if authorized["mode"] == "verification_only" and (
-            not all(path.is_file() for path in data_paths) or marker_path.exists()
+            not all(path.is_file() for path in data_paths)
+            or marker_path.exists()
+            or (verification_seal is not None and verification_seal.exists())
         ):
             raise ValueError("verification-only submission index changed state")
-    elif not all(path.is_file() for path in data_paths) or marker_path.exists():
+    elif action == "verify" and (
+        not all(path.is_file() for path in data_paths)
+        or marker_path.exists()
+        or (verification_seal is not None and verification_seal.exists())
+    ):
         raise ValueError(
             "verification action requires complete unmarked data artifacts"
         )
@@ -1984,7 +2102,7 @@ def _live_stage_verifier_execution_binding(
             ),
         }
     runtime = _require_single_gpu_runtime(benchmark.runtime_fingerprint())
-    _require_preflight_runtime_match(root, manifest, runtime)
+    _require_preflight_runtime_match(root, manifest, runtime, stage="stage-verifier")
     return scheduler, receipt, runtime
 
 
@@ -2014,7 +2132,7 @@ def _validate_retained_stage_verifier_execution_binding(
     else:
         raise ValueError("retained stage-verifier receipt kind is invalid")
     runtime = _require_single_gpu_runtime(runtime_record)
-    _require_preflight_runtime_match(root, manifest, runtime)
+    _require_preflight_runtime_match(root, manifest, runtime, stage="stage-verifier")
     if dict(receipt_record) != receipt or dict(runtime_record) != runtime:
         raise ValueError("retained stage-verifier execution binding differs")
     return scheduler, receipt, runtime
@@ -2091,7 +2209,7 @@ def _live_array_execution_binding(
         root, manifest, cell, stage, authorization, scheduler
     )
     runtime = _require_single_gpu_runtime(benchmark.runtime_fingerprint())
-    _require_preflight_runtime_match(root, manifest, runtime)
+    _require_preflight_runtime_match(root, manifest, runtime, stage=stage)
     return scheduler, receipt, runtime
 
 
@@ -2116,7 +2234,7 @@ def _validate_retained_creation_binding(
         root, manifest, cell, stage, authorization, scheduler
     )
     runtime = _require_single_gpu_runtime(result.get("runtime", {}))
-    _require_preflight_runtime_match(root, manifest, runtime)
+    _require_preflight_runtime_match(root, manifest, runtime, stage=stage)
     if (
         authorization["mode"] != "new"
         or result.get("creation_submission_receipt") != receipt
@@ -2559,7 +2677,9 @@ def run_calibration(
     creation_scheduler, creation_receipt, creation_runtime = (
         _live_single_execution_binding(root, manifest, "calibration")
     )
-    _require_preflight_runtime_match(root, manifest, creation_runtime)
+    _require_preflight_runtime_match(
+        root, manifest, creation_runtime, stage="calibration"
+    )
     if creation_receipt.get("intent_payload", {}).get("mode") != "new":
         raise ValueError("calibration result lacks a new-mode creation receipt")
     started = time.perf_counter()
@@ -2615,7 +2735,9 @@ def verify_calibration(output_root: str | Path) -> dict[str, Any]:
             result.get("runtime", {}),
         )
     )
-    _require_preflight_runtime_match(root, manifest, creation_runtime)
+    _require_preflight_runtime_match(
+        root, manifest, creation_runtime, stage="calibration"
+    )
     if creation_receipt.get("intent_payload", {}).get("mode") != "new":
         raise ValueError("calibration result lacks a new-mode creation receipt")
     arrays_file_sha256 = benchmark.file_sha256(arrays_path)
@@ -2758,11 +2880,13 @@ def verify_calibration(output_root: str | Path) -> dict[str, Any]:
     verification_scheduler, verification_receipt, verification_runtime = (
         _live_single_execution_binding(root, manifest, "calibration")
     )
-    _require_preflight_runtime_match(root, manifest, verification_runtime)
+    _require_preflight_runtime_match(
+        root, manifest, verification_runtime, stage="calibration"
+    )
     _require_distinct_replay_processes(creation_scheduler, verification_scheduler)
-    if benchmark.runtime_homogeneity_identity(
+    if _actor_gap_runtime_homogeneity_identity(
         creation_runtime
-    ) != benchmark.runtime_homogeneity_identity(verification_runtime):
+    ) != _actor_gap_runtime_homogeneity_identity(verification_runtime):
         raise ValueError("calibration creation and replay runtimes differ")
     verification_mode = verification_receipt.get("intent_payload", {}).get("mode")
     if verification_mode not in {"new", "verification_only"} or (
@@ -2833,8 +2957,12 @@ def _validate_calibration_marker(
         )
     )
     _require_distinct_replay_processes(creation_scheduler, verification_scheduler)
-    _require_preflight_runtime_match(root, manifest, creation_runtime)
-    _require_preflight_runtime_match(root, manifest, verification_runtime)
+    _require_preflight_runtime_match(
+        root, manifest, creation_runtime, stage="calibration"
+    )
+    _require_preflight_runtime_match(
+        root, manifest, verification_runtime, stage="calibration"
+    )
     verification_mode = verification_receipt.get("intent_payload", {}).get("mode")
     if (
         result.get("schema_version") != CALIBRATION_SCHEMA
@@ -2848,8 +2976,8 @@ def _validate_calibration_marker(
         or verification_mode not in {"new", "verification_only"}
         or (verification_mode == "new" and verification_receipt != creation_receipt)
         or marker.get("verification_submission_receipt") != verification_receipt
-        or benchmark.runtime_homogeneity_identity(creation_runtime)
-        != benchmark.runtime_homogeneity_identity(verification_runtime)
+        or _actor_gap_runtime_homogeneity_identity(creation_runtime)
+        != _actor_gap_runtime_homogeneity_identity(verification_runtime)
     ):
         raise ValueError("calibration result certificate is invalid")
     return marker
@@ -6597,6 +6725,948 @@ def _compute_evaluation_cell(
     return core, trace, timing
 
 
+def _evaluation_publication_snapshot(
+    root: Path, cell: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """Describe the publishable cell paths without changing them."""
+
+    snapshot: list[dict[str, Any]] = []
+    for path in _cell_artifact_paths(root, cell, "evaluation"):
+        relative = str(path.relative_to(root))
+        if not path.exists():
+            snapshot.append({"path": relative, "state": "missing"})
+        elif path.is_file() and not path.is_symlink():
+            snapshot.append(
+                {
+                    "path": relative,
+                    "state": "file",
+                    "bytes": path.stat().st_size,
+                    "file_sha256": benchmark.file_sha256(path),
+                }
+            )
+        else:
+            raise ValueError(
+                f"evaluation publication path is not a regular file: {relative}"
+            )
+    return snapshot
+
+
+def _validate_job_scoped_evaluation_cache_path(
+    raw: str,
+    manifest: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    scheduler: Mapping[str, Any],
+) -> str:
+    """Require the exact fresh cache namespace assigned to one array task."""
+
+    if not raw:
+        raise ValueError("evaluation cache primer requires JAX_COMPILATION_CACHE_DIR")
+    cache = PurePosixPath(raw)
+    expected_leaf = f"job-{str(scheduler['job_id'])}-task-{int(cell['index'])}"
+    if (
+        not cache.is_absolute()
+        or cache.name != expected_leaf
+        or cache.parent.name != str(manifest["source_commit"])
+        or cache.parent.parent.name != "actor-gap-roadmap"
+    ):
+        raise ValueError("evaluation cache is not the declared fresh job-scoped path")
+    return str(cache)
+
+
+def _job_scoped_evaluation_cache(
+    manifest: Mapping[str, Any], cell: Mapping[str, Any], scheduler: Mapping[str, Any]
+) -> str:
+    return _validate_job_scoped_evaluation_cache_path(
+        str(os.environ.get("JAX_COMPILATION_CACHE_DIR", "")),
+        manifest,
+        cell,
+        scheduler,
+    )
+
+
+def _evaluation_cache_reader_certificate(
+    manifest: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    scheduler: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind an evidence process to the cache populated by its primer."""
+
+    cache = _job_scoped_evaluation_cache(manifest, cell, scheduler)
+    fingerprint = _assert_evaluation_cache_sealed(manifest, cell, scheduler, runtime)
+    return {
+        "schema_version": EVALUATION_CACHE_READER_SCHEMA,
+        "status": "primed_cache_reader",
+        "source_commit": manifest["source_commit"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "cell_id": cell["cell_id"],
+        "cell_index": int(cell["index"]),
+        "job_id": str(scheduler["job_id"]),
+        "array_job_id": str(scheduler["array_job_id"]),
+        "array_task_id": int(scheduler["array_task_id"]),
+        "cache_directory": cache,
+        "cache_tree_sha256_after_discarded_primer": fingerprint,
+        "separate_discard_only_primer_process": True,
+    }
+
+
+def _assert_evaluation_cache_sealed(
+    manifest: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    scheduler: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+) -> str:
+    """Require the current cache tree to equal the post-primer fingerprint."""
+
+    cache = _job_scoped_evaluation_cache(manifest, cell, scheduler)
+    expected = str(os.environ.get("AGR_EVALUATION_CACHE_FINGERPRINT", ""))
+    if re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+        raise ValueError("evaluation cache primer fingerprint is missing or invalid")
+    if str(runtime.get("jax_compilation_cache_dir")) != cache:
+        raise ValueError("runtime cache directory differs from the primer cache")
+    actual = cache_tree_sha256(Path(cache))
+    if actual != expected:
+        raise ValueError("evaluation cache changed after the discarded primer")
+    return actual
+
+
+def _evaluation_primer_receipt_path(
+    root: Path, cell: Mapping[str, Any], scheduler: Mapping[str, Any]
+) -> Path:
+    return (
+        root
+        / "runtime"
+        / "evaluation-primers"
+        / (f"job-{str(scheduler['job_id'])}-" f"task-{int(cell['index'])}.json")
+    )
+
+
+def _require_same_array_task(left: Mapping[str, Any], right: Mapping[str, Any]) -> None:
+    fields = (
+        "job_id",
+        "array_job_id",
+        "array_task_id",
+        "node_name",
+        "boot_id",
+    )
+    if any(left[field] != right[field] for field in fields):
+        raise ValueError("evaluation primer and cache reader are not one array task")
+
+
+def _evaluation_primer_receipt_reference(
+    root: Path, path: Path, receipt: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        "path": str(path.relative_to(root)),
+        "file_sha256": benchmark.file_sha256(path),
+        "receipt_sha256": receipt["receipt_sha256"],
+        "discarded_wall_seconds": float(receipt["discarded_wall_seconds"]),
+        "cache_tree_sha256_after_discarded_primer": receipt[
+            "cache_tree_sha256_after_discarded_primer"
+        ],
+    }
+
+
+def _validate_evaluation_primer_receipt_reference(
+    root: Path,
+    reference: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    reader_scheduler: Mapping[str, Any],
+    reader_runtime: Mapping[str, Any],
+    reader_authorization: Mapping[str, Any],
+    expected_cache_fingerprint: str,
+) -> dict[str, Any]:
+    expected_path = _evaluation_primer_receipt_path(root, cell, reader_scheduler)
+    canonical_reference = dict(reference)
+    if (
+        set(canonical_reference)
+        != {
+            "path",
+            "file_sha256",
+            "receipt_sha256",
+            "discarded_wall_seconds",
+            "cache_tree_sha256_after_discarded_primer",
+        }
+        or canonical_reference.get("path") != str(expected_path.relative_to(root))
+        or canonical_reference.get("file_sha256")
+        != benchmark.file_sha256(expected_path)
+        or not isinstance(
+            canonical_reference.get("discarded_wall_seconds"), (int, float)
+        )
+        or not math.isfinite(float(canonical_reference["discarded_wall_seconds"]))
+        or float(canonical_reference["discarded_wall_seconds"]) < 0.0
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(
+                canonical_reference.get("cache_tree_sha256_after_discarded_primer", "")
+            ),
+        )
+        is None
+    ):
+        raise ValueError("evaluation primer receipt reference is invalid")
+    receipt = read_json(expected_path)
+    primer_scheduler = _validate_scheduler_record(
+        receipt.get("scheduler_provenance", {}), int(cell["index"])
+    )
+    primer_runtime = _require_single_gpu_runtime(receipt.get("runtime", {}))
+    _require_preflight_runtime_match(root, manifest, primer_runtime, stage="evaluation")
+    primer_authorization = _validate_retained_submission_authorization(
+        root,
+        manifest,
+        cell,
+        "evaluation",
+        receipt.get("submission_authorization", {}),
+    )
+    primer_submission_receipt = _validate_array_submission_receipt(
+        root,
+        manifest,
+        cell,
+        "evaluation",
+        primer_authorization,
+        primer_scheduler,
+    )
+    _require_same_array_task(primer_scheduler, reader_scheduler)
+    _require_distinct_replay_processes(primer_scheduler, reader_scheduler)
+    expected_cache = _validate_job_scoped_evaluation_cache_path(
+        str(primer_runtime.get("jax_compilation_cache_dir", "")),
+        manifest,
+        cell,
+        primer_scheduler,
+    )
+    expected_keys = {
+        "schema_version",
+        "status",
+        "source_commit",
+        "manifest_sha256",
+        "cell_id",
+        "cell_index",
+        "arm",
+        "submission_mode",
+        "cache_directory",
+        "scheduler_provenance",
+        "submission_authorization",
+        "submission_receipt",
+        "runtime",
+        "publication_snapshot_before",
+        "publication_snapshot_after",
+        "publication_artifacts_unchanged",
+        "discarded_core_sha256",
+        "discarded_trace_sha256",
+        "discarded_timing",
+        "discarded_wall_seconds",
+        "cache_tree_sha256_after_discarded_primer",
+        "receipt_path",
+        "receipt_sha256",
+    }
+    if (
+        set(receipt) != expected_keys
+        or receipt.get("schema_version") != EVALUATION_PRIMER_RECEIPT_SCHEMA
+        or receipt.get("status") != "discarded_without_cell_publication"
+        or receipt.get("source_commit") != manifest["source_commit"]
+        or receipt.get("manifest_sha256") != manifest["manifest_sha256"]
+        or receipt.get("cell_id") != cell["cell_id"]
+        or receipt.get("cell_index") != int(cell["index"])
+        or receipt.get("arm") != cell["arm"]
+        or receipt.get("submission_mode") != primer_authorization["mode"]
+        or primer_authorization != dict(reader_authorization)
+        or receipt.get("cache_directory") != expected_cache
+        or dict(receipt.get("scheduler_provenance", {})) != primer_scheduler
+        or dict(receipt.get("submission_authorization", {})) != primer_authorization
+        or receipt.get("submission_receipt") != primer_submission_receipt
+        or dict(receipt.get("runtime", {})) != primer_runtime
+        or receipt.get("publication_snapshot_before")
+        != receipt.get("publication_snapshot_after")
+        or receipt.get("publication_artifacts_unchanged") is not True
+        or receipt.get("receipt_path") != str(expected_path.relative_to(root))
+        or receipt.get("receipt_sha256") != _unsigned_digest(receipt, "receipt_sha256")
+        or receipt.get("receipt_sha256") != canonical_reference.get("receipt_sha256")
+        or float(receipt.get("discarded_wall_seconds", -1.0))
+        != float(canonical_reference["discarded_wall_seconds"])
+        or receipt.get("cache_tree_sha256_after_discarded_primer")
+        != canonical_reference.get("cache_tree_sha256_after_discarded_primer")
+        or not _finite_tree(receipt)
+    ):
+        raise ValueError("evaluation primer receipt is invalid")
+    if _actor_gap_runtime_homogeneity_identity(
+        primer_runtime
+    ) != _actor_gap_runtime_homogeneity_identity(reader_runtime):
+        raise ValueError("evaluation primer and cache-reader runtimes differ")
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", str(expected_cache_fingerprint)) is None
+        or receipt.get("cache_tree_sha256_after_discarded_primer")
+        != expected_cache_fingerprint
+    ):
+        raise ValueError("evaluation primer and cache-reader fingerprints differ")
+    return canonical_reference
+
+
+def _current_evaluation_primer_receipt_reference(
+    root: Path,
+    manifest: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    reader_scheduler: Mapping[str, Any],
+    reader_runtime: Mapping[str, Any],
+    reader_authorization: Mapping[str, Any],
+) -> dict[str, Any]:
+    path = _evaluation_primer_receipt_path(root, cell, reader_scheduler)
+    receipt = read_json(path)
+    reference = _evaluation_primer_receipt_reference(root, path, receipt)
+    return _validate_evaluation_primer_receipt_reference(
+        root,
+        reference,
+        manifest,
+        cell,
+        reader_scheduler,
+        reader_runtime,
+        reader_authorization,
+        str(os.environ.get("AGR_EVALUATION_CACHE_FINGERPRINT", "")),
+    )
+
+
+def _evaluation_cache_seal_path(
+    root: Path, cell: Mapping[str, Any], phase: str
+) -> Path:
+    if phase not in {"creation", "verification"}:
+        raise ValueError("evaluation cache-seal phase is invalid")
+    return root / str(cell[f"{phase}_cache_seal_path"])
+
+
+def _evaluation_cache_seal_artifacts(
+    root: Path, cell: Mapping[str, Any], phase: str
+) -> list[dict[str, str]]:
+    keys = ["result_path", "trace_path"]
+    if phase == "verification":
+        keys.append("marker_path")
+    return [
+        {
+            "path": str(cell[key]),
+            "file_sha256": benchmark.file_sha256(root / str(cell[key])),
+        }
+        for key in keys
+    ]
+
+
+def _evaluation_cache_seal_body(
+    root: Path,
+    manifest: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    phase: str,
+    *,
+    reader_authorization: Mapping[str, Any],
+    reader_scheduler: Mapping[str, Any],
+    reader_receipt: Mapping[str, Any],
+    reader_runtime: Mapping[str, Any],
+    sealer_authorization: Mapping[str, Any],
+    sealer_scheduler: Mapping[str, Any],
+    sealer_receipt: Mapping[str, Any],
+    sealer_runtime: Mapping[str, Any],
+) -> dict[str, Any]:
+    cache = _job_scoped_evaluation_cache(manifest, cell, sealer_scheduler)
+    fingerprint = _assert_evaluation_cache_sealed(
+        manifest, cell, sealer_scheduler, sealer_runtime
+    )
+    _require_same_array_task(reader_scheduler, sealer_scheduler)
+    _require_distinct_replay_processes(reader_scheduler, sealer_scheduler)
+    body = {
+        "schema_version": EVALUATION_CACHE_SEAL_SCHEMA,
+        "status": "sealed_after_reader_process_exit",
+        "phase": phase,
+        "source_commit": manifest["source_commit"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "cell_id": cell["cell_id"],
+        "cell_index": int(cell["index"]),
+        "cache_directory": cache,
+        "cache_tree_sha256_after_discarded_primer": fingerprint,
+        "reader_submission_authorization": dict(reader_authorization),
+        "reader_scheduler_provenance": dict(reader_scheduler),
+        "reader_submission_receipt": dict(reader_receipt),
+        "reader_runtime": dict(reader_runtime),
+        "sealer_submission_authorization": dict(sealer_authorization),
+        "sealer_scheduler_provenance": dict(sealer_scheduler),
+        "sealer_submission_receipt": dict(sealer_receipt),
+        "sealer_runtime": dict(sealer_runtime),
+        "artifact_bindings": _evaluation_cache_seal_artifacts(root, cell, phase),
+        "reader_exited_before_seal": True,
+        "seal_path": str(
+            _evaluation_cache_seal_path(root, cell, phase).relative_to(root)
+        ),
+    }
+    body["seal_sha256"] = benchmark.object_sha256(body)
+    return body
+
+
+def _validate_evaluation_cache_seal(
+    root: Path,
+    manifest: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    phase: str,
+) -> dict[str, Any]:
+    path = _evaluation_cache_seal_path(root, cell, phase)
+    seal = read_json(path)
+    result = read_json(root / str(cell["result_path"]))
+    if phase == "creation":
+        reader_authorization, reader_scheduler, reader_receipt, reader_runtime = (
+            _validate_retained_creation_binding(
+                root, manifest, cell, "evaluation", result
+            )
+        )
+        cache_certificate = result.get("creation_cache_reader_certificate", {})
+        primer_reference = result.get("creation_primer_receipt", {})
+    elif phase == "verification":
+        marker = read_json(root / str(cell["marker_path"]))
+        reader_authorization = _validate_retained_submission_authorization(
+            root,
+            manifest,
+            cell,
+            "evaluation",
+            marker.get("verification_submission_authorization", {}),
+        )
+        reader_scheduler = _validate_scheduler_record(
+            marker.get("verification_scheduler_provenance", {}), int(cell["index"])
+        )
+        reader_receipt = _validate_array_submission_receipt(
+            root,
+            manifest,
+            cell,
+            "evaluation",
+            reader_authorization,
+            reader_scheduler,
+        )
+        reader_runtime = _require_single_gpu_runtime(
+            marker.get("verification_runtime", {})
+        )
+        _require_preflight_runtime_match(
+            root, manifest, reader_runtime, stage="evaluation"
+        )
+        cache_certificate = marker.get("verification_cache_reader_certificate", {})
+        primer_reference = marker.get("verification_primer_receipt", {})
+    else:
+        raise ValueError("evaluation cache-seal phase is invalid")
+    _validate_evaluation_cache_reader_certificate(
+        cache_certificate,
+        manifest,
+        cell,
+        reader_scheduler,
+        reader_runtime,
+    )
+    _validate_evaluation_primer_receipt_reference(
+        root,
+        primer_reference,
+        manifest,
+        cell,
+        reader_scheduler,
+        reader_runtime,
+        reader_authorization,
+        str(cache_certificate.get("cache_tree_sha256_after_discarded_primer", "")),
+    )
+    sealer_authorization = _validate_retained_submission_authorization(
+        root,
+        manifest,
+        cell,
+        "evaluation",
+        seal.get("sealer_submission_authorization", {}),
+    )
+    sealer_scheduler = _validate_scheduler_record(
+        seal.get("sealer_scheduler_provenance", {}), int(cell["index"])
+    )
+    sealer_receipt = _validate_array_submission_receipt(
+        root,
+        manifest,
+        cell,
+        "evaluation",
+        sealer_authorization,
+        sealer_scheduler,
+    )
+    sealer_runtime = _require_single_gpu_runtime(seal.get("sealer_runtime", {}))
+    _require_preflight_runtime_match(root, manifest, sealer_runtime, stage="evaluation")
+    _require_same_array_task(reader_scheduler, sealer_scheduler)
+    _require_distinct_replay_processes(reader_scheduler, sealer_scheduler)
+    expected_cache = _validate_job_scoped_evaluation_cache_path(
+        str(sealer_runtime.get("jax_compilation_cache_dir", "")),
+        manifest,
+        cell,
+        sealer_scheduler,
+    )
+    expected_keys = {
+        "schema_version",
+        "status",
+        "phase",
+        "source_commit",
+        "manifest_sha256",
+        "cell_id",
+        "cell_index",
+        "cache_directory",
+        "cache_tree_sha256_after_discarded_primer",
+        "reader_submission_authorization",
+        "reader_scheduler_provenance",
+        "reader_submission_receipt",
+        "reader_runtime",
+        "sealer_submission_authorization",
+        "sealer_scheduler_provenance",
+        "sealer_submission_receipt",
+        "sealer_runtime",
+        "artifact_bindings",
+        "reader_exited_before_seal",
+        "seal_path",
+        "seal_sha256",
+    }
+    if (
+        set(seal) != expected_keys
+        or seal.get("schema_version") != EVALUATION_CACHE_SEAL_SCHEMA
+        or seal.get("status") != "sealed_after_reader_process_exit"
+        or seal.get("phase") != phase
+        or seal.get("source_commit") != manifest["source_commit"]
+        or seal.get("manifest_sha256") != manifest["manifest_sha256"]
+        or seal.get("cell_id") != cell["cell_id"]
+        or seal.get("cell_index") != int(cell["index"])
+        or seal.get("cache_directory") != expected_cache
+        or seal.get("cache_tree_sha256_after_discarded_primer")
+        != cache_certificate.get("cache_tree_sha256_after_discarded_primer")
+        or dict(seal.get("reader_submission_authorization", {})) != reader_authorization
+        or dict(seal.get("reader_scheduler_provenance", {})) != reader_scheduler
+        or seal.get("reader_submission_receipt") != reader_receipt
+        or dict(seal.get("reader_runtime", {})) != reader_runtime
+        or sealer_authorization != reader_authorization
+        or dict(seal.get("sealer_scheduler_provenance", {})) != sealer_scheduler
+        or seal.get("sealer_submission_receipt") != sealer_receipt
+        or dict(seal.get("sealer_runtime", {})) != sealer_runtime
+        or seal.get("artifact_bindings")
+        != _evaluation_cache_seal_artifacts(root, cell, phase)
+        or seal.get("reader_exited_before_seal") is not True
+        or seal.get("seal_path") != str(path.relative_to(root))
+        or seal.get("seal_sha256") != _unsigned_digest(seal, "seal_sha256")
+    ):
+        raise ValueError("evaluation cache seal is invalid")
+    return seal
+
+
+def seal_evaluation_cache_reader(
+    output_root: str | Path,
+    index: int,
+    *,
+    phase: str,
+    submission_authorization: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Publish a durable cache seal after a reader interpreter has exited."""
+
+    root = Path(output_root)
+    manifest = read_json(root / "manifest.json")
+    validate_manifest(manifest)
+    cell = _cell(manifest, "evaluation", index)
+    sealer_authorization = _validate_retained_submission_authorization(
+        root, manifest, cell, "evaluation", submission_authorization
+    )
+    path = _evaluation_cache_seal_path(root, cell, phase)
+    if phase == "creation" and path.is_file():
+        if sealer_authorization["mode"] != "verification_only":
+            raise ValueError("creation cache seal already exists")
+        return _validate_evaluation_cache_seal(root, manifest, cell, "creation")
+    if path.exists():
+        raise ValueError("evaluation cache seal path already exists")
+    result = read_json(root / str(cell["result_path"]))
+    sealer_scheduler, sealer_receipt, sealer_runtime = _live_array_execution_binding(
+        root, manifest, cell, "evaluation", sealer_authorization
+    )
+    if phase == "creation":
+        if (root / str(cell["marker_path"])).exists():
+            raise ValueError("creation cache seal must precede replay publication")
+        reader_authorization, reader_scheduler, reader_receipt, reader_runtime = (
+            _validate_retained_creation_binding(
+                root, manifest, cell, "evaluation", result
+            )
+        )
+        _validate_evaluation_cache_reader_certificate(
+            result.get("creation_cache_reader_certificate", {}),
+            manifest,
+            cell,
+            reader_scheduler,
+            reader_runtime,
+        )
+        _validate_evaluation_primer_receipt_reference(
+            root,
+            result.get("creation_primer_receipt", {}),
+            manifest,
+            cell,
+            reader_scheduler,
+            reader_runtime,
+            reader_authorization,
+            str(
+                result.get("creation_cache_reader_certificate", {}).get(
+                    "cache_tree_sha256_after_discarded_primer", ""
+                )
+            ),
+        )
+    elif phase == "verification":
+        _validate_evaluation_cache_seal(root, manifest, cell, "creation")
+        marker = read_json(root / str(cell["marker_path"]))
+        if (
+            marker.get("schema_version") != MARKER_SCHEMA
+            or marker.get("status") != "verified"
+            or marker.get("stage") != "evaluation"
+            or marker.get("source_commit") != manifest["source_commit"]
+            or marker.get("manifest_sha256") != manifest["manifest_sha256"]
+            or marker.get("cell_id") != cell["cell_id"]
+            or marker.get("cell_index") != int(cell["index"])
+            or marker.get("result_file_sha256")
+            != benchmark.file_sha256(root / str(cell["result_path"]))
+            or marker.get("trace_file_sha256")
+            != benchmark.file_sha256(root / str(cell["trace_path"]))
+            or marker.get("marker_sha256") != _unsigned_digest(marker, "marker_sha256")
+        ):
+            raise ValueError("evaluation marker cannot be cache-sealed")
+        reader_authorization = _validate_retained_submission_authorization(
+            root,
+            manifest,
+            cell,
+            "evaluation",
+            marker.get("verification_submission_authorization", {}),
+        )
+        reader_scheduler = _validate_scheduler_record(
+            marker.get("verification_scheduler_provenance", {}), int(cell["index"])
+        )
+        reader_receipt = _validate_array_submission_receipt(
+            root,
+            manifest,
+            cell,
+            "evaluation",
+            reader_authorization,
+            reader_scheduler,
+        )
+        reader_runtime = _require_single_gpu_runtime(
+            marker.get("verification_runtime", {})
+        )
+        _require_preflight_runtime_match(
+            root, manifest, reader_runtime, stage="evaluation"
+        )
+        _validate_evaluation_cache_reader_certificate(
+            marker.get("verification_cache_reader_certificate", {}),
+            manifest,
+            cell,
+            reader_scheduler,
+            reader_runtime,
+        )
+        _validate_evaluation_primer_receipt_reference(
+            root,
+            marker.get("verification_primer_receipt", {}),
+            manifest,
+            cell,
+            reader_scheduler,
+            reader_runtime,
+            reader_authorization,
+            str(
+                marker.get("verification_cache_reader_certificate", {}).get(
+                    "cache_tree_sha256_after_discarded_primer", ""
+                )
+            ),
+        )
+    else:
+        raise ValueError("evaluation cache-seal phase is invalid")
+    body = _evaluation_cache_seal_body(
+        root,
+        manifest,
+        cell,
+        phase,
+        reader_authorization=reader_authorization,
+        reader_scheduler=reader_scheduler,
+        reader_receipt=reader_receipt,
+        reader_runtime=reader_runtime,
+        sealer_authorization=sealer_authorization,
+        sealer_scheduler=sealer_scheduler,
+        sealer_receipt=sealer_receipt,
+        sealer_runtime=sealer_runtime,
+    )
+    _write_json_exclusive(path, body)
+    return body
+
+
+def _validate_evaluation_cache_reader_certificate(
+    certificate: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    scheduler: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+) -> dict[str, Any]:
+    canonical = dict(certificate)
+    expected_cache = _validate_job_scoped_evaluation_cache_path(
+        str(runtime.get("jax_compilation_cache_dir", "")),
+        manifest,
+        cell,
+        scheduler,
+    )
+    expected_keys = {
+        "schema_version",
+        "status",
+        "source_commit",
+        "manifest_sha256",
+        "cell_id",
+        "cell_index",
+        "job_id",
+        "array_job_id",
+        "array_task_id",
+        "cache_directory",
+        "cache_tree_sha256_after_discarded_primer",
+        "separate_discard_only_primer_process",
+    }
+    if (
+        set(canonical) != expected_keys
+        or canonical.get("schema_version") != EVALUATION_CACHE_READER_SCHEMA
+        or canonical.get("status") != "primed_cache_reader"
+        or canonical.get("source_commit") != manifest["source_commit"]
+        or canonical.get("manifest_sha256") != manifest["manifest_sha256"]
+        or canonical.get("cell_id") != cell["cell_id"]
+        or canonical.get("cell_index") != int(cell["index"])
+        or canonical.get("job_id") != str(scheduler["job_id"])
+        or canonical.get("array_job_id") != str(scheduler["array_job_id"])
+        or canonical.get("array_task_id") != int(scheduler["array_task_id"])
+        or canonical.get("cache_directory") != expected_cache
+        or canonical.get("cache_directory")
+        != str(runtime.get("jax_compilation_cache_dir"))
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(canonical.get("cache_tree_sha256_after_discarded_primer", "")),
+        )
+        is None
+        or canonical.get("separate_discard_only_primer_process") is not True
+    ):
+        raise ValueError("evaluation cache-reader certificate is invalid")
+    return canonical
+
+
+def prime_evaluation_cell(
+    output_root: str | Path,
+    index: int,
+    *,
+    submission_authorization: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Execute a full discarded cell and publish only its runtime receipt."""
+
+    root = Path(output_root)
+    manifest = read_json(root / "manifest.json")
+    validate_manifest(manifest)
+    cell = _cell(manifest, "evaluation", index)
+    current_authorization = _validate_retained_submission_authorization(
+        root, manifest, cell, "evaluation", submission_authorization
+    )
+    paths = _cell_artifact_paths(root, cell, "evaluation")
+    data_paths, marker_path = paths[:-1], paths[-1]
+    verification_seal = _evaluation_cache_seal_path(root, cell, "verification")
+    if current_authorization["mode"] == "new" and (
+        any(path.exists() for path in paths) or verification_seal.exists()
+    ):
+        raise ValueError("new evaluation primer found retained publication artifacts")
+    if current_authorization["mode"] == "verification_only" and (
+        not all(path.is_file() for path in data_paths)
+        or marker_path.exists()
+        or verification_seal.exists()
+    ):
+        raise ValueError("verification-only evaluation primer state differs")
+    _validate_stage_marker(root, manifest, "model")
+    scheduler, receipt, runtime = _live_array_execution_binding(
+        root, manifest, cell, "evaluation", current_authorization
+    )
+    cache = _job_scoped_evaluation_cache(manifest, cell, scheduler)
+    if str(runtime.get("jax_compilation_cache_dir")) != cache:
+        raise ValueError("primer runtime cache directory differs from its job cache")
+    receipt_path = _evaluation_primer_receipt_path(root, cell, scheduler)
+    if receipt_path.exists():
+        raise ValueError("evaluation primer receipt path already exists")
+    before = _evaluation_publication_snapshot(root, cell)
+    started = time.perf_counter()
+    core, trace, timing = _compute_evaluation_cell(root, manifest, cell)
+    wall_seconds = time.perf_counter() - started
+    if not _finite_tree(core) or not _finite_tree(trace) or not _finite_tree(timing):
+        raise FloatingPointError("discarded evaluation cache primer is not finite")
+    after = _evaluation_publication_snapshot(root, cell)
+    if after != before:
+        raise ValueError(
+            "discarded evaluation cache primer changed publication artifacts"
+        )
+    receipt_body = {
+        "schema_version": EVALUATION_PRIMER_RECEIPT_SCHEMA,
+        "status": "discarded_without_cell_publication",
+        "source_commit": manifest["source_commit"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "cell_id": cell["cell_id"],
+        "cell_index": int(cell["index"]),
+        "arm": cell["arm"],
+        "submission_mode": current_authorization["mode"],
+        "cache_directory": cache,
+        "scheduler_provenance": scheduler,
+        "submission_authorization": current_authorization,
+        "submission_receipt": receipt,
+        "runtime": runtime,
+        "publication_snapshot_before": before,
+        "publication_snapshot_after": after,
+        "publication_artifacts_unchanged": True,
+        "discarded_core_sha256": benchmark.object_sha256(core),
+        "discarded_trace_sha256": benchmark.array_sha256(trace),
+        "discarded_timing": timing,
+        "discarded_wall_seconds": wall_seconds,
+        "cache_tree_sha256_after_discarded_primer": cache_tree_sha256(Path(cache)),
+        "receipt_path": str(receipt_path.relative_to(root)),
+    }
+    receipt_body["receipt_sha256"] = benchmark.object_sha256(receipt_body)
+    _write_json_exclusive(receipt_path, receipt_body)
+    return receipt_body
+
+
+def _replay_value_preview(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    rendered = repr(value)
+    return rendered if len(rendered) <= 240 else rendered[:237] + "..."
+
+
+def _first_nested_replay_difference(
+    retained: Any, replay: Any, path: str
+) -> dict[str, Any] | None:
+    if isinstance(retained, Mapping) and isinstance(replay, Mapping):
+        retained_keys = set(retained)
+        replay_keys = set(replay)
+        if retained_keys != replay_keys:
+            return {
+                "path": path,
+                "kind": "mapping_keys",
+                "retained_only": sorted(retained_keys - replay_keys),
+                "replay_only": sorted(replay_keys - retained_keys),
+            }
+        for key in sorted(retained_keys, key=str):
+            difference = _first_nested_replay_difference(
+                retained[key], replay[key], f"{path}.{key}" if path else str(key)
+            )
+            if difference is not None:
+                return difference
+        return None
+    if isinstance(retained, (list, tuple)) and isinstance(replay, (list, tuple)):
+        if len(retained) != len(replay):
+            return {
+                "path": path,
+                "kind": "sequence_length",
+                "retained": len(retained),
+                "replay": len(replay),
+            }
+        for position, (retained_item, replay_item) in enumerate(
+            zip(retained, replay, strict=True)
+        ):
+            difference = _first_nested_replay_difference(
+                retained_item, replay_item, f"{path}[{position}]"
+            )
+            if difference is not None:
+                return difference
+        return None
+    try:
+        equal = bool(retained == replay)
+    except (TypeError, ValueError):
+        equal = False
+    if equal:
+        return None
+    difference = {
+        "path": path,
+        "kind": "value",
+        "retained": _replay_value_preview(retained),
+        "replay": _replay_value_preview(replay),
+    }
+    if isinstance(retained, (int, float)) and isinstance(replay, (int, float)):
+        difference["absolute_difference"] = abs(float(retained) - float(replay))
+    return difference
+
+
+def _first_core_replay_difference(
+    retained: Mapping[str, Any],
+    replay: Mapping[str, Any],
+    ordered_keys: Sequence[str],
+) -> dict[str, Any] | None:
+    for key in ordered_keys:
+        if key not in retained or key not in replay:
+            return {
+                "path": key,
+                "kind": "missing_key",
+                "retained_present": key in retained,
+                "replay_present": key in replay,
+            }
+        difference = _first_nested_replay_difference(retained[key], replay[key], key)
+        if difference is not None:
+            return difference
+    # Keep the preferred scientific ordering above, but still diagnose schema
+    # drift rather than returning ``null`` when either side gained a field.
+    remaining = (set(retained) | set(replay)) - set(ordered_keys)
+    for key in sorted(remaining, key=str):
+        if key not in retained or key not in replay:
+            return {
+                "path": key,
+                "kind": "missing_key",
+                "retained_present": key in retained,
+                "replay_present": key in replay,
+            }
+        difference = _first_nested_replay_difference(retained[key], replay[key], key)
+        if difference is not None:
+            return difference
+    return None
+
+
+def _first_trace_replay_difference(
+    retained: Mapping[str, np.ndarray], replay: Mapping[str, np.ndarray]
+) -> dict[str, Any] | None:
+    priority = (
+        "residual_norm",
+        "objective_before",
+        "objective_after",
+        "objective_improvement",
+        "actions",
+        "observations",
+        "rewards",
+    )
+    available = set(retained) | set(replay)
+    names = [name for name in priority if name in available]
+    names.extend(sorted(available - set(names)))
+    for name in names:
+        if name not in retained or name not in replay:
+            return {
+                "array": name,
+                "kind": "missing_array",
+                "retained_present": name in retained,
+                "replay_present": name in replay,
+            }
+        left = np.ascontiguousarray(retained[name])
+        right = np.ascontiguousarray(replay[name])
+        if left.dtype != right.dtype or left.shape != right.shape:
+            return {
+                "array": name,
+                "kind": "descriptor",
+                "retained_dtype": left.dtype.str,
+                "replay_dtype": right.dtype.str,
+                "retained_shape": list(left.shape),
+                "replay_shape": list(right.shape),
+            }
+        if left.tobytes(order="C") == right.tobytes(order="C"):
+            continue
+        left_bytes = left.view(np.uint8).reshape(left.size, left.dtype.itemsize)
+        right_bytes = right.view(np.uint8).reshape(right.size, right.dtype.itemsize)
+        flat = int(np.flatnonzero(np.any(left_bytes != right_bytes, axis=1))[0])
+        index = [] if left.shape == () else list(np.unravel_index(flat, left.shape))
+        left_value = left.reshape(-1)[flat]
+        right_value = right.reshape(-1)[flat]
+        detail: dict[str, Any] = {
+            "array": name,
+            "kind": "payload",
+            "index": index,
+            "retained": _replay_value_preview(left_value),
+            "replay": _replay_value_preview(right_value),
+            "retained_element_hex": left_bytes[flat].tobytes().hex(),
+            "replay_element_hex": right_bytes[flat].tobytes().hex(),
+        }
+        if np.issubdtype(left.dtype, np.number):
+            detail["absolute_difference"] = abs(float(left_value) - float(right_value))
+            detail["maximum_absolute_difference"] = float(
+                np.max(np.abs(left.astype(np.float64) - right.astype(np.float64)))
+            )
+        return detail
+    return None
+
+
 def run_evaluation_cell(
     dependency_root: str | Path,
     output_root: str | Path,
@@ -6631,12 +7701,30 @@ def run_evaluation_cell(
             root, manifest, cell, "evaluation", current_authorization
         )
     )
+    creation_cache_reader = _evaluation_cache_reader_certificate(
+        manifest, cell, creation_scheduler, creation_runtime
+    )
+    creation_primer_receipt = _current_evaluation_primer_receipt_reference(
+        root,
+        manifest,
+        cell,
+        creation_scheduler,
+        creation_runtime,
+        current_authorization,
+    )
     _reject_partial_artifacts(result_path, root / str(cell["trace_path"]))
     if not (root / "verified/stage-models.json").is_file():
         raise ValueError("evaluation requires the complete authenticated model stage")
     _validate_stage_marker(root, manifest, "model")
     started = time.perf_counter()
     core, trace, timing = _compute_evaluation_cell(root, manifest, cell)
+    if not _finite_tree(core) or not _finite_tree(trace) or not _finite_tree(timing):
+        raise FloatingPointError("evaluation cache-reader output is not finite")
+    _assert_evaluation_cache_sealed(
+        manifest, cell, creation_scheduler, creation_runtime
+    )
+    core["creation_cache_reader_certificate"] = creation_cache_reader
+    core["creation_primer_receipt"] = creation_primer_receipt
     core["creation_submission_authorization"] = current_authorization
     core["creation_scheduler_provenance"] = creation_scheduler
     core["creation_submission_receipt"] = creation_receipt
@@ -6655,7 +7743,8 @@ def run_evaluation_cell(
             "timing": timing,
             "wall_seconds": time.perf_counter() - started,
             "wall_seconds_scope": (
-                "result_creation_including_discarded_compile_warmup_and_trace_write"
+                "cache_reader_result_creation_and_trace_write_excludes_separate_"
+                "discarded_primer"
             ),
             "runtime": creation_runtime,
         }
@@ -6687,11 +7776,50 @@ def verify_evaluation_cell(
             root, manifest, cell, "evaluation", verification_authorization
         )
     )
+    verification_cache_reader = _evaluation_cache_reader_certificate(
+        manifest, cell, verification_scheduler, verification_runtime
+    )
+    verification_primer_receipt = _current_evaluation_primer_receipt_reference(
+        root,
+        manifest,
+        cell,
+        verification_scheduler,
+        verification_runtime,
+        verification_authorization,
+    )
     result_path = root / str(cell["result_path"])
     trace_path = root / str(cell["trace_path"])
     result = read_json(result_path)
-    creation_authorization, creation_scheduler, _, _ = (
+    creation_authorization, creation_scheduler, _, creation_runtime = (
         _validate_retained_creation_binding(root, manifest, cell, "evaluation", result)
+    )
+    _validate_evaluation_cache_reader_certificate(
+        result.get("creation_cache_reader_certificate", {}),
+        manifest,
+        cell,
+        creation_scheduler,
+        creation_runtime,
+    )
+    _validate_evaluation_primer_receipt_reference(
+        root,
+        result.get("creation_primer_receipt", {}),
+        manifest,
+        cell,
+        creation_scheduler,
+        creation_runtime,
+        creation_authorization,
+        str(
+            result.get("creation_cache_reader_certificate", {}).get(
+                "cache_tree_sha256_after_discarded_primer", ""
+            )
+        ),
+    )
+    _validate_evaluation_cache_reader_certificate(
+        verification_cache_reader,
+        manifest,
+        cell,
+        verification_scheduler,
+        verification_runtime,
     )
     _require_distinct_replay_processes(creation_scheduler, verification_scheduler)
     trace_file_sha256 = benchmark.file_sha256(trace_path)
@@ -6738,6 +7866,8 @@ def verify_evaluation_cell(
         "calibration_arrays_file_sha256",
         "dependency_trace_file_sha256",
         "discarded_pure_compile_warmup",
+        "creation_cache_reader_certificate",
+        "creation_primer_receipt",
         "creation_submission_authorization",
         "creation_scheduler_provenance",
         "creation_submission_receipt",
@@ -6758,8 +7888,13 @@ def verify_evaluation_cell(
     ):
         raise ValueError("evaluation cell contract differs")
     trace = benchmark.load_npz(trace_path)
-    if result.get("trace_sha256") != benchmark.array_sha256(trace):
+    if result.get("trace_sha256") != benchmark.array_sha256(trace) or not _finite_tree(
+        trace
+    ):
         raise ValueError("evaluation trace payload differs")
+    creation_cache_seal = _validate_evaluation_cache_seal(
+        root, manifest, cell, "creation"
+    )
     trust_arms = {
         "A1_persistent_trust",
         "A2_reset_trust",
@@ -6814,6 +7949,12 @@ def verify_evaluation_cell(
         ):
             raise ValueError("endpoint behavior filter did not govern execution")
     replay_core, replay_trace, _ = _compute_evaluation_cell(root, manifest, cell)
+    if not _finite_tree(replay_core) or not _finite_tree(replay_trace):
+        raise FloatingPointError("evaluation strict replay output is not finite")
+    replay_core["creation_cache_reader_certificate"] = result[
+        "creation_cache_reader_certificate"
+    ]
+    replay_core["creation_primer_receipt"] = result["creation_primer_receipt"]
     replay_core["creation_submission_authorization"] = result[
         "creation_submission_authorization"
     ]
@@ -6822,9 +7963,20 @@ def verify_evaluation_cell(
     ]
     replay_core["creation_submission_receipt"] = result["creation_submission_receipt"]
     if replay_core != core:
-        raise ValueError("evaluation semantic replay differs")
+        difference = _first_core_replay_difference(core, replay_core, core_keys)
+        raise ValueError(
+            "evaluation semantic replay differs: "
+            + json.dumps(difference, sort_keys=True, allow_nan=False)
+        )
     if benchmark.array_sha256(replay_trace) != result["trace_sha256"]:
-        raise ValueError("evaluation strict bitwise trace replay differs")
+        difference = _first_trace_replay_difference(trace, replay_trace)
+        raise ValueError(
+            "evaluation strict bitwise trace replay differs: "
+            + json.dumps(difference, sort_keys=True, allow_nan=False)
+        )
+    _assert_evaluation_cache_sealed(
+        manifest, cell, verification_scheduler, verification_runtime
+    )
     return _write_verified_marker(
         root,
         manifest,
@@ -6833,8 +7985,14 @@ def verify_evaluation_cell(
         result_path=result_path,
         extra={
             "trace_file_sha256": result["trace_file_sha256"],
+            "creation_cache_seal_file_sha256": benchmark.file_sha256(
+                _evaluation_cache_seal_path(root, cell, "creation")
+            ),
+            "creation_cache_seal_sha256": creation_cache_seal["seal_sha256"],
             "strict_policy_model_environment_replay": True,
             "arm": cell["arm"],
+            "verification_cache_reader_certificate": verification_cache_reader,
+            "verification_primer_receipt": verification_primer_receipt,
             "verification_submission_authorization": verification_authorization,
             "verification_scheduler_provenance": verification_scheduler,
             "verification_submission_receipt": verification_receipt,
@@ -6925,11 +8083,67 @@ def _validate_cell_marker(
     verification_runtime = _require_single_gpu_runtime(
         marker.get("verification_runtime", {})
     )
-    _require_preflight_runtime_match(root, manifest, creation_runtime)
-    _require_preflight_runtime_match(root, manifest, verification_runtime)
-    if benchmark.runtime_homogeneity_identity(
+    _require_preflight_runtime_match(root, manifest, creation_runtime, stage=stage)
+    _require_preflight_runtime_match(root, manifest, verification_runtime, stage=stage)
+    if stage == "evaluation":
+        _validate_evaluation_cache_reader_certificate(
+            result.get("creation_cache_reader_certificate", {}),
+            manifest,
+            cell,
+            creation_scheduler,
+            creation_runtime,
+        )
+        _validate_evaluation_cache_reader_certificate(
+            marker.get("verification_cache_reader_certificate", {}),
+            manifest,
+            cell,
+            verification_scheduler,
+            verification_runtime,
+        )
+        _validate_evaluation_primer_receipt_reference(
+            root,
+            result.get("creation_primer_receipt", {}),
+            manifest,
+            cell,
+            creation_scheduler,
+            creation_runtime,
+            creation_authorization,
+            str(
+                result.get("creation_cache_reader_certificate", {}).get(
+                    "cache_tree_sha256_after_discarded_primer", ""
+                )
+            ),
+        )
+        _validate_evaluation_primer_receipt_reference(
+            root,
+            marker.get("verification_primer_receipt", {}),
+            manifest,
+            cell,
+            verification_scheduler,
+            verification_runtime,
+            verification_authorization,
+            str(
+                marker.get("verification_cache_reader_certificate", {}).get(
+                    "cache_tree_sha256_after_discarded_primer", ""
+                )
+            ),
+        )
+        creation_cache_seal = _validate_evaluation_cache_seal(
+            root, manifest, cell, "creation"
+        )
+        _validate_evaluation_cache_seal(root, manifest, cell, "verification")
+        if (
+            marker.get("creation_cache_seal_file_sha256")
+            != benchmark.file_sha256(
+                _evaluation_cache_seal_path(root, cell, "creation")
+            )
+            or marker.get("creation_cache_seal_sha256")
+            != creation_cache_seal["seal_sha256"]
+        ):
+            raise ValueError("evaluation marker does not bind its creation cache seal")
+    if _actor_gap_runtime_homogeneity_identity(
         creation_runtime
-    ) != benchmark.runtime_homogeneity_identity(verification_runtime):
+    ) != _actor_gap_runtime_homogeneity_identity(verification_runtime):
         raise ValueError("creation and strict-replay runtime identities differ")
     _require_distinct_replay_processes(creation_scheduler, verification_scheduler)
     expected_schema = {
@@ -6982,16 +8196,20 @@ def _validate_cell_marker(
         or result.get("actor_seed") != int(cell["actor_seed"])
         or result.get("evaluation_seeds") != cell["evaluation_seeds"]
         or result.get("wall_seconds_scope")
-        != "result_creation_including_discarded_compile_warmup_and_trace_write"
+        != (
+            "cache_reader_result_creation_and_trace_write_excludes_separate_"
+            "discarded_primer"
+        )
     ):
         raise ValueError("evaluation cell semantics are invalid")
     if stage in {"diagnostic", "evaluation"}:
         trace_path = root / str(cell["trace_path"])
+        retained_trace = benchmark.load_npz(trace_path)
         if (
             marker.get("trace_file_sha256") != benchmark.file_sha256(trace_path)
             or result.get("trace_file_sha256") != benchmark.file_sha256(trace_path)
-            or result.get("trace_sha256")
-            != benchmark.array_sha256(benchmark.load_npz(trace_path))
+            or result.get("trace_sha256") != benchmark.array_sha256(retained_trace)
+            or not _finite_tree(retained_trace)
         ):
             raise ValueError(f"{stage} trace digest is invalid")
     elif stage == "model":
@@ -7021,15 +8239,22 @@ def _stage_marker_body(
     for cell in cells:
         marker_path = root / str(cell["marker_path"])
         marker = _validate_cell_marker(root, manifest, cell, stage)
-        entries.append(
-            {
-                "cell_id": cell["cell_id"],
-                "cell_index": int(cell["index"]),
-                "marker_file_sha256": benchmark.file_sha256(marker_path),
-                "marker_sha256": marker["marker_sha256"],
-                "result_file_sha256": marker["result_file_sha256"],
-            }
-        )
+        entry = {
+            "cell_id": cell["cell_id"],
+            "cell_index": int(cell["index"]),
+            "marker_file_sha256": benchmark.file_sha256(marker_path),
+            "marker_sha256": marker["marker_sha256"],
+            "result_file_sha256": marker["result_file_sha256"],
+        }
+        if stage == "evaluation":
+            for phase in ("creation", "verification"):
+                seal_path = _evaluation_cache_seal_path(root, cell, phase)
+                seal = read_json(seal_path)
+                entry[f"{phase}_cache_seal_file_sha256"] = benchmark.file_sha256(
+                    seal_path
+                )
+                entry[f"{phase}_cache_seal_sha256"] = seal["seal_sha256"]
+        entries.append(entry)
     upstream: dict[str, str] = {}
     if stage == "diagnostic":
         calibration = _validate_calibration_marker(root, manifest)
@@ -7580,6 +8805,23 @@ def _build_final_report(root: Path, manifest: Mapping[str, Any]) -> dict[str, An
         read_json(root / str(cell["marker_path"]))
         for cell in manifest["evaluation_cells"]
     ]
+    evaluation_primer_references = [
+        reference
+        for result, marker in zip(evaluations, evaluation_markers, strict=True)
+        for reference in (
+            result["creation_primer_receipt"],
+            marker["verification_primer_receipt"],
+        )
+    ]
+    unique_evaluation_primers = {
+        str(reference["path"]): reference for reference in evaluation_primer_references
+    }
+    evaluation_primer_seconds = float(
+        sum(
+            float(reference["discarded_wall_seconds"])
+            for reference in unique_evaluation_primers.values()
+        )
+    )
     result_creation_seconds = float(
         sum(row["wall_seconds"] for row in diagnostics + models + evaluations)
     )
@@ -7617,9 +8859,11 @@ def _build_final_report(root: Path, manifest: Mapping[str, Any]) -> dict[str, An
         "controller_telemetry": _controller_summary(evaluations),
         "runtime_evidence": {
             "scope": (
-                "per_cell_result_creation_plus_per_cell_strict_replay_verification;_"
-                "excludes_preflight_calibration_stage_finalization_slurm_queue_and_"
-                "scheduler_overhead"
+                "discarded_evaluation_primers_plus_per_cell_result_creation_plus_"
+                "per_cell_strict_replay_verification;_"
+                "excludes_shell_cache_hashing_post_exit_seal_processes_preflight_"
+                "calibration_stage_finalization_slurm_queue_scheduler_overhead_and_"
+                "failed_attempts"
             ),
             "total_diagnostic_wall_seconds": float(
                 sum(row["wall_seconds"] for row in diagnostics)
@@ -7634,11 +8878,17 @@ def _build_final_report(root: Path, manifest: Mapping[str, Any]) -> dict[str, An
                 np.mean([row["wall_seconds"] for row in evaluations])
             ),
             "total_result_creation_wall_seconds": result_creation_seconds,
+            "total_discarded_evaluation_primer_wall_seconds": (
+                evaluation_primer_seconds
+            ),
+            "unique_discarded_evaluation_primers": len(unique_evaluation_primers),
             "total_strict_replay_verification_wall_seconds": (
                 strict_verification_seconds
             ),
             "total_accounted_cell_wall_seconds": (
-                result_creation_seconds + strict_verification_seconds
+                evaluation_primer_seconds
+                + result_creation_seconds
+                + strict_verification_seconds
             ),
             "runtime_fingerprints": sorted(
                 {
@@ -7675,6 +8925,20 @@ def _build_final_report(root: Path, manifest: Mapping[str, Any]) -> dict[str, An
                     "cell_id": row["cell_id"],
                     "arm": row["arm"],
                     "wall_seconds": float(row["wall_seconds"]),
+                    "creation_primer_wall_seconds": float(
+                        row["creation_primer_receipt"]["discarded_wall_seconds"]
+                    ),
+                    "verification_primer_wall_seconds": float(
+                        evaluation_markers[index]["verification_primer_receipt"][
+                            "discarded_wall_seconds"
+                        ]
+                    ),
+                    "shared_creation_and_verification_primer": (
+                        row["creation_primer_receipt"]["path"]
+                        == evaluation_markers[index]["verification_primer_receipt"][
+                            "path"
+                        ]
+                    ),
                     "mean_milliseconds_per_step": float(
                         row["timing"]["mean_milliseconds_per_step"]
                     ),
@@ -7713,7 +8977,7 @@ def _write_final_marker(
     scheduler, receipt, runtime = _live_single_execution_binding(
         root, manifest, "finalize"
     )
-    _require_preflight_runtime_match(root, manifest, runtime)
+    _require_preflight_runtime_match(root, manifest, runtime, stage="finalize")
     if receipt.get("intent_payload", {}).get("mode") != expected_mode:
         raise ValueError("finalization receipt mode differs from artifact state")
     marker: dict[str, Any] = {
@@ -7808,7 +9072,7 @@ def validate_final(output_root: str | Path) -> dict[str, Any]:
         marker.get("submission_receipt", {}),
         marker.get("runtime", {}),
     )
-    _require_preflight_runtime_match(root, manifest, runtime)
+    _require_preflight_runtime_match(root, manifest, runtime, stage="finalize")
     finalization_mode = receipt.get("intent_payload", {}).get("mode")
     expected_marker = {
         "schema_version": STAGE_MARKER_SCHEMA,

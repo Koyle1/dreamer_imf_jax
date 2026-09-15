@@ -1627,9 +1627,17 @@ def _classify_cells(
     for cell in manifest[f"{stage}_cells"]:
         paths = study._cell_artifact_paths(root, cell, stage)
         data_paths, marker_path = paths[:-1], paths[-1]
+        verification_seal = study._evaluation_verification_cache_seal_path(
+            root, cell, stage
+        )
         if marker_path.is_file():
             study._validate_cell_marker(root, manifest, cell, stage)
             continue
+        if verification_seal is not None and verification_seal.exists():
+            raise ValueError(
+                f"orphan verification cache seal for {cell['cell_id']}; "
+                "preserve this output and use a fresh audited output root"
+            )
         present = [path.is_file() for path in data_paths]
         if not any(present):
             if any(path.exists() for path in paths):

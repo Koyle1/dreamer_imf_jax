@@ -241,7 +241,14 @@ The manifest freezes these comparisons:
 6. Every cell has deterministic keys, immutable outputs, and a digest-bound
    marker. Creation and strict replay are separate Python processes. Their
    Linux process identities must differ, while both must identify the same
-   registered Slurm array index and exactly one visible JAX GPU.
+   registered Slurm array index and exactly one visible JAX GPU. Evaluation
+   tasks additionally start from a fresh job-scoped compilation cache, run one
+   exact full-cell discard-only primer process, fingerprint the populated
+   cache, and then run creation and replay as two cache-reader processes. Each
+   reader rechecks the actual tree before publication. After that reader exits,
+   a separate process rechecks the tree and publishes a digest-bound creation
+   or verification cache seal. Missing creation seals cannot be retried as
+   retained data, and markers without verification seals cannot be promoted.
 7. The canonical submitter holds each array before release, persists an
    immutable receipt first, and only then releases the workers. Results bind
    their creation map and receipt; markers independently bind their replay map
@@ -260,8 +267,14 @@ contrast, favorable-seed fractions, saturation, objective improvement,
 gradient and parameter deltas, trust backtracks, frozen-reference fallbacks,
 held-out acceptance improvement, empirical executed/imagined coverage, causal
 horizon-5 ranking diagnostics, and runtime. Controller latency excludes only
-the one global discarded compile warm-up; it includes the first live step of
-every episode. With only
+discarded compilation warm-ups, including the separate evaluation primer; it
+includes the first live step of every retained episode. Each primer publishes
+only a runtime receipt—not scientific cell output—and the final report adds
+the unique receipt times to total accounted compute. Failed attempts remain
+separately visible in Slurm/provenance evidence and are not folded into the
+successful-path total. This is scientific compute-path time rather than total
+allocated GPU time: shell cache hashing, post-exit seal processes, queue time,
+and scheduler overhead remain in Slurm accounting. With only
 three top-level units on one easy task, these estimates are useful for deciding
 which mechanism deserves a preregistered multi-task study; they do not support
 a NeurIPS-level performance claim by themselves.
@@ -285,7 +298,11 @@ preflight
   -> calibration
   -> diagnostic-cell[0:3] -> fresh-process replay -> verify-diagnostics
   -> model-cell[0:21]      -> fresh-process replay -> verify-models
-  -> evaluation-cell[0:90] -> fresh-process replay -> verify-evaluations
+  -> evaluation-primer[0:90] -> evaluation-cell[0:90]
+                              -> post-exit creation cache seal
+                              -> fresh-process replay
+                              -> post-exit verification cache seal
+                              -> verify-evaluations
   -> finalize
 ```
 
@@ -302,8 +319,10 @@ python scripts/verify_actor_gap_roadmap_study.py <gate> --output-root <root>
 
 There are 114 logical scientific cells and 120 Slurm tasks/jobs including
 preflight, calibration, the three whole-stage verifiers, and finalization. A
-cell's creation command exits before its strict replay command starts, even
-though both commands execute sequentially inside the same Slurm array task.
+cell's discard-only primer exits before creation, and creation exits before its
+strict replay starts, even though all commands execute sequentially inside the
+same Slurm array task. The primer cannot publish a result, trace, marker, or
+checkpoint; its only output-root artifact is an authenticated runtime receipt.
 
 Required terminal tokens are:
 

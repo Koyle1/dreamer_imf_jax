@@ -28,7 +28,9 @@ COMMANDS = (
     "model-cell",
     "verify-model-cell",
     "verify-models",
+    "prime-evaluation-cell",
     "evaluation-cell",
+    "seal-evaluation-cache-reader",
     "verify-evaluation-cell",
     "verify-evaluations",
     "finalize",
@@ -95,7 +97,8 @@ def main() -> int:
         "--submission-stage", choices=("diagnostic", "model", "evaluation")
     )
     parser.add_argument("--submission-map-file-sha256")
-    parser.add_argument("--submission-action", choices=("create", "verify"))
+    parser.add_argument("--submission-action", choices=("create", "verify", "read"))
+    parser.add_argument("--cache-seal-phase", choices=("creation", "verification"))
     parser.add_argument("--model-updates", type=int, default=study.MODEL_UPDATES)
     parser.add_argument(
         "--evaluation-episodes", type=int, default=study.EVALUATION_EPISODES
@@ -215,6 +218,17 @@ def main() -> int:
     elif arguments.command == "verify-models":
         payload = study.verify_model_stage(arguments.output_root)
         token = "ACTOR_GAP_ROADMAP_MODELS_VERIFIED"
+    elif arguments.command == "prime-evaluation-cell":
+        index = _require_index(parser, arguments)
+        authorization = _authorize_submission(
+            parser, arguments, "evaluation", action="create"
+        )
+        payload = study.prime_evaluation_cell(
+            arguments.output_root,
+            index,
+            submission_authorization=authorization,
+        )
+        token = "ACTOR_GAP_ROADMAP_EVALUATION_CACHE_PRIMED"
     elif arguments.command == "evaluation-cell":
         dependency_root = _require_dependency(parser, arguments)
         index = _require_index(parser, arguments)
@@ -230,6 +244,20 @@ def main() -> int:
         )
         payload = result
         token = "ACTOR_GAP_ROADMAP_EVALUATION_CELL_DATA_READY"
+    elif arguments.command == "seal-evaluation-cache-reader":
+        index = _require_index(parser, arguments)
+        if arguments.cache_seal_phase is None:
+            parser.error("seal-evaluation-cache-reader requires --cache-seal-phase")
+        authorization = _authorize_submission(
+            parser, arguments, "evaluation", action="read"
+        )
+        payload = study.seal_evaluation_cache_reader(
+            arguments.output_root,
+            index,
+            phase=arguments.cache_seal_phase,
+            submission_authorization=authorization,
+        )
+        token = "ACTOR_GAP_ROADMAP_EVALUATION_CACHE_READER_SEALED"
     elif arguments.command == "verify-evaluation-cell":
         index = _require_index(parser, arguments)
         authorization = _authorize_submission(

@@ -9,6 +9,9 @@ from unittest import mock
 
 import numpy as np
 
+from dreamer_imf_comparison.cluster.actor_gap_roadmap import (
+    submit_actor_gap_roadmap as roadmap_submitter,
+)
 from dreamer_imf_compare import actor_gap_roadmap_study as study
 from dreamer_imf_compare.artifacts import write_json_atomic
 
@@ -181,6 +184,943 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
                         0,
                         strict_replay=False,
                         submission_authorization={},
+                    )
+
+    def test_evaluation_primer_is_discard_only_for_new_and_retry_states(self) -> None:
+        commit = "c" * 40
+        cell = {
+            "index": 4,
+            "cell_id": "evaluation-O1_recursive_action_sequence_gradient-211-311",
+            "arm": "O1_recursive_action_sequence_gradient",
+            "result_path": "evaluation/cell/result.json",
+            "trace_path": "evaluation/cell/traces.npz",
+            "creation_cache_seal_path": "verified/cache-seals/cell-creation.json",
+            "verification_cache_seal_path": (
+                "verified/cache-seals/cell-verification.json"
+            ),
+            "marker_path": "verified/cell.json",
+        }
+        manifest = {
+            "source_commit": commit,
+            "manifest_sha256": "m" * 64,
+            "evaluation_cells": [cell],
+        }
+        scheduler = {
+            "job_id": "12345",
+            "array_job_id": "12000",
+            "array_task_id": 4,
+        }
+        computed = (
+            {"finite": 1.0},
+            {"actions": np.asarray([[0.25]], dtype=np.float32)},
+            {"timed_steps": 1.0},
+        )
+        for mode in ("new", "verification_only"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_json_atomic(root / "manifest.json", manifest)
+                if mode == "verification_only":
+                    result_path = root / cell["result_path"]
+                    trace_path = root / cell["trace_path"]
+                    result_path.parent.mkdir(parents=True)
+                    result_path.write_bytes(b"immutable-result")
+                    trace_path.write_bytes(b"immutable-trace")
+                    creation_seal_path = root / cell["creation_cache_seal_path"]
+                    creation_seal_path.parent.mkdir(parents=True)
+                    creation_seal_path.write_bytes(b"immutable-creation-seal")
+                cache = (
+                    root
+                    / "jax-compilation-cache"
+                    / "actor-gap-roadmap"
+                    / commit
+                    / "job-12345-task-4"
+                )
+                cache.mkdir(parents=True)
+                (cache / "compiled-entry").write_bytes(b"fake compiled executable")
+                execution = (
+                    scheduler,
+                    {"receipt": "read-only"},
+                    {"jax_compilation_cache_dir": str(cache)},
+                )
+                with mock.patch.object(study, "validate_manifest"), mock.patch.object(
+                    study,
+                    "_validate_retained_submission_authorization",
+                    return_value={"mode": mode},
+                ), mock.patch.object(
+                    study, "_validate_stage_marker"
+                ), mock.patch.object(
+                    study, "_live_array_execution_binding", return_value=execution
+                ), mock.patch.object(
+                    study, "_compute_evaluation_cell", return_value=computed
+                ), mock.patch.dict(
+                    os.environ,
+                    {"JAX_COMPILATION_CACHE_DIR": str(cache)},
+                    clear=False,
+                ):
+                    result = study.prime_evaluation_cell(
+                        root,
+                        4,
+                        submission_authorization={"authorized": True},
+                    )
+                self.assertEqual(result["status"], "discarded_without_cell_publication")
+                self.assertTrue(result["publication_artifacts_unchanged"])
+                self.assertEqual(
+                    result["publication_snapshot_before"],
+                    result["publication_snapshot_after"],
+                )
+                self.assertFalse((root / cell["marker_path"]).exists())
+                if mode == "new":
+                    self.assertFalse((root / cell["result_path"]).exists())
+                    self.assertFalse((root / cell["trace_path"]).exists())
+                    self.assertFalse((root / cell["creation_cache_seal_path"]).exists())
+                else:
+                    self.assertEqual(
+                        (root / cell["result_path"]).read_bytes(), b"immutable-result"
+                    )
+                    self.assertEqual(
+                        (root / cell["trace_path"]).read_bytes(), b"immutable-trace"
+                    )
+                    self.assertEqual(
+                        (root / cell["creation_cache_seal_path"]).read_bytes(),
+                        b"immutable-creation-seal",
+                    )
+                self.assertFalse((root / cell["verification_cache_seal_path"]).exists())
+
+    def test_evaluation_primer_rejects_attempted_publication(self) -> None:
+        commit = "c" * 40
+        cell = {
+            "index": 4,
+            "cell_id": "evaluation-O1_recursive_action_sequence_gradient-211-311",
+            "arm": "O1_recursive_action_sequence_gradient",
+            "result_path": "evaluation/cell/result.json",
+            "trace_path": "evaluation/cell/traces.npz",
+            "creation_cache_seal_path": "verified/cache-seals/cell-creation.json",
+            "verification_cache_seal_path": (
+                "verified/cache-seals/cell-verification.json"
+            ),
+            "marker_path": "verified/cell.json",
+        }
+        manifest = {
+            "source_commit": commit,
+            "manifest_sha256": "m" * 64,
+            "evaluation_cells": [cell],
+        }
+        scheduler = {
+            "job_id": "12345",
+            "array_job_id": "12000",
+            "array_task_id": 4,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json_atomic(root / "manifest.json", manifest)
+            cache = (
+                root
+                / "jax-compilation-cache"
+                / "actor-gap-roadmap"
+                / commit
+                / "job-12345-task-4"
+            )
+            cache.mkdir(parents=True)
+            (cache / "compiled-entry").write_bytes(b"fake compiled executable")
+            execution = (
+                scheduler,
+                {"receipt": "read-only"},
+                {"jax_compilation_cache_dir": str(cache)},
+            )
+            result_path = root / cell["result_path"]
+
+            def publish_during_compute(*_args: object) -> tuple[dict, dict, dict]:
+                result_path.parent.mkdir(parents=True)
+                result_path.write_bytes(b"primer-must-not-publish-this")
+                return (
+                    {"finite": 1.0},
+                    {"actions": np.asarray([[0.25]], dtype=np.float32)},
+                    {"timed_steps": 1.0},
+                )
+
+            with mock.patch.object(study, "validate_manifest"), mock.patch.object(
+                study,
+                "_validate_retained_submission_authorization",
+                return_value={"mode": "new"},
+            ), mock.patch.object(study, "_validate_stage_marker"), mock.patch.object(
+                study, "_live_array_execution_binding", return_value=execution
+            ), mock.patch.object(
+                study, "_compute_evaluation_cell", side_effect=publish_during_compute
+            ), mock.patch.dict(
+                os.environ,
+                {"JAX_COMPILATION_CACHE_DIR": str(cache)},
+                clear=False,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "primer changed publication artifacts"
+                ):
+                    study.prime_evaluation_cell(
+                        root,
+                        4,
+                        submission_authorization={"authorized": True},
+                    )
+            self.assertEqual(result_path.read_bytes(), b"primer-must-not-publish-this")
+            self.assertFalse((root / cell["trace_path"]).exists())
+            self.assertFalse((root / cell["marker_path"]).exists())
+
+    def test_cache_mutation_fails_before_evaluation_bundle_publication(self) -> None:
+        commit = "c" * 40
+        cell = {
+            "index": 4,
+            "cell_id": "evaluation-O1_recursive_action_sequence_gradient-211-311",
+            "arm": "O1_recursive_action_sequence_gradient",
+            "result_path": "evaluation/cell/result.json",
+            "trace_path": "evaluation/cell/traces.npz",
+            "creation_cache_seal_path": "verified/cache-seals/cell-creation.json",
+            "verification_cache_seal_path": (
+                "verified/cache-seals/cell-verification.json"
+            ),
+            "marker_path": "verified/cell.json",
+        }
+        manifest = {
+            "source_commit": commit,
+            "manifest_sha256": "m" * 64,
+            "evaluation_cells": [cell],
+        }
+        scheduler = {
+            "job_id": "12345",
+            "array_job_id": "12000",
+            "array_task_id": 4,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "verified").mkdir()
+            (root / "verified/stage-models.json").write_bytes(b"authenticated")
+            cache = (
+                root
+                / "jax-compilation-cache"
+                / "actor-gap-roadmap"
+                / commit
+                / "job-12345-task-4"
+            )
+            cache.mkdir(parents=True)
+            runtime = {"jax_compilation_cache_dir": str(cache)}
+            execution = (scheduler, {"receipt": "creation"}, runtime)
+            computed = (
+                {"finite": 1.0},
+                {"actions": np.asarray([[0.25]], dtype=np.float32)},
+                {"timed_steps": 1.0},
+            )
+            with mock.patch.object(
+                study, "write_manifest", return_value=manifest
+            ), mock.patch.object(
+                study,
+                "_validate_retained_submission_authorization",
+                return_value={"mode": "new"},
+            ), mock.patch.object(
+                study, "_live_array_execution_binding", return_value=execution
+            ), mock.patch.object(
+                study,
+                "_evaluation_cache_reader_certificate",
+                return_value={"cache": "reader"},
+            ), mock.patch.object(
+                study,
+                "_current_evaluation_primer_receipt_reference",
+                return_value={"receipt_sha256": "p" * 64},
+            ), mock.patch.object(
+                study, "_validate_stage_marker"
+            ), mock.patch.object(
+                study, "_compute_evaluation_cell", return_value=computed
+            ) as compute, mock.patch.object(
+                study,
+                "_assert_evaluation_cache_sealed",
+                side_effect=ValueError("evaluation cache changed after primer"),
+            ) as seal:
+                with self.assertRaisesRegex(ValueError, "cache changed"):
+                    study.run_evaluation_cell(
+                        "/unused-dependency",
+                        root,
+                        4,
+                        submission_authorization={"authorized": True},
+                    )
+            compute.assert_called_once()
+            seal.assert_called_once()
+            self.assertFalse((root / cell["result_path"]).exists())
+            self.assertFalse((root / cell["trace_path"]).exists())
+            self.assertFalse((root / cell["creation_cache_seal_path"]).exists())
+            self.assertFalse((root / cell["verification_cache_seal_path"]).exists())
+            self.assertFalse((root / cell["marker_path"]).exists())
+
+    def test_cache_mutation_fails_before_evaluation_marker_publication(self) -> None:
+        commit = "c" * 40
+        cell = {
+            "index": 4,
+            "cell_id": "evaluation-F0_uniform_prior_unconstrained-211-311",
+            "arm": "F0_uniform_prior_unconstrained",
+            "world_model_seed": 211,
+            "actor_seed": 311,
+            "evaluation_seeds": [401],
+            "result_path": "evaluation/cell/result.json",
+            "trace_path": "evaluation/cell/traces.npz",
+            "creation_cache_seal_path": "verified/cache-seals/cell-creation.json",
+            "verification_cache_seal_path": (
+                "verified/cache-seals/cell-verification.json"
+            ),
+            "marker_path": "verified/cell.json",
+        }
+        manifest = {
+            "source_commit": commit,
+            "manifest_sha256": "m" * 64,
+            "evaluation_cells": [cell],
+        }
+        creation_scheduler = {
+            "job_id": "12345",
+            "array_job_id": "12000",
+            "array_task_id": 4,
+        }
+        verification_scheduler = {
+            "job_id": "99999",
+            "array_job_id": "99000",
+            "array_task_id": 4,
+        }
+        creation_authorization = {"mode": "new"}
+        verification_authorization = {"mode": "verification_only"}
+        creation_receipt = {"receipt": "creation"}
+        creation_runtime = {"jax_compilation_cache_dir": "/cache/job-12345-task-4"}
+        verification_runtime = {"jax_compilation_cache_dir": "/cache/job-99999-task-4"}
+        creation_certificate = {"cache": "creation-reader"}
+        verification_certificate = {"cache": "verification-reader"}
+        creation_primer_receipt = {"receipt_sha256": "c" * 64}
+        verification_primer_receipt = {"receipt_sha256": "v" * 64}
+        replay_core = {
+            "schema_version": study.EVALUATION_SCHEMA,
+            "status": "complete",
+            "source_commit": commit,
+            "manifest_sha256": manifest["manifest_sha256"],
+            "cell_id": cell["cell_id"],
+            "cell_index": 4,
+            "task": study.TASK,
+            "arm": cell["arm"],
+            "controller_family": "uniform_prior",
+            "world_model_seed": 211,
+            "actor_seed": 311,
+            "evaluation_seeds": [401],
+            "episode_returns": [0.0],
+            "mean_return": 0.0,
+            "normalized_mean_return": 0.0,
+            "action_saturation_fraction": 0.0,
+            "mean_objective_improvement": 0.0,
+            "nonnegative_objective_improvement_fraction": 1.0,
+            "mean_gradient_norm": 0.0,
+            "mean_parameter_delta": 0.0,
+            "mean_anchor_action_drift": 0.0,
+            "mean_current_action_drift": 0.0,
+            "reference_budget_violation_fraction": 0.0,
+            "mean_trust_backtracks": 0.0,
+            "frozen_reference_fallback_fraction": 0.0,
+            "mean_heldout_acceptance_improvement": 0.0,
+            "heldout_acceptance_fraction": 1.0,
+            "acceptance_fraction": 1.0,
+            "behavior_filter_fallback_fraction": 0.0,
+            "executed_behavior_violation_fraction": 0.0,
+            "mean_behavior_distance": 0.0,
+            "objective_evaluations_per_step": [1],
+            "coverage": {"fraction": 1.0},
+            "imagined_coverage": {"fraction": 1.0},
+            "imagined_coverage_protocol": "test-only",
+            "a0_dependency_replay_verified": False,
+            "source_reward_checkpoint_sha256": "r" * 64,
+            "source_rebrac_checkpoint_sha256": "b" * 64,
+            "model_checkpoint_sha256": "w" * 64,
+            "calibration_arrays_file_sha256": "a" * 64,
+            "dependency_trace_file_sha256": "t" * 64,
+            "discarded_pure_compile_warmup": True,
+        }
+        core = {
+            **replay_core,
+            "creation_cache_reader_certificate": creation_certificate,
+            "creation_primer_receipt": creation_primer_receipt,
+            "creation_submission_authorization": creation_authorization,
+            "creation_scheduler_provenance": creation_scheduler,
+            "creation_submission_receipt": creation_receipt,
+        }
+        trace = {"actions": np.asarray([[[0.25, -0.25]]], dtype=np.float32)}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json_atomic(root / "manifest.json", manifest)
+            trace_path = root / cell["trace_path"]
+            trace_path.parent.mkdir(parents=True)
+            np.savez(trace_path, **trace)
+            result = {
+                **core,
+                "core_sha256": study.benchmark.object_sha256(core),
+                "trace_file_sha256": study.benchmark.file_sha256(trace_path),
+                "trace_sha256": study.benchmark.array_sha256(trace),
+                "timing": {"timed_steps": 1.0},
+                "wall_seconds": 1.0,
+                "runtime": creation_runtime,
+            }
+            write_json_atomic(root / cell["result_path"], result)
+
+            verification_execution = (
+                verification_scheduler,
+                {"receipt": "verification"},
+                verification_runtime,
+            )
+            with mock.patch.object(study, "validate_manifest"), mock.patch.object(
+                study,
+                "_validate_retained_submission_authorization",
+                return_value=verification_authorization,
+            ), mock.patch.object(
+                study,
+                "_live_array_execution_binding",
+                return_value=verification_execution,
+            ), mock.patch.object(
+                study,
+                "_evaluation_cache_reader_certificate",
+                return_value=verification_certificate,
+            ), mock.patch.object(
+                study,
+                "_current_evaluation_primer_receipt_reference",
+                return_value=verification_primer_receipt,
+            ), mock.patch.object(
+                study,
+                "_validate_retained_creation_binding",
+                return_value=(
+                    creation_authorization,
+                    creation_scheduler,
+                    creation_receipt,
+                    creation_runtime,
+                ),
+            ), mock.patch.object(
+                study, "_validate_evaluation_cache_reader_certificate"
+            ), mock.patch.object(
+                study, "_validate_evaluation_primer_receipt_reference"
+            ), mock.patch.object(
+                study,
+                "_validate_evaluation_cache_seal",
+                return_value={"seal_sha256": "s" * 64},
+            ), mock.patch.object(
+                study, "_require_distinct_replay_processes"
+            ), mock.patch.object(
+                study,
+                "_compute_evaluation_cell",
+                return_value=(replay_core, trace, {"timed_steps": 1.0}),
+            ) as compute, mock.patch.object(
+                study,
+                "_assert_evaluation_cache_sealed",
+                side_effect=ValueError("evaluation cache changed after primer"),
+            ) as seal, mock.patch.object(
+                study, "_write_verified_marker"
+            ) as publish_marker:
+                with self.assertRaisesRegex(ValueError, "cache changed"):
+                    study.verify_evaluation_cell(
+                        root,
+                        4,
+                        strict_replay=True,
+                        submission_authorization={"authorized": True},
+                    )
+            compute.assert_called_once()
+            seal.assert_called_once()
+            publish_marker.assert_not_called()
+            self.assertFalse((root / cell["marker_path"]).exists())
+
+    def test_existing_evaluation_marker_is_invalid_without_verification_seal(
+        self,
+    ) -> None:
+        cell = {
+            "index": 0,
+            "cell_id": "evaluation-O1-211-311",
+            "result_path": "evaluation/cell/result.json",
+            "trace_path": "evaluation/cell/traces.npz",
+            "creation_cache_seal_path": "verified/cache-seals/cell-creation.json",
+            "verification_cache_seal_path": (
+                "verified/cache-seals/cell-verification.json"
+            ),
+            "marker_path": "verified/cell.json",
+        }
+        manifest = {
+            "source_commit": "c" * 40,
+            "manifest_sha256": "m" * 64,
+            "evaluation_cells": [cell],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = {
+                "runtime": {},
+                "creation_submission_authorization": {},
+                "creation_scheduler_provenance": {},
+                "creation_cache_reader_certificate": {},
+                "creation_primer_receipt": {},
+            }
+            write_json_atomic(root / cell["result_path"], result)
+            write_json_atomic(root / cell["creation_cache_seal_path"], {"sealed": True})
+            marker = {
+                "schema_version": study.MARKER_SCHEMA,
+                "status": "verified",
+                "stage": "evaluation",
+                "source_commit": manifest["source_commit"],
+                "manifest_sha256": manifest["manifest_sha256"],
+                "cell_id": cell["cell_id"],
+                "cell_index": 0,
+                "result_file_sha256": study.benchmark.file_sha256(
+                    root / cell["result_path"]
+                ),
+                "strict_policy_model_environment_replay": True,
+                "strict_replay_wall_seconds": 1.0,
+                "verification_submission_authorization": {},
+                "verification_scheduler_provenance": {},
+                "verification_cache_reader_certificate": {},
+                "verification_primer_receipt": {},
+                "verification_runtime": {},
+                "creation_cache_seal_file_sha256": study.benchmark.file_sha256(
+                    root / cell["creation_cache_seal_path"]
+                ),
+                "creation_cache_seal_sha256": "s" * 64,
+            }
+            marker["marker_sha256"] = study.benchmark.object_sha256(marker)
+            write_json_atomic(root / cell["marker_path"], marker)
+            original_seal_validator = study._validate_evaluation_cache_seal
+            phases: list[str] = []
+
+            def validate_seal(
+                seal_root: Path,
+                seal_manifest: dict,
+                seal_cell: dict,
+                phase: str,
+            ) -> dict:
+                phases.append(phase)
+                if phase == "creation":
+                    return {"seal_sha256": "s" * 64}
+                return original_seal_validator(
+                    seal_root, seal_manifest, seal_cell, phase
+                )
+
+            scheduler = {
+                "job_id": "123",
+                "array_job_id": "120",
+                "array_task_id": 0,
+            }
+            with mock.patch.object(
+                study,
+                "_validate_retained_submission_authorization",
+                side_effect=[{"mode": "new"}, {"mode": "verification_only"}],
+            ), mock.patch.object(
+                study, "_validate_scheduler_record", return_value=scheduler
+            ), mock.patch.object(
+                study, "_validate_array_submission_receipt", return_value={}
+            ), mock.patch.object(
+                study, "_require_single_gpu_runtime", return_value={}
+            ), mock.patch.object(
+                study, "_require_preflight_runtime_match"
+            ), mock.patch.object(
+                study, "_validate_evaluation_cache_reader_certificate"
+            ), mock.patch.object(
+                study, "_validate_evaluation_primer_receipt_reference"
+            ), mock.patch.object(
+                study, "_validate_evaluation_cache_seal", side_effect=validate_seal
+            ):
+                with self.assertRaises(FileNotFoundError):
+                    study._validate_cell_marker(root, manifest, cell, "evaluation")
+            self.assertEqual(phases, ["creation", "verification"])
+            self.assertFalse((root / cell["verification_cache_seal_path"]).exists())
+
+    def test_nonfinite_retained_and_replayed_traces_cannot_publish_marker(
+        self,
+    ) -> None:
+        cell = {
+            "index": 0,
+            "cell_id": "evaluation-F0-211-311",
+            "arm": "F0_uniform_prior_unconstrained",
+            "world_model_seed": 211,
+            "actor_seed": 311,
+            "evaluation_seeds": [401],
+            "result_path": "evaluation/cell/result.json",
+            "trace_path": "evaluation/cell/traces.npz",
+            "creation_cache_seal_path": "verified/cache-seals/cell-creation.json",
+            "verification_cache_seal_path": (
+                "verified/cache-seals/cell-verification.json"
+            ),
+            "marker_path": "verified/cell.json",
+        }
+        manifest = {
+            "source_commit": "c" * 40,
+            "manifest_sha256": "m" * 64,
+            "evaluation_cells": [cell],
+        }
+        creation_authorization = {"mode": "new"}
+        verification_authorization = {"mode": "verification_only"}
+        creation_scheduler = {"job_id": "1", "array_job_id": "1", "array_task_id": 0}
+        verification_scheduler = {
+            "job_id": "2",
+            "array_job_id": "2",
+            "array_task_id": 0,
+        }
+        creation_receipt = {"receipt": "creation"}
+        creation_runtime = {"jax_compilation_cache_dir": "/cache/job-1-task-0"}
+        verification_runtime = {"jax_compilation_cache_dir": "/cache/job-2-task-0"}
+        creation_certificate = {"cache": "creation"}
+        creation_primer = {"receipt_sha256": "c" * 64}
+        verification_primer = {"receipt_sha256": "v" * 64}
+        replay_core = {
+            "schema_version": study.EVALUATION_SCHEMA,
+            "status": "complete",
+            "source_commit": manifest["source_commit"],
+            "manifest_sha256": manifest["manifest_sha256"],
+            "cell_id": cell["cell_id"],
+            "cell_index": 0,
+            "task": study.TASK,
+            "arm": cell["arm"],
+            "controller_family": "uniform_prior",
+            "world_model_seed": 211,
+            "actor_seed": 311,
+            "evaluation_seeds": [401],
+            "episode_returns": [0.0],
+            "mean_return": 0.0,
+            "normalized_mean_return": 0.0,
+            "action_saturation_fraction": 0.0,
+            "mean_objective_improvement": 0.0,
+            "nonnegative_objective_improvement_fraction": 1.0,
+            "mean_gradient_norm": 0.0,
+            "mean_parameter_delta": 0.0,
+            "mean_anchor_action_drift": 0.0,
+            "mean_current_action_drift": 0.0,
+            "reference_budget_violation_fraction": 0.0,
+            "mean_trust_backtracks": 0.0,
+            "frozen_reference_fallback_fraction": 0.0,
+            "mean_heldout_acceptance_improvement": 0.0,
+            "heldout_acceptance_fraction": 1.0,
+            "acceptance_fraction": 1.0,
+            "behavior_filter_fallback_fraction": 0.0,
+            "executed_behavior_violation_fraction": 0.0,
+            "mean_behavior_distance": 0.0,
+            "objective_evaluations_per_step": [1],
+            "coverage": {"fraction": 1.0},
+            "imagined_coverage": {"fraction": 1.0},
+            "imagined_coverage_protocol": "test-only",
+            "a0_dependency_replay_verified": False,
+            "source_reward_checkpoint_sha256": "r" * 64,
+            "source_rebrac_checkpoint_sha256": "b" * 64,
+            "model_checkpoint_sha256": "w" * 64,
+            "calibration_arrays_file_sha256": "a" * 64,
+            "dependency_trace_file_sha256": "t" * 64,
+            "discarded_pure_compile_warmup": True,
+        }
+
+        def write_retained(root: Path, retained_trace: dict) -> None:
+            trace_path = root / cell["trace_path"]
+            trace_path.parent.mkdir(parents=True)
+            np.savez(trace_path, **retained_trace)
+            core = {
+                **replay_core,
+                "creation_cache_reader_certificate": creation_certificate,
+                "creation_primer_receipt": creation_primer,
+                "creation_submission_authorization": creation_authorization,
+                "creation_scheduler_provenance": creation_scheduler,
+                "creation_submission_receipt": creation_receipt,
+            }
+            result = {
+                **core,
+                "core_sha256": study.benchmark.object_sha256(core),
+                "trace_file_sha256": study.benchmark.file_sha256(trace_path),
+                "trace_sha256": study.benchmark.array_sha256(retained_trace),
+                "timing": {"timed_steps": 1.0},
+                "wall_seconds": 1.0,
+                "runtime": creation_runtime,
+            }
+            write_json_atomic(root / cell["result_path"], result)
+
+        finite_trace = {"actions": np.asarray([[[0.25, -0.25]]], dtype=np.float32)}
+        nonfinite_trace = {"actions": np.asarray([[[np.nan, -0.25]]], dtype=np.float32)}
+        for label, retained_trace, replay_trace, error, message in (
+            (
+                "retained",
+                nonfinite_trace,
+                finite_trace,
+                ValueError,
+                "trace payload differs",
+            ),
+            (
+                "replay",
+                finite_trace,
+                nonfinite_trace,
+                FloatingPointError,
+                "strict replay output is not finite",
+            ),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_json_atomic(root / "manifest.json", manifest)
+                write_retained(root, retained_trace)
+                verification_execution = (
+                    verification_scheduler,
+                    {"receipt": "verification"},
+                    verification_runtime,
+                )
+                with mock.patch.object(study, "validate_manifest"), mock.patch.object(
+                    study,
+                    "_validate_retained_submission_authorization",
+                    return_value=verification_authorization,
+                ), mock.patch.object(
+                    study,
+                    "_live_array_execution_binding",
+                    return_value=verification_execution,
+                ), mock.patch.object(
+                    study,
+                    "_evaluation_cache_reader_certificate",
+                    return_value={"cache": "verification"},
+                ), mock.patch.object(
+                    study,
+                    "_current_evaluation_primer_receipt_reference",
+                    return_value=verification_primer,
+                ), mock.patch.object(
+                    study,
+                    "_validate_retained_creation_binding",
+                    return_value=(
+                        creation_authorization,
+                        creation_scheduler,
+                        creation_receipt,
+                        creation_runtime,
+                    ),
+                ), mock.patch.object(
+                    study, "_validate_evaluation_cache_reader_certificate"
+                ), mock.patch.object(
+                    study, "_validate_evaluation_primer_receipt_reference"
+                ), mock.patch.object(
+                    study, "_require_distinct_replay_processes"
+                ), mock.patch.object(
+                    study,
+                    "_validate_evaluation_cache_seal",
+                    return_value={"seal_sha256": "s" * 64},
+                ) as validate_seal, mock.patch.object(
+                    study,
+                    "_compute_evaluation_cell",
+                    return_value=(replay_core, replay_trace, {"timed_steps": 1.0}),
+                ) as compute, mock.patch.object(
+                    study, "_assert_evaluation_cache_sealed"
+                ) as assert_sealed, mock.patch.object(
+                    study, "_write_verified_marker"
+                ) as publish_marker:
+                    with self.assertRaisesRegex(error, message):
+                        study.verify_evaluation_cell(
+                            root,
+                            0,
+                            strict_replay=True,
+                            submission_authorization={"authorized": True},
+                        )
+                if label == "retained":
+                    validate_seal.assert_not_called()
+                    compute.assert_not_called()
+                else:
+                    validate_seal.assert_called_once()
+                    compute.assert_called_once()
+                assert_sealed.assert_not_called()
+                publish_marker.assert_not_called()
+                self.assertFalse((root / cell["marker_path"]).exists())
+
+    def test_same_array_task_ignores_only_process_and_allocation_snapshots(
+        self,
+    ) -> None:
+        primer = {
+            "job_id": "12345",
+            "array_job_id": "12000",
+            "array_task_id": 4,
+            "node_name": "firehorse01",
+            "boot_id": "boot-a",
+            "process_id": 101,
+            "process_start_ticks": 1001,
+            "allocation_certificate": {"snapshot": "primer"},
+        }
+        reader = {
+            **primer,
+            "process_id": 202,
+            "process_start_ticks": 2002,
+            "allocation_certificate": {"snapshot": "reader"},
+        }
+        study._require_same_array_task(primer, reader)
+
+        changed_values = {
+            "job_id": "12346",
+            "array_job_id": "12001",
+            "array_task_id": 5,
+            "node_name": "firehorse02",
+            "boot_id": "boot-b",
+        }
+        for field, value in changed_values.items():
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError, "not one array task"
+            ):
+                study._require_same_array_task(primer, {**reader, field: value})
+
+    def test_replay_difference_reports_one_ulp_without_relaxing_equality(self) -> None:
+        retained = np.asarray([[np.float32(0.2283480018377304)]])
+        replay = np.nextafter(retained, np.float32(np.inf))
+        self.assertIsNone(
+            study._first_trace_replay_difference(
+                {"residual_norm": retained}, {"residual_norm": retained.copy()}
+            )
+        )
+        difference = study._first_trace_replay_difference(
+            {"residual_norm": retained}, {"residual_norm": replay}
+        )
+        self.assertEqual(difference["array"], "residual_norm")
+        self.assertEqual(difference["index"], [0, 0])
+        expected_ulp = float(replay[0, 0]) - float(retained[0, 0])
+        self.assertEqual(difference["absolute_difference"], expected_ulp)
+        self.assertEqual(difference["maximum_absolute_difference"], expected_ulp)
+        self.assertNotEqual(
+            difference["retained_element_hex"], difference["replay_element_hex"]
+        )
+        semantic = study._first_core_replay_difference(
+            {"metric": [1.0, 2.0]},
+            {"metric": [1.0, np.nextafter(2.0, np.inf)]},
+            ("metric",),
+        )
+        self.assertEqual(semantic["path"], "metric[1]")
+        self.assertGreater(semantic["absolute_difference"], 0.0)
+
+    def test_replay_difference_reports_priority_missing_dtype_and_shape(self) -> None:
+        retained = {
+            "residual_norm": np.asarray([1.0, 2.0], dtype=np.float32),
+            "actions": np.asarray([0.0], dtype=np.float32),
+        }
+        replay = {
+            "residual_norm": np.asarray([1.0, 3.0], dtype=np.float32),
+            "actions": np.asarray([1.0], dtype=np.float32),
+        }
+        priority = study._first_trace_replay_difference(retained, replay)
+        self.assertEqual(priority["array"], "residual_norm")
+        self.assertEqual(priority["index"], [1])
+
+        missing = study._first_trace_replay_difference(
+            {"actions": np.asarray([0.0], dtype=np.float32)}, {}
+        )
+        self.assertEqual(missing["kind"], "missing_array")
+        self.assertEqual(missing["array"], "actions")
+
+        dtype = study._first_trace_replay_difference(
+            {"actions": np.asarray([0.0], dtype=np.float32)},
+            {"actions": np.asarray([0.0], dtype=np.float64)},
+        )
+        self.assertEqual(dtype["kind"], "descriptor")
+        self.assertEqual(dtype["retained_dtype"], "<f4")
+        self.assertEqual(dtype["replay_dtype"], "<f8")
+
+        shape = study._first_trace_replay_difference(
+            {"actions": np.asarray([0.0], dtype=np.float32)},
+            {"actions": np.asarray([[0.0]], dtype=np.float32)},
+        )
+        self.assertEqual(shape["kind"], "descriptor")
+        self.assertEqual(shape["retained_shape"], [1])
+        self.assertEqual(shape["replay_shape"], [1, 1])
+
+        core_equal = {"metric": [1.0, {"nested": True}]}
+        self.assertIsNone(
+            study._first_core_replay_difference(
+                core_equal, {"metric": [1.0, {"nested": True}]}, ("metric",)
+            )
+        )
+        core_missing = study._first_core_replay_difference(
+            {"metric": 1.0}, {}, ("metric",)
+        )
+        self.assertEqual(core_missing["kind"], "missing_key")
+        self.assertEqual(core_missing["path"], "metric")
+        core_extra = study._first_core_replay_difference(
+            {"metric": 1.0}, {"metric": 1.0, "unexpected": 2.0}, ("metric",)
+        )
+        self.assertEqual(core_extra["kind"], "missing_key")
+        self.assertEqual(core_extra["path"], "unexpected")
+        self.assertFalse(core_extra["retained_present"])
+        self.assertTrue(core_extra["replay_present"])
+
+    def test_retained_cache_reader_certificate_uses_retained_runtime_path(self) -> None:
+        commit = "c" * 40
+        manifest = {"source_commit": commit, "manifest_sha256": "m" * 64}
+        cell = {"cell_id": "cell-4", "index": 4}
+        scheduler = {
+            "job_id": "12345",
+            "array_job_id": "12000",
+            "array_task_id": 4,
+        }
+        cache = f"/work2/cache/actor-gap-roadmap/{commit}/job-12345-task-4"
+        certificate = {
+            "schema_version": study.EVALUATION_CACHE_READER_SCHEMA,
+            "status": "primed_cache_reader",
+            "source_commit": commit,
+            "manifest_sha256": manifest["manifest_sha256"],
+            "cell_id": cell["cell_id"],
+            "cell_index": 4,
+            "job_id": "12345",
+            "array_job_id": "12000",
+            "array_task_id": 4,
+            "cache_directory": cache,
+            "cache_tree_sha256_after_discarded_primer": "a" * 64,
+            "separate_discard_only_primer_process": True,
+        }
+        runtime = {"jax_compilation_cache_dir": cache}
+        with mock.patch.dict(
+            os.environ,
+            {
+                "JAX_COMPILATION_CACHE_DIR": (
+                    f"/work2/cache/actor-gap-roadmap/{commit}/job-99999-task-4"
+                )
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                study._validate_evaluation_cache_reader_certificate(
+                    certificate, manifest, cell, scheduler, runtime
+                ),
+                certificate,
+            )
+
+            retry_scheduler = {
+                "job_id": "99999",
+                "array_job_id": "99000",
+                "array_task_id": 4,
+            }
+            retry_runtime = {
+                "jax_compilation_cache_dir": (
+                    f"/work2/cache/actor-gap-roadmap/{commit}/job-99999-task-4"
+                )
+            }
+            with self.assertRaisesRegex(ValueError, "certificate is invalid"):
+                study._validate_evaluation_cache_reader_certificate(
+                    certificate,
+                    manifest,
+                    cell,
+                    retry_scheduler,
+                    retry_runtime,
+                )
+
+            retry_certificate = {
+                **certificate,
+                "job_id": "99999",
+                "array_job_id": "99000",
+                "cache_directory": retry_runtime["jax_compilation_cache_dir"],
+                "cache_tree_sha256_after_discarded_primer": "b" * 64,
+            }
+            self.assertEqual(
+                study._validate_evaluation_cache_reader_certificate(
+                    retry_certificate,
+                    manifest,
+                    cell,
+                    retry_scheduler,
+                    retry_runtime,
+                ),
+                retry_certificate,
+            )
+            for field, invalid in (
+                ("cell_index", 5),
+                ("array_task_id", 5),
+                ("source_commit", "d" * 40),
+                ("cache_tree_sha256_after_discarded_primer", "not-a-digest"),
+                ("separate_discard_only_primer_process", False),
+            ):
+                with self.subTest(field=field), self.assertRaisesRegex(
+                    ValueError, "certificate is invalid"
+                ):
+                    study._validate_evaluation_cache_reader_certificate(
+                        {**retry_certificate, field: invalid},
+                        manifest,
+                        cell,
+                        retry_scheduler,
+                        retry_runtime,
                     )
 
     def test_endpoint_warmup_exercises_the_complete_executed_action_path(self) -> None:
@@ -599,6 +1539,424 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
                         expected_file_sha256=study.benchmark.file_sha256(map_path),
                     )
 
+    def test_missing_creation_seal_blocks_retry_classification_and_authorization(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve(strict=True)
+            cell = {
+                "index": 0,
+                "cell_id": "evaluation-O1-211-311",
+                "result_path": "evaluation/cell/result.json",
+                "trace_path": "evaluation/cell/traces.npz",
+                "creation_cache_seal_path": ("verified/cache-seals/cell-creation.json"),
+                "verification_cache_seal_path": (
+                    "verified/cache-seals/cell-verification.json"
+                ),
+                "marker_path": "verified/cell.json",
+            }
+            manifest = {
+                "source_commit": "c" * 40,
+                "manifest_sha256": "m" * 64,
+                "evaluation_cells": [cell],
+            }
+            write_json_atomic(root / "manifest.json", manifest)
+            write_json_atomic(root / cell["result_path"], {"complete": True})
+            study.benchmark._write_npz_atomic(
+                root / cell["trace_path"],
+                {"value": np.asarray([1], dtype=np.int32)},
+            )
+
+            with self.assertRaisesRegex(ValueError, "partial immutable artifacts"):
+                roadmap_submitter._classify_cells(root, manifest, "evaluation")
+
+            upstream = {"stage": "model", "marker_sha256": "u" * 64}
+            with mock.patch.object(study, "validate_manifest"), mock.patch.object(
+                study, "_submission_upstream_marker", return_value=upstream
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "verification-only submission artifacts differ"
+                ):
+                    study.write_submission_map(
+                        root,
+                        "evaluation",
+                        [{"index": 0, "mode": "verification_only"}],
+                    )
+            self.assertFalse((root / cell["creation_cache_seal_path"]).exists())
+
+    def test_new_and_retry_cache_seals_bind_attempts_and_artifact_hashes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve(strict=True)
+            cell = {
+                "index": 0,
+                "cell_id": "evaluation-O1-211-311",
+                "result_path": "evaluation/cell/result.json",
+                "trace_path": "evaluation/cell/traces.npz",
+                "creation_cache_seal_path": ("verified/cache-seals/cell-creation.json"),
+                "verification_cache_seal_path": (
+                    "verified/cache-seals/cell-verification.json"
+                ),
+                "marker_path": "verified/cell.json",
+            }
+            manifest = {
+                "source_commit": "c" * 40,
+                "manifest_sha256": "m" * 64,
+                "evaluation_cells": [cell],
+            }
+            write_json_atomic(root / "manifest.json", manifest)
+            upstream = {"stage": "model", "marker_sha256": "u" * 64}
+            reader_scheduler = {
+                "job_id": "12345",
+                "array_job_id": "12000",
+                "array_task_id": 0,
+                "node_name": "gpu01",
+                "boot_id": "boot-a",
+                "process_id": 101,
+                "process_start_ticks": 1001,
+            }
+            sealer_scheduler = {
+                **reader_scheduler,
+                "process_id": 102,
+                "process_start_ticks": 1002,
+            }
+            runtime = {"jax_compilation_cache_dir": "/immutable/job-cache"}
+            with mock.patch.object(study, "validate_manifest"), mock.patch.object(
+                study, "_submission_upstream_marker", return_value=upstream
+            ):
+                new_map = study.write_submission_map(
+                    root, "evaluation", [{"index": 0, "mode": "new"}]
+                )
+            self.assertEqual(new_map["attempt"], 1)
+            new_map_path = root / new_map["map_path"]
+            new_authorization = {
+                "map_path": new_map["map_path"],
+                "map_file_sha256": study.benchmark.file_sha256(new_map_path),
+                "map_sha256": new_map["map_sha256"],
+                "mode": "new",
+            }
+
+            write_json_atomic(root / cell["result_path"], {"complete": True})
+            study.benchmark._write_npz_atomic(
+                root / cell["trace_path"],
+                {"value": np.asarray([1], dtype=np.int32)},
+            )
+            with mock.patch.object(
+                study,
+                "_job_scoped_evaluation_cache",
+                return_value=runtime["jax_compilation_cache_dir"],
+            ), mock.patch.object(
+                study, "_assert_evaluation_cache_sealed", return_value="f" * 64
+            ):
+                creation_seal = study._evaluation_cache_seal_body(
+                    root,
+                    manifest,
+                    cell,
+                    "creation",
+                    reader_authorization=new_authorization,
+                    reader_scheduler=reader_scheduler,
+                    reader_receipt={"receipt": "creation-reader"},
+                    reader_runtime=runtime,
+                    sealer_authorization=new_authorization,
+                    sealer_scheduler=sealer_scheduler,
+                    sealer_receipt={"receipt": "creation-sealer"},
+                    sealer_runtime=runtime,
+                )
+            write_json_atomic(root / cell["creation_cache_seal_path"], creation_seal)
+
+            with mock.patch.object(study, "validate_manifest"), mock.patch.object(
+                study, "_submission_upstream_marker", return_value=upstream
+            ):
+                retry_map = study.write_submission_map(
+                    root,
+                    "evaluation",
+                    [{"index": 0, "mode": "verification_only"}],
+                )
+                retry_map_path = root / retry_map["map_path"]
+                study.validate_submission_map(
+                    root,
+                    retry_map_path,
+                    "evaluation",
+                    0,
+                    expected_file_sha256=study.benchmark.file_sha256(retry_map_path),
+                )
+            self.assertEqual(retry_map["attempt"], 2)
+            retained = retry_map["entries"][0]["retained_data_files"]
+            self.assertEqual(
+                [record["path"] for record in retained],
+                [
+                    cell["result_path"],
+                    cell["trace_path"],
+                    cell["creation_cache_seal_path"],
+                ],
+            )
+            for record in retained:
+                self.assertEqual(
+                    record["file_sha256"],
+                    study.benchmark.file_sha256(root / record["path"]),
+                )
+
+            original_creation_seal = (
+                root / cell["creation_cache_seal_path"]
+            ).read_bytes()
+            write_json_atomic(
+                root / cell["creation_cache_seal_path"], {"mutated": True}
+            )
+            with mock.patch.object(study, "validate_manifest"), mock.patch.object(
+                study, "_submission_upstream_marker", return_value=upstream
+            ):
+                with self.assertRaisesRegex(ValueError, "artifact digests changed"):
+                    study.validate_submission_map(
+                        root,
+                        retry_map_path,
+                        "evaluation",
+                        0,
+                        expected_file_sha256=study.benchmark.file_sha256(
+                            retry_map_path
+                        ),
+                    )
+            (root / cell["creation_cache_seal_path"]).write_bytes(
+                original_creation_seal
+            )
+
+            retry_authorization = {
+                "map_path": retry_map["map_path"],
+                "map_file_sha256": study.benchmark.file_sha256(retry_map_path),
+                "map_sha256": retry_map["map_sha256"],
+                "mode": "verification_only",
+            }
+            write_json_atomic(root / cell["marker_path"], {"verified": True})
+            with mock.patch.object(
+                study,
+                "_job_scoped_evaluation_cache",
+                return_value=runtime["jax_compilation_cache_dir"],
+            ), mock.patch.object(
+                study, "_assert_evaluation_cache_sealed", return_value="f" * 64
+            ):
+                verification_seal = study._evaluation_cache_seal_body(
+                    root,
+                    manifest,
+                    cell,
+                    "verification",
+                    reader_authorization=retry_authorization,
+                    reader_scheduler=reader_scheduler,
+                    reader_receipt={"receipt": "verification-reader"},
+                    reader_runtime=runtime,
+                    sealer_authorization=retry_authorization,
+                    sealer_scheduler=sealer_scheduler,
+                    sealer_receipt={"receipt": "verification-sealer"},
+                    sealer_runtime=runtime,
+                )
+            self.assertEqual(
+                creation_seal["reader_submission_authorization"]["map_path"],
+                "submissions/evaluation-attempt-001.json",
+            )
+            self.assertEqual(
+                verification_seal["reader_submission_authorization"]["map_path"],
+                "submissions/evaluation-attempt-002.json",
+            )
+            self.assertEqual(
+                [row["path"] for row in creation_seal["artifact_bindings"]],
+                [cell["result_path"], cell["trace_path"]],
+            )
+            self.assertEqual(
+                [row["path"] for row in verification_seal["artifact_bindings"]],
+                [cell["result_path"], cell["trace_path"], cell["marker_path"]],
+            )
+            for body in (creation_seal, verification_seal):
+                for binding in body["artifact_bindings"]:
+                    self.assertEqual(
+                        binding["file_sha256"],
+                        study.benchmark.file_sha256(root / binding["path"]),
+                    )
+                self.assertEqual(
+                    body["seal_sha256"],
+                    study._unsigned_digest(body, "seal_sha256"),
+                )
+
+    def test_cache_sealer_publication_transitions_from_new_to_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cell = {
+                "index": 0,
+                "cell_id": "evaluation-O1-211-311",
+                "result_path": "evaluation/cell/result.json",
+                "trace_path": "evaluation/cell/traces.npz",
+                "creation_cache_seal_path": ("verified/cache-seals/cell-creation.json"),
+                "verification_cache_seal_path": (
+                    "verified/cache-seals/cell-verification.json"
+                ),
+                "marker_path": "verified/cell.json",
+            }
+            manifest = {
+                "source_commit": "c" * 40,
+                "manifest_sha256": "m" * 64,
+                "evaluation_cells": [cell],
+            }
+            write_json_atomic(root / "manifest.json", manifest)
+            write_json_atomic(
+                root / cell["result_path"],
+                {
+                    "creation_cache_reader_certificate": {"cache": "creation"},
+                    "creation_primer_receipt": {"receipt": "creation"},
+                },
+            )
+            study.benchmark._write_npz_atomic(
+                root / cell["trace_path"],
+                {"value": np.asarray([1], dtype=np.int32)},
+            )
+            runtime = {"jax_compilation_cache_dir": "/immutable/job-cache"}
+            reader_scheduler = {
+                "job_id": "123",
+                "array_job_id": "120",
+                "array_task_id": 0,
+                "node_name": "gpu01",
+                "boot_id": "boot-a",
+                "process_id": 100,
+                "process_start_ticks": 1000,
+            }
+            sealer_scheduler = {
+                **reader_scheduler,
+                "process_id": 101,
+                "process_start_ticks": 1001,
+            }
+            new_authorization = {
+                "map_path": "submissions/evaluation-attempt-001.json",
+                "map_file_sha256": "1" * 64,
+                "map_sha256": "2" * 64,
+                "mode": "new",
+            }
+            with mock.patch.object(study, "validate_manifest"), mock.patch.object(
+                study,
+                "_validate_retained_submission_authorization",
+                return_value=new_authorization,
+            ), mock.patch.object(
+                study,
+                "_live_array_execution_binding",
+                return_value=(sealer_scheduler, {"receipt": "sealer"}, runtime),
+            ), mock.patch.object(
+                study,
+                "_validate_retained_creation_binding",
+                return_value=(
+                    new_authorization,
+                    reader_scheduler,
+                    {"receipt": "reader"},
+                    runtime,
+                ),
+            ), mock.patch.object(
+                study, "_validate_evaluation_cache_reader_certificate"
+            ), mock.patch.object(
+                study, "_validate_evaluation_primer_receipt_reference"
+            ), mock.patch.object(
+                study,
+                "_job_scoped_evaluation_cache",
+                return_value=runtime["jax_compilation_cache_dir"],
+            ), mock.patch.object(
+                study, "_assert_evaluation_cache_sealed", return_value="f" * 64
+            ):
+                creation = study.seal_evaluation_cache_reader(
+                    root,
+                    0,
+                    phase="creation",
+                    submission_authorization=new_authorization,
+                )
+                with self.assertRaisesRegex(ValueError, "already exists"):
+                    study.seal_evaluation_cache_reader(
+                        root,
+                        0,
+                        phase="creation",
+                        submission_authorization=new_authorization,
+                    )
+            self.assertEqual(creation["phase"], "creation")
+            self.assertEqual(creation["reader_submission_authorization"]["mode"], "new")
+            self.assertTrue((root / cell["creation_cache_seal_path"]).is_file())
+
+            retry_authorization = {
+                "map_path": "submissions/evaluation-attempt-002.json",
+                "map_file_sha256": "3" * 64,
+                "map_sha256": "4" * 64,
+                "mode": "verification_only",
+            }
+            marker = {
+                "schema_version": study.MARKER_SCHEMA,
+                "status": "verified",
+                "stage": "evaluation",
+                "source_commit": manifest["source_commit"],
+                "manifest_sha256": manifest["manifest_sha256"],
+                "cell_id": cell["cell_id"],
+                "cell_index": 0,
+                "result_file_sha256": study.benchmark.file_sha256(
+                    root / cell["result_path"]
+                ),
+                "trace_file_sha256": study.benchmark.file_sha256(
+                    root / cell["trace_path"]
+                ),
+                "verification_submission_authorization": retry_authorization,
+                "verification_scheduler_provenance": reader_scheduler,
+                "verification_cache_reader_certificate": {"cache": "verification"},
+                "verification_primer_receipt": {"receipt": "verification"},
+                "verification_runtime": runtime,
+            }
+            marker["marker_sha256"] = study.benchmark.object_sha256(marker)
+            write_json_atomic(root / cell["marker_path"], marker)
+            with mock.patch.object(study, "validate_manifest"), mock.patch.object(
+                study,
+                "_validate_retained_submission_authorization",
+                return_value=retry_authorization,
+            ), mock.patch.object(
+                study,
+                "_live_array_execution_binding",
+                return_value=(sealer_scheduler, {"receipt": "sealer"}, runtime),
+            ), mock.patch.object(
+                study,
+                "_validate_evaluation_cache_seal",
+                return_value=creation,
+            ), mock.patch.object(
+                study, "_validate_scheduler_record", return_value=reader_scheduler
+            ), mock.patch.object(
+                study,
+                "_validate_array_submission_receipt",
+                return_value={"receipt": "reader"},
+            ), mock.patch.object(
+                study, "_require_single_gpu_runtime", return_value=runtime
+            ), mock.patch.object(
+                study, "_require_preflight_runtime_match"
+            ), mock.patch.object(
+                study, "_validate_evaluation_cache_reader_certificate"
+            ), mock.patch.object(
+                study, "_validate_evaluation_primer_receipt_reference"
+            ), mock.patch.object(
+                study,
+                "_job_scoped_evaluation_cache",
+                return_value=runtime["jax_compilation_cache_dir"],
+            ), mock.patch.object(
+                study, "_assert_evaluation_cache_sealed", return_value="f" * 64
+            ):
+                verification = study.seal_evaluation_cache_reader(
+                    root,
+                    0,
+                    phase="verification",
+                    submission_authorization=retry_authorization,
+                )
+                with self.assertRaisesRegex(ValueError, "already exists"):
+                    study.seal_evaluation_cache_reader(
+                        root,
+                        0,
+                        phase="verification",
+                        submission_authorization=retry_authorization,
+                    )
+            self.assertEqual(verification["phase"], "verification")
+            self.assertEqual(
+                verification["reader_submission_authorization"]["mode"],
+                "verification_only",
+            )
+            self.assertTrue((root / cell["verification_cache_seal_path"]).is_file())
+            self.assertEqual(
+                [row["path"] for row in verification["artifact_bindings"]],
+                [cell["result_path"], cell["trace_path"], cell["marker_path"]],
+            )
+
     def test_array_receipt_binds_live_job_and_exact_map_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve(strict=True)
@@ -963,6 +2321,39 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
             {**runtime, "device_kinds": ["NVIDIA A100"]}
         )
         self.assertNotEqual(identity, changed_kind)
+        commit = "c" * 40
+        shared = {
+            **runtime,
+            "jax_compilation_cache_dir": (
+                f"/work2/cache/actor-gap-roadmap/{commit}/shared"
+            ),
+        }
+        job_scoped = {
+            **runtime,
+            "jax_compilation_cache_dir": (
+                f"/work2/cache/actor-gap-roadmap/{commit}/job-12345-task-4"
+            ),
+        }
+        with mock.patch.object(
+            study, "_validate_preflight_gate", return_value={"runtime": shared}
+        ):
+            study._require_preflight_runtime_match(
+                Path("/unused"), {}, job_scoped, stage="evaluation"
+            )
+            study._require_preflight_runtime_match(
+                Path("/unused"), {}, shared, stage="model"
+            )
+            with self.assertRaisesRegex(ValueError, "job-cache scoped"):
+                study._require_preflight_runtime_match(
+                    Path("/unused"),
+                    {},
+                    {**job_scoped, "jax_compilation_cache_dir": "/work2/other-cache"},
+                    stage="evaluation",
+                )
+            with self.assertRaisesRegex(ValueError, "shared-cache scoped"):
+                study._require_preflight_runtime_match(
+                    Path("/unused"), {}, job_scoped, stage="model"
+                )
 
     def test_preflight_marker_requires_all_executed_gate_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

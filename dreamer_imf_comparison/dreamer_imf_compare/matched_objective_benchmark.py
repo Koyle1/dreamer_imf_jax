@@ -238,6 +238,8 @@ _REQUIRED_SOURCE_PATHS = tuple(
             "dreamer_imf_comparison/TRAJECTORY_IMF_THEORY.md",
             "dreamer_imf_comparison/TRAJECTORY_IMF_NOVELTY_AUDIT.md",
             "dreamer_imf_comparison/NEURIPS_READINESS_REPORT.md",
+            "dreamer_imf_comparison/dreamer_imf_compare/cache_fingerprint.py",
+            "dreamer_imf_comparison/scripts/fingerprint_jax_cache.py",
             "dreamer_imf_comparison/trajectory_imf_novelty_sources.json",
         ]
         + [
@@ -517,6 +519,7 @@ def _source_files(root: Path) -> list[str]:
         "dreamer_imf_comparison/dreamer_imf_compare/policy_alignment_diagnostics.py",
         "dreamer_imf_comparison/dreamer_imf_compare/flowmpc_actor_study.py",
         "dreamer_imf_comparison/dreamer_imf_compare/actor_gap*.py",
+        "dreamer_imf_comparison/dreamer_imf_compare/cache_fingerprint.py",
         "dreamer_imf_comparison/scripts/*causal*.py",
         "dreamer_imf_comparison/scripts/verify_causal_consistency.sh",
         "dreamer_imf_comparison/scripts/*matched_objective*.py",
@@ -525,6 +528,7 @@ def _source_files(root: Path) -> list[str]:
         "dreamer_imf_comparison/scripts/*pendulum*.sh",
         "dreamer_imf_comparison/scripts/*policy_alignment*.py",
         "dreamer_imf_comparison/scripts/*actor_gap*.py",
+        "dreamer_imf_comparison/scripts/fingerprint_jax_cache.py",
         "dreamer_imf_comparison/scripts/*reacher_imf_small*.sh",
         "dreamer_imf_comparison/scripts/verify_smoke_idempotence.py",
         "dreamer_imf_comparison/scripts/*trajectory_imf*.py",
