@@ -61,14 +61,22 @@ The diagnostics are descriptive.  They cannot select an arm or tune an
 evaluation-time threshold.
 
 The diagnostic code does not regenerate the persistent controller between
-measurements.  During the exact `A0` rollout it retains the live posterior
+measurements. During the fresh exact `A0` rollout it retains the live posterior
 beliefs and, for steps 0, 1, 5, and 15 of the first episode, the in-memory
 adaptation-start actor, updated actor, current observation, and proposal-noise
-bank.  Only after the complete rollout reproduces the authenticated dependency
-trace exactly are independent-noise gradients and counterfactual measurements
-computed from those contexts.  The actor trees remain ephemeral; the result
-publishes only their SHA-256 digests.  This avoids treating a numerically close
-second persistent rollout as the same causal controller state.
+bank. Independent-noise gradients and counterfactual measurements are computed
+from those contexts. The actor trees remain ephemeral; the result publishes
+only their SHA-256 digests.
+
+`A0` is a fresh control-input-matched baseline for this study, not a claim of
+bitwise reproduction of the historical dependency trajectory. A two-order GPU
+probe showed that the exact dependency controller and the roadmap's generalized
+A0 implementation are bitwise identical to each other, while both differ from
+the historical compiler-writer trajectory from its first action. That old trace
+is therefore authenticated only as provenance. The fresh A0 cell remains held
+to exact semantic creation-versus-replay equality under the job-scoped cache
+contract; no replay tolerance is introduced. This separates the scientific
+estimand from an irreproducible historical floating-point execution state.
 
 Every fresh evaluation arm also records bounded live-planner imagined
 occupancy every 50 environment steps using the first 8 particles from the
@@ -90,8 +98,9 @@ the immutable ReBRAC actor:
 
 The isolated contrast is:
 
-- `A0_persistent_unconstrained_replay`: exact persistent, unconstrained replay
-  bridge to the authenticated dependency;
+- `A0_persistent_unconstrained_replay`: dependency-matched persistent,
+  unconstrained controller freshly executed and exactly replayed within this
+  study (the name is retained for manifest continuity);
 - `A1_persistent_trust`: the same controller with only the action trust region.
 
 `F1` and `F3` repeat the same trust mechanism for the uniformly continued and
@@ -209,8 +218,9 @@ rejection diagnostic, not proof of support.
 - `R0_zero_shot_dependency`: immutable zero-shot ReBRAC result.
 - `R1_unconstrained_dependency`: immutable published-style ITPO adaptation
   result.
-- `A0_persistent_unconstrained_replay`: fresh exact bridge that must reproduce
-  the matching prefix of `R1` before any new controller conclusion is trusted.
+- `A0_persistent_unconstrained_replay`: fresh dependency-matched bridge that is
+  created and replayed exactly within this study. The immutable `R1` trace is
+  digest-bound provenance, not the action anchor.
 
 The manifest freezes these comparisons:
 

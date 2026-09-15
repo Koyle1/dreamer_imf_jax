@@ -32,11 +32,11 @@ from . import matched_objective_benchmark as benchmark
 from . import flowmpc_actor_study as dependency
 from .cache_fingerprint import cache_tree_sha256
 
-SCHEMA = "trajectory-imf-actor-gap-roadmap-study-v1"
+SCHEMA = "trajectory-imf-actor-gap-roadmap-study-v2"
 CALIBRATION_SCHEMA = "trajectory-imf-actor-gap-calibration-v1"
-DIAGNOSTIC_SCHEMA = "trajectory-imf-actor-gap-diagnostic-cell-v1"
+DIAGNOSTIC_SCHEMA = "trajectory-imf-actor-gap-diagnostic-cell-v2"
 MODEL_SCHEMA = "trajectory-imf-actor-gap-model-cell-v1"
-EVALUATION_SCHEMA = "trajectory-imf-actor-gap-evaluation-cell-v1"
+EVALUATION_SCHEMA = "trajectory-imf-actor-gap-evaluation-cell-v2"
 DIAGNOSTIC_CACHE_READER_SCHEMA = "trajectory-imf-actor-gap-diagnostic-cache-reader-v1"
 DIAGNOSTIC_A0_PRIMER_RECEIPT_SCHEMA = (
     "trajectory-imf-actor-gap-diagnostic-a0-primer-receipt-v1"
@@ -3076,31 +3076,6 @@ def _write_verified_marker(
     return marker
 
 
-def _assert_trace_subset_close(
-    retained: Mapping[str, np.ndarray],
-    regenerated: Mapping[str, np.ndarray],
-    *,
-    prefix: str,
-    episodes: int,
-) -> None:
-    for name in ("actions", "rewards", "continuations", "is_last", "lengths"):
-        left = np.asarray(retained[f"{prefix}_{name}"])[:episodes]
-        right = np.asarray(regenerated[name])[:episodes]
-        if name != "lengths":
-            maximum_length = int(np.max(right.shape[1:2], initial=0))
-            left = left[:, :maximum_length]
-        equal = left.dtype == right.dtype and np.array_equal(left, right)
-        if not equal:
-            maximum = (
-                float(
-                    np.max(np.abs(left.astype(np.float64) - right.astype(np.float64)))
-                )
-                if left.shape == right.shape and left.size
-                else math.inf
-            )
-            raise ValueError(f"A0 dependency replay differs for {name}: {maximum}")
-
-
 def _replay_observations(
     evaluation_seeds: Sequence[int], trace: Mapping[str, np.ndarray]
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -4088,12 +4063,15 @@ def _compute_diagnostic_cell(
             old,
             dependency_cell,
         )
-        _assert_trace_subset_close(
-            retained,
-            trace,
-            prefix="flowmpc",
-            episodes=len(evaluation_seeds),
-        )
+        # The historical dependency trajectory is authenticated as provenance,
+        # but is not a reproducible bitwise controller state.  The persistent
+        # planner contains hard selection branches, so an old compiler-writer
+        # execution can differ from every later cache-reader execution from the
+        # first action even when the exact original controller function is
+        # used.  This diagnostic therefore defines A0 as a fresh live anchor
+        # under the current source/cache contract.  Creation and independent
+        # replay still have to reproduce this entire anchor exactly.
+        del retained
         if a0_capture.get("schema_version") != "trajectory-imf-live-a0-context-v1":
             raise ValueError("live A0 diagnostic context was not captured")
         captured_beliefs = a0_capture.get("beliefs_by_episode")
@@ -4201,7 +4179,9 @@ def _compute_diagnostic_cell(
             {
                 "actor_seed": actor_seed,
                 "evaluation_seeds": evaluation_seeds,
-                "a0_dependency_replay_verified": True,
+                "a0_control_dependency_authenticated": True,
+                "a0_anchor_protocol": "fresh_live_exact_cell_replay",
+                "historical_dependency_trajectory_used_as_anchor": False,
                 "coverage": {
                     key: value
                     for key, value in coverage_result.items()
@@ -4235,7 +4215,9 @@ def _compute_diagnostic_cell(
                         ]
                     )
                 ),
-                "dependency_trace_file_sha256": benchmark.file_sha256(retained_path),
+                "historical_dependency_trace_file_sha256": benchmark.file_sha256(
+                    retained_path
+                ),
             }
         )
         prefix = f"actor_{actor_seed}"
@@ -7127,15 +7109,11 @@ def _compute_evaluation_cell(
         old,
         old_cell,
     )
-    a0_replay_verified: bool | None = None
-    if arm == "A0_persistent_unconstrained_replay":
-        _assert_trace_subset_close(
-            old_trace,
-            trace,
-            prefix="flowmpc",
-            episodes=len(evaluation_seeds),
-        )
-        a0_replay_verified = True
+    # This authenticates the historical dependency and records its digest, but
+    # intentionally does not make an irreproducible old compiler-writer trace
+    # the baseline.  Every arm, including A0, is created and replayed exactly
+    # under this study's fresh cache-reader contract.
+    del old_trace
     lengths = np.asarray(trace["lengths"], dtype=np.int64)
     mask = np.arange(trace["actions"].shape[1])[None] < lengths[:, None]
     coverage_object = _coverage_from_arrays(
@@ -7284,7 +7262,13 @@ def _compute_evaluation_cell(
                 "stage_reward_queries_only_terminal_critic_query_excluded"
             ),
         },
-        "a0_dependency_replay_verified": a0_replay_verified,
+        "a0_control_dependency_authenticated": True,
+        "a0_anchor_protocol": (
+            "fresh_live_exact_cell_replay"
+            if arm == "A0_persistent_unconstrained_replay"
+            else None
+        ),
+        "historical_dependency_trajectory_used_as_anchor": False,
         "source_reward_checkpoint_sha256": source["reward_checkpoint_sha256"],
         "source_rebrac_checkpoint_sha256": benchmark.file_sha256(
             Path(str(manifest["dependency_root"]))
@@ -7296,7 +7280,9 @@ def _compute_evaluation_cell(
         "calibration_arrays_file_sha256": benchmark.file_sha256(
             calibration_arrays_path
         ),
-        "dependency_trace_file_sha256": benchmark.file_sha256(old_trace_path),
+        "historical_dependency_trace_file_sha256": benchmark.file_sha256(
+            old_trace_path
+        ),
         "discarded_pure_compile_warmup": True,
     }
     return core, trace, timing
@@ -8582,12 +8568,14 @@ def verify_evaluation_cell(
         "coverage",
         "imagined_coverage",
         "imagined_coverage_protocol",
-        "a0_dependency_replay_verified",
+        "a0_control_dependency_authenticated",
+        "a0_anchor_protocol",
+        "historical_dependency_trajectory_used_as_anchor",
         "source_reward_checkpoint_sha256",
         "source_rebrac_checkpoint_sha256",
         "model_checkpoint_sha256",
         "calibration_arrays_file_sha256",
-        "dependency_trace_file_sha256",
+        "historical_dependency_trace_file_sha256",
         "discarded_pure_compile_warmup",
         "creation_cache_reader_certificate",
         "creation_primer_receipt",
@@ -8629,24 +8617,17 @@ def verify_evaluation_cell(
     sequence_search = arm.startswith(("O1_", "O2_", "P0_", "P1_", "K0_", "K1_"))
     endpoint_arm = arm.startswith(("K0_", "K1_"))
     if (
-        (
-            arm == "A0_persistent_unconstrained_replay"
-            and result.get("a0_dependency_replay_verified") is not True
+        arm in trust_arms
+        and not math.isclose(
+            float(result["reference_budget_violation_fraction"]),
+            0.0,
+            rel_tol=0.0,
+            abs_tol=0.0,
         )
-        or (
-            arm in trust_arms
-            and not math.isclose(
-                float(result["reference_budget_violation_fraction"]),
-                0.0,
-                rel_tol=0.0,
-                abs_tol=0.0,
-            )
-        )
-        or (
-            sequence_search
-            and result.get("objective_evaluations_per_step")
-            != [ACTION_SEQUENCE_OBJECTIVE_EVALUATIONS]
-        )
+    ) or (
+        sequence_search
+        and result.get("objective_evaluations_per_step")
+        != [ACTION_SEQUENCE_OBJECTIVE_EVALUATIONS]
     ):
         raise ValueError("evaluation intervention certificate differs")
     if endpoint_arm:
@@ -9327,8 +9308,13 @@ def _diagnostic_summary(results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     )
     return {
         "nested_actor_rows": len(actor_rows),
-        "all_a0_dependency_replays_verified": all(
-            row.get("a0_dependency_replay_verified") is True for row in actor_rows
+        "all_diagnostic_a0_control_dependencies_authenticated": all(
+            row.get("a0_control_dependency_authenticated") is True for row in actor_rows
+        ),
+        "all_diagnostic_a0_anchors_are_fresh_exact_cell_replays": all(
+            row.get("a0_anchor_protocol") == "fresh_live_exact_cell_replay"
+            and row.get("historical_dependency_trajectory_used_as_anchor") is False
+            for row in actor_rows
         ),
         "mean_coverage": _mean_numeric_fields(
             [row["coverage"] for row in actor_rows],

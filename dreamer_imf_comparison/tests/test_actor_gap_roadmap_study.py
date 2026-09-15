@@ -102,10 +102,20 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
 
         compute = inspect.getsource(study._compute_diagnostic_cell)
         capture = compute.index("diagnostic_capture=a0_capture")
-        bridge = compute.index("_assert_trace_subset_close", capture)
-        diagnostics = compute.index("_independent_noise_result", bridge)
-        self.assertLess(capture, bridge)
-        self.assertLess(bridge, diagnostics)
+        fresh_anchor = compute.index("This diagnostic therefore defines A0", capture)
+        diagnostics = compute.index("_independent_noise_result", fresh_anchor)
+        self.assertLess(capture, fresh_anchor)
+        self.assertLess(fresh_anchor, diagnostics)
+        self.assertNotIn("_assert_trace_subset_close", compute)
+
+    def test_a0_is_a_fresh_exact_anchor_not_historical_bitwise_replay(self) -> None:
+        diagnostic = inspect.getsource(study._compute_diagnostic_cell)
+        evaluation = inspect.getsource(study._compute_evaluation_cell)
+        for source in (diagnostic, evaluation):
+            self.assertIn("fresh_live_exact_cell_replay", source)
+            self.assertIn("historical_dependency_trajectory_used_as_anchor", source)
+            self.assertNotIn("_assert_trace_subset_close", source)
+        self.assertNotIn("def _assert_trace_subset_close", inspect.getsource(study))
 
     def test_diagnostic_primer_and_each_reader_execute_one_full_cell(self) -> None:
         a0_writer = inspect.getsource(study.prime_diagnostic_a0_cache)
@@ -742,12 +752,14 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
             "coverage": {"fraction": 1.0},
             "imagined_coverage": {"fraction": 1.0},
             "imagined_coverage_protocol": "test-only",
-            "a0_dependency_replay_verified": False,
+            "a0_control_dependency_authenticated": True,
+            "a0_anchor_protocol": None,
+            "historical_dependency_trajectory_used_as_anchor": False,
             "source_reward_checkpoint_sha256": "r" * 64,
             "source_rebrac_checkpoint_sha256": "b" * 64,
             "model_checkpoint_sha256": "w" * 64,
             "calibration_arrays_file_sha256": "a" * 64,
-            "dependency_trace_file_sha256": "t" * 64,
+            "historical_dependency_trace_file_sha256": "t" * 64,
             "discarded_pure_compile_warmup": True,
         }
         core = {
@@ -1234,12 +1246,14 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
             "coverage": {"fraction": 1.0},
             "imagined_coverage": {"fraction": 1.0},
             "imagined_coverage_protocol": "test-only",
-            "a0_dependency_replay_verified": False,
+            "a0_control_dependency_authenticated": True,
+            "a0_anchor_protocol": None,
+            "historical_dependency_trajectory_used_as_anchor": False,
             "source_reward_checkpoint_sha256": "r" * 64,
             "source_rebrac_checkpoint_sha256": "b" * 64,
             "model_checkpoint_sha256": "w" * 64,
             "calibration_arrays_file_sha256": "a" * 64,
-            "dependency_trace_file_sha256": "t" * 64,
+            "historical_dependency_trace_file_sha256": "t" * 64,
             "discarded_pure_compile_warmup": True,
         }
 
