@@ -104,9 +104,18 @@ case "${AGR_STAGE}" in
   diagnostic-cell)
     require_array_index 3
     submission_arguments
-    # The primer first compiles exact A0 for both nested actor seeds without
-    # applying the dependency gate, then executes and discards one complete
-    # diagnostic. Creation and replay are separate immutable cache readers.
+    # A dedicated writer process first compiles exact A0 for both nested actor
+    # seeds without applying the dependency gate. The full discarded primer,
+    # creation, and replay then execute as separate immutable cache readers.
+    python "${RUNNER}" prime-diagnostic-a0-cache \
+      --output-root "${AGR_OUTPUT_ROOT}" \
+      --index "${SLURM_ARRAY_TASK_ID}" \
+      --submission-map "${AGR_SUBMISSION_MAP}" \
+      --submission-stage diagnostic \
+      --submission-map-file-sha256 "${AGR_SUBMISSION_MAP_FILE_SHA256}"
+    AGR_DIAGNOSTIC_A0_CACHE_FINGERPRINT=$(cache_fingerprint)
+    export AGR_DIAGNOSTIC_A0_CACHE_FINGERPRINT
+    echo "ACTOR_GAP_ROADMAP_PRIMED_DIAGNOSTIC_A0_CACHE_SHA256=${AGR_DIAGNOSTIC_A0_CACHE_FINGERPRINT}"
     python "${RUNNER}" prime-diagnostic-cell --output-root "${AGR_OUTPUT_ROOT}" \
       --index "${SLURM_ARRAY_TASK_ID}" \
       --submission-map "${AGR_SUBMISSION_MAP}" \

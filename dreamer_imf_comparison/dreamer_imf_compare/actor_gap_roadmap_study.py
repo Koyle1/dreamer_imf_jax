@@ -38,8 +38,11 @@ DIAGNOSTIC_SCHEMA = "trajectory-imf-actor-gap-diagnostic-cell-v1"
 MODEL_SCHEMA = "trajectory-imf-actor-gap-model-cell-v1"
 EVALUATION_SCHEMA = "trajectory-imf-actor-gap-evaluation-cell-v1"
 DIAGNOSTIC_CACHE_READER_SCHEMA = "trajectory-imf-actor-gap-diagnostic-cache-reader-v1"
+DIAGNOSTIC_A0_PRIMER_RECEIPT_SCHEMA = (
+    "trajectory-imf-actor-gap-diagnostic-a0-primer-receipt-v1"
+)
 DIAGNOSTIC_PRIMER_RECEIPT_SCHEMA = (
-    "trajectory-imf-actor-gap-diagnostic-primer-receipt-v1"
+    "trajectory-imf-actor-gap-diagnostic-primer-receipt-v2"
 )
 DIAGNOSTIC_CACHE_SEAL_SCHEMA = "trajectory-imf-actor-gap-diagnostic-cache-seal-v1"
 EVALUATION_CACHE_READER_SCHEMA = "trajectory-imf-actor-gap-evaluation-cache-reader-v1"
@@ -678,8 +681,8 @@ def build_manifest(
             "live_planner_imagined_coverage_particles": (IMAGINED_COVERAGE_PARTICLES),
             "cache_scope": "fresh_per_slurm_array_task",
             "primer_process_order": [
-                "a0_only_prepass_both_actor_seeds",
-                "discarded_complete_diagnostic",
+                "a0_only_writer_prepass_both_actor_seeds",
+                "separate_process_discarded_complete_diagnostic_cache_reader",
                 "result_creation_cache_reader",
                 "post_exit_creation_cache_seal",
                 "strict_replay_cache_reader",
@@ -877,8 +880,8 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
         "live_planner_imagined_coverage_particles": IMAGINED_COVERAGE_PARTICLES,
         "cache_scope": "fresh_per_slurm_array_task",
         "primer_process_order": [
-            "a0_only_prepass_both_actor_seeds",
-            "discarded_complete_diagnostic",
+            "a0_only_writer_prepass_both_actor_seeds",
+            "separate_process_discarded_complete_diagnostic_cache_reader",
             "result_creation_cache_reader",
             "post_exit_creation_cache_seal",
             "strict_replay_cache_reader",
@@ -4324,6 +4327,283 @@ def _prime_diagnostic_a0_only(
     }
 
 
+def _diagnostic_a0_primer_receipt_path(
+    root: Path,
+    cell: Mapping[str, Any],
+    scheduler: Mapping[str, Any],
+) -> Path:
+    return (
+        root
+        / "runtime"
+        / "diagnostic-a0-primers"
+        / (f"job-{str(scheduler['job_id'])}-" f"task-{int(cell['index'])}.json")
+    )
+
+
+def _diagnostic_a0_primer_reference(
+    root: Path, path: Path, receipt: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        "path": str(path.relative_to(root)),
+        "file_sha256": benchmark.file_sha256(path),
+        "receipt_sha256": receipt["receipt_sha256"],
+        "discarded_wall_seconds": float(receipt["discarded_wall_seconds"]),
+        "cache_tree_sha256_after_a0_prepass": receipt[
+            "cache_tree_sha256_after_a0_prepass"
+        ],
+    }
+
+
+def _validate_diagnostic_a0_primer_reference(
+    root: Path,
+    reference: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    reader_scheduler: Mapping[str, Any],
+    reader_runtime: Mapping[str, Any],
+    reader_authorization: Mapping[str, Any],
+    expected_cache_fingerprint: str,
+    *,
+    require_current_cache: bool,
+) -> dict[str, Any]:
+    expected_path = _diagnostic_a0_primer_receipt_path(root, cell, reader_scheduler)
+    canonical = dict(reference)
+    if (
+        set(canonical)
+        != {
+            "path",
+            "file_sha256",
+            "receipt_sha256",
+            "discarded_wall_seconds",
+            "cache_tree_sha256_after_a0_prepass",
+        }
+        or canonical.get("path") != str(expected_path.relative_to(root))
+        or canonical.get("file_sha256") != benchmark.file_sha256(expected_path)
+        or not isinstance(canonical.get("discarded_wall_seconds"), (int, float))
+        or not math.isfinite(float(canonical["discarded_wall_seconds"]))
+        or float(canonical["discarded_wall_seconds"]) < 0.0
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(canonical.get("cache_tree_sha256_after_a0_prepass", "")),
+        )
+        is None
+    ):
+        raise ValueError("diagnostic A0 primer reference is invalid")
+    receipt = read_json(expected_path)
+    primer_scheduler = _validate_scheduler_record(
+        receipt.get("scheduler_provenance", {}), int(cell["index"])
+    )
+    primer_runtime = _require_single_gpu_runtime(receipt.get("runtime", {}))
+    _require_preflight_runtime_match(root, manifest, primer_runtime, stage="diagnostic")
+    primer_authorization = _validate_retained_submission_authorization(
+        root,
+        manifest,
+        cell,
+        "diagnostic",
+        receipt.get("submission_authorization", {}),
+    )
+    primer_submission_receipt = _validate_array_submission_receipt(
+        root,
+        manifest,
+        cell,
+        "diagnostic",
+        primer_authorization,
+        primer_scheduler,
+    )
+    _require_same_array_task(primer_scheduler, reader_scheduler)
+    _require_distinct_replay_processes(primer_scheduler, reader_scheduler)
+    expected_cache = _validate_job_scoped_evaluation_cache_path(
+        str(primer_runtime.get("jax_compilation_cache_dir", "")),
+        manifest,
+        cell,
+        primer_scheduler,
+        stage="diagnostic",
+    )
+    expected_keys = {
+        "schema_version",
+        "status",
+        "source_commit",
+        "manifest_sha256",
+        "cell_id",
+        "cell_index",
+        "world_model_seed",
+        "submission_mode",
+        "cache_directory",
+        "scheduler_provenance",
+        "submission_authorization",
+        "submission_receipt",
+        "runtime",
+        "publication_snapshot_before",
+        "publication_snapshot_after",
+        "publication_artifacts_unchanged",
+        "actor_seeds",
+        "trace_sha256",
+        "dependency_equality_gate_applied",
+        "discarded_wall_seconds",
+        "cache_tree_sha256_after_a0_prepass",
+        "receipt_path",
+        "receipt_sha256",
+    }
+    if (
+        set(receipt) != expected_keys
+        or receipt.get("schema_version") != DIAGNOSTIC_A0_PRIMER_RECEIPT_SCHEMA
+        or receipt.get("status") != "discarded_without_cell_publication"
+        or receipt.get("source_commit") != manifest["source_commit"]
+        or receipt.get("manifest_sha256") != manifest["manifest_sha256"]
+        or receipt.get("cell_id") != cell["cell_id"]
+        or receipt.get("cell_index") != int(cell["index"])
+        or receipt.get("world_model_seed") != int(cell["world_model_seed"])
+        or receipt.get("submission_mode") != primer_authorization["mode"]
+        or primer_authorization != dict(reader_authorization)
+        or receipt.get("cache_directory") != expected_cache
+        or dict(receipt.get("scheduler_provenance", {})) != primer_scheduler
+        or dict(receipt.get("submission_authorization", {})) != primer_authorization
+        or receipt.get("submission_receipt") != primer_submission_receipt
+        or dict(receipt.get("runtime", {})) != primer_runtime
+        or receipt.get("publication_snapshot_before")
+        != receipt.get("publication_snapshot_after")
+        or receipt.get("publication_artifacts_unchanged") is not True
+        or receipt.get("actor_seeds") != list(ACTOR_SEEDS)
+        or not isinstance(receipt.get("trace_sha256"), list)
+        or len(receipt["trace_sha256"]) != len(ACTOR_SEEDS)
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", str(digest)) is None
+            for digest in receipt["trace_sha256"]
+        )
+        or receipt.get("dependency_equality_gate_applied") is not False
+        or receipt.get("receipt_path") != str(expected_path.relative_to(root))
+        or receipt.get("receipt_sha256") != _unsigned_digest(receipt, "receipt_sha256")
+        or receipt.get("receipt_sha256") != canonical.get("receipt_sha256")
+        or float(receipt.get("discarded_wall_seconds", -1.0))
+        != float(canonical["discarded_wall_seconds"])
+        or receipt.get("cache_tree_sha256_after_a0_prepass")
+        != canonical.get("cache_tree_sha256_after_a0_prepass")
+        or not _finite_tree(receipt)
+    ):
+        raise ValueError("diagnostic A0 primer receipt is invalid")
+    if _actor_gap_runtime_homogeneity_identity(
+        primer_runtime
+    ) != _actor_gap_runtime_homogeneity_identity(reader_runtime):
+        raise ValueError("diagnostic A0 primer and cache-reader runtimes differ")
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", str(expected_cache_fingerprint)) is None
+        or receipt.get("cache_tree_sha256_after_a0_prepass")
+        != expected_cache_fingerprint
+    ):
+        raise ValueError("diagnostic A0 primer fingerprint differs")
+    if require_current_cache and cache_tree_sha256(Path(expected_cache)) != str(
+        expected_cache_fingerprint
+    ):
+        raise ValueError("diagnostic cache changed after the A0 writer prepass")
+    return canonical
+
+
+def _current_diagnostic_a0_primer_reference(
+    root: Path,
+    manifest: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    reader_scheduler: Mapping[str, Any],
+    reader_runtime: Mapping[str, Any],
+    reader_authorization: Mapping[str, Any],
+    *,
+    require_current_cache: bool,
+) -> dict[str, Any]:
+    path = _diagnostic_a0_primer_receipt_path(root, cell, reader_scheduler)
+    receipt = read_json(path)
+    reference = _diagnostic_a0_primer_reference(root, path, receipt)
+    return _validate_diagnostic_a0_primer_reference(
+        root,
+        reference,
+        manifest,
+        cell,
+        reader_scheduler,
+        reader_runtime,
+        reader_authorization,
+        str(os.environ.get("AGR_DIAGNOSTIC_A0_CACHE_FINGERPRINT", "")),
+        require_current_cache=require_current_cache,
+    )
+
+
+def prime_diagnostic_a0_cache(
+    output_root: str | Path,
+    index: int,
+    *,
+    submission_authorization: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Populate exact A0 cache entries in a discard-only writer process."""
+
+    root = Path(output_root)
+    manifest = read_json(root / "manifest.json")
+    validate_manifest(manifest)
+    cell = _cell(manifest, "diagnostic", index)
+    current_authorization = _validate_retained_submission_authorization(
+        root, manifest, cell, "diagnostic", submission_authorization
+    )
+    paths = _cell_artifact_paths(root, cell, "diagnostic")
+    data_paths, marker_path = paths[:-1], paths[-1]
+    verification_seal = _evaluation_cache_seal_path(
+        root, cell, "verification", stage="diagnostic"
+    )
+    if current_authorization["mode"] == "new" and (
+        any(path.exists() for path in paths) or verification_seal.exists()
+    ):
+        raise ValueError("new diagnostic A0 primer found publication artifacts")
+    if current_authorization["mode"] == "verification_only" and (
+        not all(path.is_file() for path in data_paths)
+        or marker_path.exists()
+        or verification_seal.exists()
+    ):
+        raise ValueError("verification-only diagnostic A0 primer state differs")
+    calibration_marker = _validate_calibration_marker(root, manifest)
+    if calibration_marker.get("training_only") is not True:
+        raise ValueError("diagnostic A0 primer requires train-only calibration")
+    scheduler, receipt, runtime = _live_array_execution_binding(
+        root, manifest, cell, "diagnostic", current_authorization
+    )
+    cache = _job_scoped_evaluation_cache(manifest, cell, scheduler, stage="diagnostic")
+    if str(runtime.get("jax_compilation_cache_dir")) != cache:
+        raise ValueError("diagnostic A0 primer runtime differs from its job cache")
+    receipt_path = _diagnostic_a0_primer_receipt_path(root, cell, scheduler)
+    if receipt_path.exists():
+        raise ValueError("diagnostic A0 primer receipt path already exists")
+    before = _evaluation_publication_snapshot(root, cell, stage="diagnostic")
+    started = time.perf_counter()
+    prepass = _prime_diagnostic_a0_only(root, manifest, cell)
+    wall_seconds = time.perf_counter() - started
+    after = _evaluation_publication_snapshot(root, cell, stage="diagnostic")
+    if after != before:
+        raise ValueError("discarded diagnostic A0 primer changed artifacts")
+    receipt_body = {
+        "schema_version": DIAGNOSTIC_A0_PRIMER_RECEIPT_SCHEMA,
+        "status": "discarded_without_cell_publication",
+        "source_commit": manifest["source_commit"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "cell_id": cell["cell_id"],
+        "cell_index": int(cell["index"]),
+        "world_model_seed": int(cell["world_model_seed"]),
+        "submission_mode": current_authorization["mode"],
+        "cache_directory": cache,
+        "scheduler_provenance": scheduler,
+        "submission_authorization": current_authorization,
+        "submission_receipt": receipt,
+        "runtime": runtime,
+        "publication_snapshot_before": before,
+        "publication_snapshot_after": after,
+        "publication_artifacts_unchanged": True,
+        "actor_seeds": prepass["actor_seeds"],
+        "trace_sha256": prepass["trace_sha256"],
+        "dependency_equality_gate_applied": prepass["dependency_equality_gate_applied"],
+        "discarded_wall_seconds": wall_seconds,
+        "cache_tree_sha256_after_a0_prepass": cache_tree_sha256(Path(cache)),
+        "receipt_path": str(receipt_path.relative_to(root)),
+    }
+    if not _finite_tree(receipt_body):
+        raise FloatingPointError("diagnostic A0 primer receipt is not finite")
+    receipt_body["receipt_sha256"] = benchmark.object_sha256(receipt_body)
+    _write_json_exclusive(receipt_path, receipt_body)
+    return receipt_body
+
+
 def prime_diagnostic_cell(
     output_root: str | Path,
     index: int,
@@ -4369,12 +4649,23 @@ def prime_diagnostic_cell(
     if receipt_path.exists():
         raise ValueError("diagnostic primer receipt path already exists")
     before = _evaluation_publication_snapshot(root, cell, stage="diagnostic")
+    a0_reference = _current_diagnostic_a0_primer_reference(
+        root,
+        manifest,
+        cell,
+        scheduler,
+        runtime,
+        current_authorization,
+        require_current_cache=True,
+    )
+    a0_receipt = read_json(root / str(a0_reference["path"]))
     started = time.perf_counter()
-    a0_prepass = _prime_diagnostic_a0_only(root, manifest, cell)
     full_started = time.perf_counter()
     core, traces = _compute_diagnostic_cell(root, manifest, cell)
     full_wall_seconds = time.perf_counter() - full_started
-    wall_seconds = time.perf_counter() - started
+    wall_seconds = float(a0_reference["discarded_wall_seconds"]) + (
+        time.perf_counter() - started
+    )
     if not _finite_tree(core) or not _finite_tree(traces):
         raise FloatingPointError("discarded diagnostic cache primer is not finite")
     after = _evaluation_publication_snapshot(root, cell, stage="diagnostic")
@@ -4399,16 +4690,18 @@ def prime_diagnostic_cell(
         "publication_snapshot_before": before,
         "publication_snapshot_after": after,
         "publication_artifacts_unchanged": True,
-        "a0_only_prepass_actor_seeds": a0_prepass["actor_seeds"],
-        "a0_only_prepass_trace_sha256": a0_prepass["trace_sha256"],
+        "a0_only_prepass_actor_seeds": a0_receipt["actor_seeds"],
+        "a0_only_prepass_trace_sha256": a0_receipt["trace_sha256"],
         "a0_only_prepass_before_full_diagnostic": True,
-        "a0_only_prepass_dependency_equality_gate_applied": a0_prepass[
+        "a0_only_prepass_dependency_equality_gate_applied": a0_receipt[
             "dependency_equality_gate_applied"
         ],
+        "a0_only_prepass_separate_process": True,
+        "a0_only_prepass_receipt": a0_reference,
         "discarded_core_sha256": benchmark.object_sha256(core),
         "discarded_trace_sha256": benchmark.array_sha256(traces),
         "discarded_timing": {
-            "a0_only_prepass_wall_seconds": a0_prepass["wall_seconds"],
+            "a0_only_prepass_wall_seconds": a0_reference["discarded_wall_seconds"],
             "complete_diagnostic_wall_seconds": full_wall_seconds,
         },
         "discarded_wall_seconds": wall_seconds,
@@ -7292,6 +7585,8 @@ def _validate_evaluation_primer_receipt_reference(
                 "a0_only_prepass_trace_sha256",
                 "a0_only_prepass_before_full_diagnostic",
                 "a0_only_prepass_dependency_equality_gate_applied",
+                "a0_only_prepass_separate_process",
+                "a0_only_prepass_receipt",
             }
         )
     if (
@@ -7321,6 +7616,8 @@ def _validate_evaluation_primer_receipt_reference(
                 or receipt.get("a0_only_prepass_before_full_diagnostic") is not True
                 or receipt.get("a0_only_prepass_dependency_equality_gate_applied")
                 is not False
+                or receipt.get("a0_only_prepass_separate_process") is not True
+                or not isinstance(receipt.get("a0_only_prepass_receipt"), Mapping)
             )
         )
         or receipt.get("submission_mode") != primer_authorization["mode"]
@@ -7343,6 +7640,26 @@ def _validate_evaluation_primer_receipt_reference(
         or not _finite_tree(receipt)
     ):
         raise ValueError(f"{stage} primer receipt is invalid")
+    if stage == "diagnostic":
+        a0_reference = _validate_diagnostic_a0_primer_reference(
+            root,
+            receipt["a0_only_prepass_receipt"],
+            manifest,
+            cell,
+            primer_scheduler,
+            primer_runtime,
+            primer_authorization,
+            str(os.environ.get("AGR_DIAGNOSTIC_A0_CACHE_FINGERPRINT", "")),
+            require_current_cache=False,
+        )
+        a0_receipt = read_json(root / str(a0_reference["path"]))
+        if (
+            receipt["a0_only_prepass_actor_seeds"] != a0_receipt["actor_seeds"]
+            or receipt["a0_only_prepass_trace_sha256"] != a0_receipt["trace_sha256"]
+            or float(receipt["discarded_timing"]["a0_only_prepass_wall_seconds"])
+            != float(a0_reference["discarded_wall_seconds"])
+        ):
+            raise ValueError("diagnostic primer does not bind its A0 prepass")
     if _actor_gap_runtime_homogeneity_identity(
         primer_runtime
     ) != _actor_gap_runtime_homogeneity_identity(reader_runtime):

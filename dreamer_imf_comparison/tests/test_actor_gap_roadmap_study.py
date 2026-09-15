@@ -108,13 +108,17 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
         self.assertLess(bridge, diagnostics)
 
     def test_diagnostic_primer_and_each_reader_execute_one_full_cell(self) -> None:
+        a0_writer = inspect.getsource(study.prime_diagnostic_a0_cache)
         primer = inspect.getsource(study.prime_diagnostic_cell)
         creation = inspect.getsource(study.run_diagnostic_cell)
         verification = inspect.getsource(study.verify_diagnostic_cell)
+        self.assertEqual(a0_writer.count("_prime_diagnostic_a0_only("), 1)
+        self.assertNotIn("_compute_diagnostic_cell(", a0_writer)
         self.assertLess(
-            primer.index("_prime_diagnostic_a0_only"),
+            primer.index("_current_diagnostic_a0_primer_reference"),
             primer.index("_compute_diagnostic_cell"),
         )
+        self.assertNotIn("_prime_diagnostic_a0_only", primer)
         self.assertEqual(creation.count("_compute_diagnostic_cell("), 1)
         self.assertEqual(verification.count("_compute_diagnostic_cell("), 1)
         self.assertNotIn("_compute_diagnostic_cell_after_discarded_warmup", creation)
@@ -365,7 +369,96 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
             self.assertFalse((root / cell["trace_path"]).exists())
             self.assertFalse((root / cell["marker_path"]).exists())
 
-    def test_diagnostic_primer_is_a0_both_seeds_then_full_and_discard_only(
+    def test_diagnostic_a0_writer_has_its_own_discard_only_receipt(self) -> None:
+        commit = "c" * 40
+        cell = {
+            "index": 1,
+            "cell_id": "diagnostic-223",
+            "world_model_seed": 223,
+            "result_path": "diagnostics/diagnostic-223/result.json",
+            "trace_path": "diagnostics/diagnostic-223/traces.npz",
+            "creation_cache_seal_path": (
+                "verified/cache-seals/diagnostic-223-creation.json"
+            ),
+            "verification_cache_seal_path": (
+                "verified/cache-seals/diagnostic-223-verification.json"
+            ),
+            "marker_path": "verified/diagnostic-223.json",
+        }
+        manifest = {
+            "source_commit": commit,
+            "manifest_sha256": "m" * 64,
+            "diagnostic_cells": [cell],
+        }
+        scheduler = {
+            "job_id": "12345",
+            "array_job_id": "12000",
+            "array_task_id": 1,
+        }
+        prepass = {
+            "actor_seeds": list(study.ACTOR_SEEDS),
+            "trace_sha256": ["a" * 64, "b" * 64],
+            "wall_seconds": 1.0,
+            "dependency_equality_gate_applied": False,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json_atomic(root / "manifest.json", manifest)
+            cache = (
+                root
+                / "jax-compilation-cache"
+                / "actor-gap-roadmap"
+                / commit
+                / "job-12345-task-1"
+            )
+            cache.mkdir(parents=True)
+            (cache / "compiled-entry").write_bytes(b"compiled")
+            execution = (
+                scheduler,
+                {"receipt": "writer"},
+                {"jax_compilation_cache_dir": str(cache)},
+            )
+            with mock.patch.object(study, "validate_manifest"), mock.patch.object(
+                study,
+                "_validate_retained_submission_authorization",
+                return_value={"mode": "new"},
+            ), mock.patch.object(
+                study,
+                "_validate_calibration_marker",
+                return_value={"training_only": True},
+            ), mock.patch.object(
+                study, "_live_array_execution_binding", return_value=execution
+            ), mock.patch.object(
+                study, "_prime_diagnostic_a0_only", return_value=prepass
+            ), mock.patch.dict(
+                os.environ,
+                {"JAX_COMPILATION_CACHE_DIR": str(cache)},
+                clear=False,
+            ):
+                receipt = study.prime_diagnostic_a0_cache(
+                    root,
+                    1,
+                    submission_authorization={"authorized": True},
+                )
+            self.assertEqual(
+                receipt["schema_version"],
+                study.DIAGNOSTIC_A0_PRIMER_RECEIPT_SCHEMA,
+            )
+            self.assertEqual(receipt["actor_seeds"], list(study.ACTOR_SEEDS))
+            self.assertEqual(receipt["trace_sha256"], ["a" * 64, "b" * 64])
+            self.assertFalse(receipt["dependency_equality_gate_applied"])
+            self.assertTrue(receipt["publication_artifacts_unchanged"])
+            self.assertTrue((root / receipt["receipt_path"]).is_file())
+            for key in (
+                "result_path",
+                "trace_path",
+                "creation_cache_seal_path",
+                "verification_cache_seal_path",
+                "marker_path",
+            ):
+                self.assertFalse((root / cell[key]).exists())
+
+    def test_diagnostic_full_primer_requires_external_a0_and_is_discard_only(
         self,
     ) -> None:
         commit = "c" * 40
@@ -399,15 +492,6 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
         )
         events: list[str] = []
 
-        def a0_prepass(*_args: object) -> dict:
-            events.append("a0")
-            return {
-                "actor_seeds": list(study.ACTOR_SEEDS),
-                "trace_sha256": ["a" * 64, "b" * 64],
-                "wall_seconds": 1.0,
-                "dependency_equality_gate_applied": False,
-            }
-
         def full_diagnostic(*_args: object) -> tuple[dict, dict]:
             events.append("full")
             return computed
@@ -429,6 +513,22 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
                 {"receipt": "primer"},
                 {"jax_compilation_cache_dir": str(cache)},
             )
+            a0_path = root / "runtime/diagnostic-a0-primers/job-12345-task-1.json"
+            write_json_atomic(
+                a0_path,
+                {
+                    "actor_seeds": list(study.ACTOR_SEEDS),
+                    "trace_sha256": ["a" * 64, "b" * 64],
+                    "dependency_equality_gate_applied": False,
+                },
+            )
+            a0_reference = {
+                "path": str(a0_path.relative_to(root)),
+                "file_sha256": study.benchmark.file_sha256(a0_path),
+                "receipt_sha256": "r" * 64,
+                "discarded_wall_seconds": 1.0,
+                "cache_tree_sha256_after_a0_prepass": "c" * 64,
+            }
             with mock.patch.object(study, "validate_manifest"), mock.patch.object(
                 study,
                 "_validate_retained_submission_authorization",
@@ -440,7 +540,9 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
             ), mock.patch.object(
                 study, "_live_array_execution_binding", return_value=execution
             ), mock.patch.object(
-                study, "_prime_diagnostic_a0_only", side_effect=a0_prepass
+                study,
+                "_current_diagnostic_a0_primer_reference",
+                return_value=a0_reference,
             ), mock.patch.object(
                 study, "_compute_diagnostic_cell", side_effect=full_diagnostic
             ), mock.patch.dict(
@@ -453,7 +555,7 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
                     1,
                     submission_authorization={"authorized": True},
                 )
-            self.assertEqual(events, ["a0", "full"])
+            self.assertEqual(events, ["full"])
             self.assertEqual(
                 receipt["a0_only_prepass_actor_seeds"], list(study.ACTOR_SEEDS)
             )
@@ -464,6 +566,8 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
             self.assertFalse(
                 receipt["a0_only_prepass_dependency_equality_gate_applied"]
             )
+            self.assertTrue(receipt["a0_only_prepass_separate_process"])
+            self.assertEqual(receipt["a0_only_prepass_receipt"], a0_reference)
             self.assertTrue(receipt["publication_artifacts_unchanged"])
             self.assertEqual(
                 receipt["receipt_sha256"],

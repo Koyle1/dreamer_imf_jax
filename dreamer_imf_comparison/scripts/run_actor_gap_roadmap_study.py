@@ -22,6 +22,7 @@ COMMANDS = (
     "seal-preflight",
     "validate-submission",
     "calibration",
+    "prime-diagnostic-a0-cache",
     "prime-diagnostic-cell",
     "diagnostic-cell",
     "seal-diagnostic-cache-reader",
@@ -158,6 +159,17 @@ def main() -> int:
         )
         payload = result
         token = "ACTOR_GAP_ROADMAP_CALIBRATION_DATA_READY"
+    elif arguments.command == "prime-diagnostic-a0-cache":
+        index = _require_index(parser, arguments)
+        authorization = _authorize_submission(
+            parser, arguments, "diagnostic", action="create"
+        )
+        payload = study.prime_diagnostic_a0_cache(
+            arguments.output_root,
+            index,
+            submission_authorization=authorization,
+        )
+        token = "ACTOR_GAP_ROADMAP_DIAGNOSTIC_A0_CACHE_PRIMED"
     elif arguments.command == "prime-diagnostic-cell":
         index = _require_index(parser, arguments)
         authorization = _authorize_submission(

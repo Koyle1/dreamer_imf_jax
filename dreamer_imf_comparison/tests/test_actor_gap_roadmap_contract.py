@@ -48,6 +48,9 @@ class ActorGapRoadmapContractTests(unittest.TestCase):
             self.assertLess(creation, creation_seal)
             self.assertLess(creation_seal, replay)
             self.assertLess(replay, verification_seal)
+        diagnostic_writer = sbatch.index('"${RUNNER}" prime-diagnostic-a0-cache')
+        diagnostic_primer = sbatch.index('"${RUNNER}" prime-diagnostic-cell')
+        self.assertLess(diagnostic_writer, diagnostic_primer)
 
     def test_diagnostic_and_evaluation_caches_are_fresh_and_content_sealed(
         self,
@@ -76,13 +79,26 @@ class ActorGapRoadmapContractTests(unittest.TestCase):
                 sbatch.count('test "$(cache_fingerprint)" = ' f'"${{{variable}}}"'),
                 2,
             )
+        a0_writer = sbatch.index('python "${RUNNER}" prime-diagnostic-a0-cache')
+        full_diagnostic_primer = sbatch.index(
+            'python "${RUNNER}" prime-diagnostic-cell'
+        )
+        self.assertLess(a0_writer, full_diagnostic_primer)
+        self.assertIn(
+            "AGR_DIAGNOSTIC_A0_CACHE_FINGERPRINT=$(cache_fingerprint)",
+            sbatch,
+        )
         diagnostic_primer = inspect.getsource(study._prime_diagnostic_a0_only)
         self.assertIn("for actor_seed in ACTOR_SEEDS", diagnostic_primer)
         self.assertNotIn("_assert_trace_subset_close", diagnostic_primer)
         full_primer = inspect.getsource(study.prime_diagnostic_cell)
-        a0 = full_primer.index("_prime_diagnostic_a0_only")
-        complete = full_primer.index("_compute_diagnostic_cell", a0)
-        self.assertLess(a0, complete)
+        self.assertNotIn("_prime_diagnostic_a0_only", full_primer)
+        external = full_primer.index("_current_diagnostic_a0_primer_reference")
+        complete = full_primer.index("_compute_diagnostic_cell", external)
+        self.assertLess(external, complete)
+        a0_validator = inspect.getsource(study._validate_diagnostic_a0_primer_reference)
+        self.assertIn("_require_distinct_replay_processes", a0_validator)
+        self.assertIn("require_current_cache", a0_validator)
         self.assertIn("#SBATCH --no-requeue", sbatch)
 
     def test_cache_fingerprint_is_content_and_path_sensitive(self) -> None:

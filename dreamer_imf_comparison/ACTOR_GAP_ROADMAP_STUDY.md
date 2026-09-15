@@ -302,7 +302,8 @@ The only valid order is:
 ```
 preflight
   -> calibration
-  -> diagnostic-primer[0:3] -> diagnostic-cell[0:3]
+  -> diagnostic-A0-writer[0:3] -> diagnostic-full-primer[0:3]
+                              -> diagnostic-cell[0:3]
                               -> post-exit creation cache seal
                               -> fresh-process replay
                               -> post-exit verification cache seal
@@ -329,10 +330,13 @@ python scripts/verify_actor_gap_roadmap_study.py <gate> --output-root <root>
 
 There are 114 logical scientific cells and 120 Slurm tasks/jobs including
 preflight, calibration, the three whole-stage verifiers, and finalization. A
-cell's discard-only primer exits before creation, and creation exits before its
-strict replay starts, even though all commands execute sequentially inside the
-same Slurm array task. The primer cannot publish a result, trace, marker, or
-checkpoint; its only output-root artifact is an authenticated runtime receipt.
+A diagnostic cell's A0 writer exits before the complete discard-only primer;
+the complete primer exits before creation; and creation exits before strict
+replay, even though all commands execute sequentially inside one Slurm array
+task. This process boundary prevents a compiler-writer executable from being
+reused in memory by the first dependency-checked diagnostic. Neither primer can
+publish a result, trace, marker, or checkpoint; each may publish only its
+authenticated runtime receipt.
 
 Required terminal tokens are:
 
