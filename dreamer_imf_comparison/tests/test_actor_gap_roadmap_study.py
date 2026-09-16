@@ -117,6 +117,12 @@ class ActorGapRoadmapStudyTests(unittest.TestCase):
             self.assertNotIn("_assert_trace_subset_close", source)
         self.assertNotIn("def _assert_trace_subset_close", inspect.getsource(study))
 
+    def test_stage_verifier_uses_each_authenticated_a0_primer_fingerprint(self) -> None:
+        source = inspect.getsource(study._validate_evaluation_primer_receipt_reference)
+        diagnostic_branch = source[source.index('if stage == "diagnostic":') :]
+        self.assertIn("cache_tree_sha256_after_a0_prepass", diagnostic_branch)
+        self.assertNotIn("AGR_DIAGNOSTIC_A0_CACHE_FINGERPRINT", diagnostic_branch)
+
     def test_diagnostic_primer_and_each_reader_execute_one_full_cell(self) -> None:
         a0_writer = inspect.getsource(study.prime_diagnostic_a0_cache)
         primer = inspect.getsource(study.prime_diagnostic_cell)

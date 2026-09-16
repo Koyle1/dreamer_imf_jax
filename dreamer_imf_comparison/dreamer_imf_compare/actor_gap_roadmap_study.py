@@ -7635,7 +7635,11 @@ def _validate_evaluation_primer_receipt_reference(
             primer_scheduler,
             primer_runtime,
             primer_authorization,
-            str(os.environ.get("AGR_DIAGNOSTIC_A0_CACHE_FINGERPRINT", "")),
+            str(
+                receipt["a0_only_prepass_receipt"].get(
+                    "cache_tree_sha256_after_a0_prepass", ""
+                )
+            ),
             require_current_cache=False,
         )
         a0_receipt = read_json(root / str(a0_reference["path"]))
