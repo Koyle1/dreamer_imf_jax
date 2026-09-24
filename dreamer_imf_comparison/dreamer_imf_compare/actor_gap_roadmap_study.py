@@ -5027,6 +5027,7 @@ def _run_flowmpc_arm(
     heldout_acceptance_enabled: bool,
     anchor_observations: np.ndarray,
     diagnostic_capture: dict[str, Any] | None = None,
+    task: str = TASK,
 ) -> tuple[list[float], dict[str, np.ndarray], dict[str, float]]:
     """Run one FlowMPC arm with isolated trust/persistence/acceptance factors."""
 
@@ -5260,7 +5261,7 @@ def _run_flowmpc_arm(
     timed_steps = 0
     warmed = False
     for episode_index, evaluation_seed in enumerate(evaluation_seeds):
-        environment = DMCAdapter(TASK, seed=int(evaluation_seed), action_repeat=1)
+        environment = DMCAdapter(task, seed=int(evaluation_seed), action_repeat=1)
         episode: dict[str, list[Any]] = {name: [] for name in sequence_names}
         episode_beliefs: list[Any] = []
         try:
@@ -5269,14 +5270,14 @@ def _run_flowmpc_arm(
             previous_action = jnp.zeros((1, dreamer_config.action_dim), jnp.float32)
             reference_state = init_reference_actor_state(rebrac_state.actor)
             posterior_key = benchmark.derive_jax_key(
-                "flowmpc-posterior", TASK, world_seed, actor_seed, evaluation_seed
+                "flowmpc-posterior", task, world_seed, actor_seed, evaluation_seed
             )
             noise_key = benchmark.derive_jax_key(
-                "flowmpc-noise", TASK, world_seed, actor_seed, evaluation_seed
+                "flowmpc-noise", task, world_seed, actor_seed, evaluation_seed
             )
             heldout_key = benchmark.derive_jax_key(
                 "actor-gap-heldout-acceptance",
-                TASK,
+                task,
                 world_seed,
                 actor_seed,
                 evaluation_seed,
@@ -6601,6 +6602,7 @@ def _run_endpoint_action_sequence_arm(
     maximum_steps: int,
     direct_any_step: bool,
     behavior_distance_threshold: float,
+    task: str = TASK,
 ) -> tuple[list[float], dict[str, np.ndarray], dict[str, float]]:
     import jax
     import jax.numpy as jnp
@@ -6724,7 +6726,7 @@ def _run_endpoint_action_sequence_arm(
     timed_seconds = 0.0
     timed_steps = 0
     for evaluation_seed in evaluation_seeds:
-        environment = DMCAdapter(TASK, seed=int(evaluation_seed), action_repeat=1)
+        environment = DMCAdapter(task, seed=int(evaluation_seed), action_repeat=1)
         episode: dict[str, list[Any]] = {name: [] for name in names}
         try:
             observation = environment.reset()
@@ -6732,21 +6734,21 @@ def _run_endpoint_action_sequence_arm(
             previous_action = jnp.zeros((1, dreamer_config.action_dim), jnp.float32)
             posterior_key = benchmark.derive_jax_key(
                 "actor-gap-endpoint-posterior",
-                TASK,
+                task,
                 world_seed,
                 actor_seed,
                 evaluation_seed,
             )
             noise_key = benchmark.derive_jax_key(
                 "actor-gap-endpoint-noise",
-                TASK,
+                task,
                 world_seed,
                 actor_seed,
                 evaluation_seed,
             )
             proposal_key = benchmark.derive_jax_key(
                 "actor-gap-endpoint-cem",
-                TASK,
+                task,
                 world_seed,
                 actor_seed,
                 evaluation_seed,

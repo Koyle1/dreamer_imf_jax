@@ -1,0 +1,280 @@
+{
+  "schema": "trajectory-imf-mechanism-replication-v1",
+  "status": "approved_frozen_before_execution",
+  "preregistered": true,
+  "reference_commit": "be7c4846209130642b71ce9e6a8aab6eb6d97689",
+  "reference_report_file_sha256": "addb13ab07a6a0cfd66e90d272d9ebd6966858974ddaaa9ab7ddf6b78e02116a",
+  "tasks": [
+    "dmc_reacher_hard",
+    "dmc_cartpole_swingup",
+    "dmc_finger_spin"
+  ],
+  "world_model_seeds": [
+    431,
+    433,
+    439
+  ],
+  "nested_actor_seeds": [
+    541,
+    547
+  ],
+  "evaluation_environment_seeds": [
+    65001,
+    65003,
+    65011,
+    65027,
+    65029
+  ],
+  "training_seed_namespace": "imf-replication-training-v1",
+  "calibration_seed_namespace": "imf-replication-calibration-v1",
+  "evaluation_seed_namespace": "imf-replication-evaluation-v1",
+  "arms": [
+    "A1_persistent_trust",
+    "A3_persistent_trust_heldout",
+    "K0_endpoint_h1_recursive_cem_filtered",
+    "K1_endpoint_anystep_direct_cem_filtered"
+  ],
+  "contrasts": [
+    {
+      "id": "heldout_acceptance",
+      "candidate": "A3_persistent_trust_heldout",
+      "baseline": "A1_persistent_trust"
+    },
+    {
+      "id": "recursive_vs_direct_endpoint",
+      "candidate": "K0_endpoint_h1_recursive_cem_filtered",
+      "baseline": "K1_endpoint_anystep_direct_cem_filtered"
+    }
+  ],
+  "maximum_environment_steps": 1000,
+  "action_repeat": 1,
+  "evaluation_episodes_per_cell": 5,
+  "expected_evaluation_cells": 72,
+  "expected_episode_records": 360,
+  "primary_endpoint": "equal_task_mean_of_IQM_of_paired_world_seed_return_deltas",
+  "aggregation_order": [
+    "episode_mean_within_actor",
+    "equal_actor_mean_within_world_seed",
+    "candidate_minus_baseline_within_task_world_seed",
+    "fractional_trim_25_percent_each_tail_within_task",
+    "equal_task_mean"
+  ],
+  "uncertainty": {
+    "method": "paired_world_seed_cluster_bootstrap_stratified_by_fixed_task",
+    "resamples": 20000,
+    "seed": 73103,
+    "interval_level_per_contrast": 0.975,
+    "multiplicity": "Bonferroni_two_contrasts_familywise_alpha_0.05",
+    "limitations": "Three model seeds per task provide sparse cluster support; no claim about an unseen task population or achieved statistical power. Episodes and actor seeds are not independent trained-model replicates."
+  },
+  "secondary_endpoints": [
+    "arm_return_IQM",
+    "world_seed_paired_deltas",
+    "fraction_positive_world_seed_deltas",
+    "fraction_positive_task_effects",
+    "episode_return_at_least_800_fraction_not_native_task_success",
+    "action_saturation_fraction",
+    "heldout_noise_acceptance_fraction",
+    "proposal_minus_independent_noise_gain",
+    "matched_horizon_imagined_minus_real_return",
+    "observation_action_coverage",
+    "actor_gradient_norm_where_defined",
+    "parameter_delta_where_defined",
+    "controller_latency",
+    "allocated_GPU_seconds"
+  ],
+  "checkpoint_plan": {
+    "task_world_model_count": 9,
+    "task_reward_head_count": 9,
+    "task_rebrac_count": 18,
+    "endpoint_model_count": 18,
+    "replay_steps_per_task_world_seed": 50000,
+    "world_model_updates": 10000,
+    "reward_head_updates": 10000,
+    "rebrac_updates": 1000000,
+    "endpoint_model_updates": 5000,
+    "world_model_configuration": "world_model_template",
+    "freeze_point": "all_task_specific_checkpoints_and_training_only_calibration_authenticated_before_any_evaluation",
+    "scope_authorization": "user_yes_and_run_2026-09-24"
+  },
+  "controller": {
+    "horizon": 5,
+    "flowmpc_step_size": 0.000005,
+    "flowmpc_particles": 4096,
+    "action_sequence_particles": 64,
+    "action_sequence_objective_evaluations": 10,
+    "action_sequence_residual_limit": 0.1,
+    "heldout_minimum_improvement": 0,
+    "trust_anchor_mse_sum_budget": 0.01,
+    "trust_current_linf_budget": 0.1
+  },
+  "execution": {
+    "gpu_partition": "gpu-l40s",
+    "array_concurrency": 4,
+    "preflight_required": true,
+    "exact_replay_required": true,
+    "processes": [
+      "discarded_primer",
+      "creation_reader",
+      "independent_replay_reader"
+    ],
+    "cache_scope": "new_study_job_and_index",
+    "cache_seals": [
+      "post_primer",
+      "post_creation",
+      "post_replay"
+    ],
+    "new_commit_and_output_required": true,
+    "branch": "main",
+    "old_study_results_as_controls": false,
+    "no_outcome_dependent_selection": true,
+    "invalid_or_missing_cells_block_analysis": true,
+    "canonical_submission_only": true,
+    "submitter_ready": true,
+    "training_cells": 9,
+    "stage_order": [
+      "preflight",
+      "training",
+      "evaluation",
+      "finalize"
+    ]
+  },
+  "exclusions": [
+    "policy_tilt_sweep",
+    "pessimism_sweep",
+    "optimizer_sweep",
+    "shortcut_training",
+    "pixels",
+    "full_FlowMPC_reproduction"
+  ],
+  "launch_blockers": [],
+  "world_model_template": {
+    "action_dim": 2,
+    "actor_action_l2_scale": 0.001,
+    "actor_critic_warmup_steps": 0,
+    "actor_entropy_scale": 0.001,
+    "actor_gradient": "reinforce",
+    "actor_init_scale": 0.01,
+    "actor_learning_rate": 0.0003,
+    "actor_max_std": 1,
+    "actor_mean_bound": 5,
+    "actor_min_std": 0.1,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.999,
+    "adam_epsilon": 1e-8,
+    "behavior_cloning_learning_rate": 0.0003,
+    "behavior_kl_scale": 0,
+    "burn_in": 8,
+    "continuation_scale": 1,
+    "critic_bins": 51,
+    "critic_learning_rate": 0.0003,
+    "critic_output_init_scale": 0,
+    "critic_symlog_max": 20,
+    "critic_symlog_min": -20,
+    "deterministic_dim": 128,
+    "discount": 0.99,
+    "embedding_dim": 128,
+    "grad_clip": 100,
+    "hidden_dim": 256,
+    "imagination_horizon": 15,
+    "imagination_start_mode": "one_per_sequence",
+    "imf_adaptive_epsilon": 0.01,
+    "imf_adaptive_power": 1,
+    "imf_boundary_fraction": 0.5,
+    "imf_boundary_velocity_supervision": true,
+    "imf_causal_consistency_scale": 0,
+    "imf_causal_huber_delta": 1,
+    "imf_causal_normalization_epsilon": 0.001,
+    "imf_causal_reward_scale": 1,
+    "imf_condition_gradient_scale": 1,
+    "imf_endpoint_scale": 0,
+    "imf_meanflow_scale": 1,
+    "imf_noise_coupling": "independent",
+    "imf_sampling_steps": 1,
+    "imf_shortcut_scale": 0,
+    "imf_signal_weight_floor": 1,
+    "imf_signal_weight_scale": 0,
+    "imf_time_mean": -0.4,
+    "imf_time_std": 1,
+    "imf_trajectory_clean_probability": 0.3333333333333333,
+    "imf_trajectory_corrupted_probability": 0.3333333333333333,
+    "imf_trajectory_enabled": true,
+    "imf_trajectory_history_noise_max": 1,
+    "imf_trajectory_suffix_probability": 0.3333333333333333,
+    "imf_velocity_scale": 1,
+    "kl_free_nats": 0,
+    "lambda_": 0.95,
+    "max_std": 2,
+    "min_std": 0.1,
+    "model_learning_rate": 0.0003,
+    "observation_shape": [
+      6
+    ],
+    "overshooting_distances": [
+      1
+    ],
+    "overshooting_horizon": 1,
+    "overshooting_scale": 0,
+    "pmpo_negative_temperature": 1,
+    "pmpo_negative_weight": 1,
+    "pmpo_positive_temperature": 1,
+    "pmpo_positive_weight": 1,
+    "prior": "imf",
+    "prior_scale": 0.25,
+    "reconstruction_scale": 1,
+    "representation_scale": 0.05,
+    "return_normalization_epsilon": 0.000001,
+    "return_scale_ema_decay": 0.99,
+    "reward_bins": 1,
+    "reward_initial_value": 0,
+    "reward_loss": "mse",
+    "reward_max": null,
+    "reward_min": null,
+    "reward_output_init_scale": 0,
+    "reward_prediction_horizon": 0,
+    "reward_scale": 1,
+    "reward_symlog_max": 20,
+    "reward_symlog_min": -20,
+    "shortcut_bootstrap_ema_decay": 0.999,
+    "shortcut_intermediate_clip": 4,
+    "shortcut_sampling_clip": null,
+    "shortcut_sampling_steps": 4,
+    "shortcut_support_safe_bootstrap": true,
+    "shortcut_training_k_max": null,
+    "slow_critic_fraction": 0.02,
+    "stochastic_dim": 32
+  },
+  "data": {
+    "episodes": 50,
+    "steps_per_episode": 1000,
+    "train_episodes": 40,
+    "uniform_episode_probability": 0.7,
+    "sequence_length": 32,
+    "batch_size": 32,
+    "reward_test_batches": 32
+  },
+  "preflight": {
+    "episodes": 4,
+    "steps_per_episode": 64,
+    "train_episodes": 3,
+    "world_updates": 2,
+    "reward_updates": 2,
+    "rebrac_updates": 4,
+    "endpoint_updates": 2,
+    "evaluation_steps": 8,
+    "evaluation_seeds": [
+      75001
+    ],
+    "actor_seeds": [
+      541
+    ],
+    "note": "Full architecture and controller particle shapes; reduced updates and episode length; all four arms strict replay. Preflight is not scientific evidence."
+  },
+  "limitations": [
+    "Three top-level world seeds per task, two nested actors, not an unseen-task population estimate.",
+    "K0/K1 is compound endpoint training and rollout interface intervention.",
+    "A3 noise independence is within a single learned model, not model error independence.",
+    "Imagined objective includes terminal Q; no subtraction from whole-episode return is labeled a matched-horizon gap.",
+    "Fixed training budget, no tuning or negative-result retries."
+  ]
+}
