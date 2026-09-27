@@ -29,10 +29,103 @@ SOURCE = Path(__file__).resolve().parents[2]
 PROTOCOL = SOURCE / "dreamer_imf_comparison/mechanism_replication_protocol.json"
 STAGES = ("preflight", "training", "evaluation")
 MODULE = "dreamer_imf_compare.mechanism_replication"
+LEGACY_RESULT_COMMITS = frozenset({"b7e22a5ae4e7d8473624908283f683e0b9b1280a"})
+REPLAY_MODES = ("primer", "create", "replay")
+TRAINING_FILES = frozenset(
+    {"result.json", "checkpoint.pkl", "replay.npz", "schedules.pkl"}
+)
+EVALUATION_FILES = frozenset(
+    {"result.json", "trace.npz"}
+    | {f"{mode}-{kind}.json" for mode in REPLAY_MODES for kind in ("receipt", "seal")}
+)
+
+
+def exact_fields(value, names, label):
+    """A marker cannot choose a weaker schema by deleting or adding fields."""
+    if not isinstance(value, dict) or set(value) != set(names):
+        raise ValueError(f"{label} field set differs")
+
+
+def require_sha256(value, label):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError(f"invalid {label} digest")
+
+
+def require_number(value, label, *, minimum=None):
+    if type(value) not in (int, float) or not np.isfinite(value):
+        raise ValueError(f"invalid {label}")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"invalid {label}")
+
+
+def validate_runtime(value):
+    exact_fields(
+        value,
+        ("python", "jax", "jaxlib", "numpy", "mujoco", "dm_control", "devices", "x64"),
+        "runtime",
+    )
+    if any(
+        not isinstance(value[k], str) or not value[k]
+        for k in value
+        if k not in ("devices", "x64")
+    ):
+        raise ValueError("invalid runtime versions")
+    if (
+        not isinstance(value["devices"], list)
+        or not value["devices"]
+        or any(not isinstance(d, str) or not d for d in value["devices"])
+        or value["x64"] is not False
+    ):
+        raise ValueError("invalid device/precision runtime")
+
+
+def validate_controller_protocol(controller):
+    """Bind the declared knobs to the constants used by the legacy runners.
+
+    These runners do not take arbitrary controller settings. Unsupported changes
+    must fail before loading a checkpoint or stepping an environment.
+    """
+    from . import actor_gap_roadmap_study as roadmap
+
+    realized = dict(
+        horizon=roadmap.CONTROLLER_HORIZON,
+        flowmpc_step_size=roadmap.CONTROLLER_STEP_SIZE,
+        flowmpc_particles=roadmap.FLOWMPC_PARTICLES,
+        action_sequence_particles=roadmap.ACTION_SEQUENCE_PARTICLES,
+        action_sequence_objective_evaluations=roadmap.ACTION_SEQUENCE_OBJECTIVE_EVALUATIONS,
+        action_sequence_residual_limit=roadmap.ACTION_SEQUENCE_RESIDUAL_LIMIT,
+        heldout_minimum_improvement=roadmap.HELDOUT_MINIMUM_IMPROVEMENT,
+        trust_anchor_mse_sum_budget=roadmap.TRUST_ANCHOR_MSE_BUDGET,
+        trust_current_linf_budget=roadmap.TRUST_CURRENT_LINF_BUDGET,
+    )
+    exact_fields(controller, realized, "controller protocol")
+    for name, expected in realized.items():
+        require_number(controller[name], f"controller {name}")
+        if controller[name] != expected or (
+            type(expected) is int and type(controller[name]) is not int
+        ):
+            raise ValueError(f"unsupported controller protocol value: {name}")
+    # The endpoint runner constructs this fixed two-by-four CEM budget.
+    if realized["action_sequence_objective_evaluations"] != 2 + 2 * 4:
+        raise ValueError("controller objective budget differs from realized CEM")
+    return realized
 
 
 def read(path):
-    return json.loads(Path(path).read_text())
+    def pairs(items):
+        value = {}
+        for name, item in items:
+            if name in value:
+                raise ValueError(f"duplicate JSON field: {name}")
+            value[name] = item
+        return value
+
+    def invalid_constant(value):
+        raise ValueError(f"nonfinite JSON constant: {value}")
+
+    return json.loads(
+        Path(path).read_text(), object_pairs_hook=pairs, parse_constant=invalid_constant
+    )
 
 
 def digest(value):
@@ -467,15 +560,23 @@ def verify_training(protocol, directory, *, preflight=False):
 
     directory = Path(directory)
     result = read(directory / "result.json")
+    validate_training_result(result, preflight=preflight)
     with (directory / "checkpoint.pkl").open("rb") as handle:
         model = pickle.load(handle)
     arrays = b.load_npz(directory / "replay.npz")
     with (directory / "schedules.pkl").open("rb") as handle:
         schedules = pickle.load(handle)
-    if not finite(model) or not finite(arrays) or not finite(result):
+    if (
+        not finite(model)
+        or not finite(arrays)
+        or not finite(result)
+        or not finite(schedules)
+    ):
         raise ValueError("nonfinite training artifact")
     cfg = config_for(protocol, arrays)
-    if digest(model["config"]) != digest(asdict(cfg)):
+    if digest(model["config"]) != digest(asdict(cfg)) or digest(
+        result["config"]
+    ) != digest(asdict(cfg)):
         raise ValueError("checkpoint config differs")
     p = protocol["preflight"] if preflight else protocol["checkpoint_plan"]
     expected = dict(
@@ -502,6 +603,9 @@ def verify_training(protocol, directory, *, preflight=False):
     )
     if not train_ids or not test_ids or train_ids & test_ids:
         raise ValueError("invalid episode split")
+    schedule_names = {"world", "reward", "reward-test"}
+    exact_fields(schedules, schedule_names, "training schedules")
+    exact_fields(result["schedule_sha256"], schedule_names, "training schedule digests")
     for name, schedule_ in schedules.items():
         ids = test_ids if name == "reward-test" else train_ids
         if not set(schedule_["episode_ids"].ravel()) <= ids:
@@ -520,6 +624,8 @@ def verify_training(protocol, directory, *, preflight=False):
     )
     if set(model["policies"]) != set(actors):
         raise ValueError("policy seed set differs")
+    if set(result["policies"]) != set(map(str, actors)):
+        raise ValueError("policy result seed set differs")
     for actor in actors:
         info, policy = result["policies"][str(actor)], model["policies"][actor]
         if (
@@ -527,6 +633,10 @@ def verify_training(protocol, directory, *, preflight=False):
             or b._tree_digest(policy) != info["final_state_sha256"]
         ):
             raise ValueError("policy checkpoint update/digest differs")
+    from .actor_gap_model_training import ENDPOINT_FAMILIES
+
+    exact_fields(model["endpoints"], ENDPOINT_FAMILIES, "endpoint checkpoints")
+    exact_fields(result["endpoints"], ENDPOINT_FAMILIES, "endpoint results")
     for family, checkpoint in model["endpoints"].items():
         info = result["endpoints"][family]
         if int(checkpoint["optimizer"].step) != expected["endpoint_model_updates"]:
@@ -543,6 +653,9 @@ def evaluate(protocol, cell, training_dir, *, preflight=False):
         score_observation_action_coverage,
     )
 
+    realized_controller = validate_controller_protocol(protocol["controller"])
+    if cell["arm"] not in read(PROTOCOL)["arms"]:
+        raise ValueError("unsupported controller arm")
     model = load_checkpoint(training_dir)
     cfg, rc = model["config"], model["rebrac_config"]
     actor, arm = cell["actor_seed"], cell["arm"]
@@ -619,6 +732,7 @@ def evaluate(protocol, cell, training_dir, *, preflight=False):
         coverage=real_coverage,
         trace_sha256=b.array_sha256(trace),
         checkpoint_sha256=b.file_sha256(Path(training_dir) / "checkpoint.pkl"),
+        realized_controller_config=realized_controller,
     )
     return core, trace, timing
 
@@ -640,50 +754,426 @@ def marker(root, directory, cell, files, **extra):
     return result
 
 
-def verify_files(root, directory):
-    m = manifest(root)
+def verify_bound_files(m, directory, expected_files, *, replay=False):
+    """Authenticate an exact artifact set; reusable by separately frozen studies.
+
+    The caller supplies its already authenticated manifest and stage schema.
+    No source identity override or legacy-manifest fallback occurs here.
+    """
     directory = Path(directory)
+    if directory.is_symlink() or (directory / "verified.json").is_symlink():
+        raise ValueError("symlinked artifact directory/marker")
     mark = read(directory / "verified.json")
+    fields = {"source_commit", "manifest_sha256", "cell", "files"}
+    if replay:
+        fields |= {"strict_bitwise_replay", "cache_sha256"}
+    exact_fields(mark, fields, "cell marker")
+    exact_fields(mark["files"], expected_files, "bound artifact")
     if (
         mark["manifest_sha256"] != digest(m)
         or mark["source_commit"] != m["source_commit"]
     ):
         raise ValueError("marker identity mismatch")
+    if replay:
+        if mark["strict_bitwise_replay"] is not True:
+            raise ValueError("strict bitwise replay is mandatory")
+        require_sha256(mark["cache_sha256"], "cache")
     for name, sha in mark["files"].items():
-        if "/" in name or name in (".", "..") or b.file_sha256(directory / name) != sha:
+        require_sha256(sha, "artifact")
+        path = directory / name
+        if (
+            Path(name).name != name
+            or name in (".", "..")
+            or path.is_symlink()
+            or not path.is_file()
+            or b.file_sha256(path) != sha
+        ):
             raise ValueError("bound artifact differs")
-    result = read(directory / "result.json")
+    return mark
+
+
+def verify_replay_receipts(directory, mark, result, *, expected_runtime=None):
+    """Bind retained trace, reader cores, distinct processes and all cache seals."""
+    directory = Path(directory)
+    if mark.get("strict_bitwise_replay") is not True:
+        raise ValueError("strict bitwise replay is mandatory")
+    require_sha256(mark["cache_sha256"], "cache")
+    trace = b.load_npz(directory / "trace.npz")
+    if (
+        not trace
+        or not finite(trace)
+        or b.array_sha256(trace) != result["trace_sha256"]
+    ):
+        raise ValueError("retained trace binding differs or is nonfinite")
+    receipts = []
+    for mode in REPLAY_MODES:
+        receipt = read(directory / f"{mode}-receipt.json")
+        exact_fields(
+            receipt,
+            (
+                "mode",
+                "pid",
+                "runtime",
+                "core_sha256",
+                "trace_sha256",
+                "cache_sha256",
+                "wall_seconds",
+                "timing",
+            ),
+            "replay receipt",
+        )
+        if (
+            receipt["mode"] != mode
+            or type(receipt["pid"]) is not int
+            or receipt["pid"] <= 0
+        ):
+            raise ValueError("reader mode/process identity differs")
+        validate_runtime(receipt["runtime"])
+        if expected_runtime is not None and receipt["runtime"] != expected_runtime:
+            raise ValueError("reader runtime differs from authenticated preflight")
+        require_number(receipt["wall_seconds"], "reader wall time", minimum=0)
+        validate_timing(receipt["timing"])
+        for key in ("core_sha256", "trace_sha256", "cache_sha256"):
+            require_sha256(receipt[key], key)
+        # Primer executes in the compiler-writer process, so its trajectory is
+        # deliberately not compared to the two independent cache readers.
+        if mode != "primer" and (
+            receipt["core_sha256"] != digest(result)
+            or receipt["trace_sha256"] != result["trace_sha256"]
+        ):
+            raise ValueError("reader result/trace binding differs")
+        seal = read(directory / f"{mode}-seal.json")
+        exact_fields(seal, ("cache_sha256", "receipt_sha256"), "cache seal")
+        if (
+            receipt["cache_sha256"] != mark["cache_sha256"]
+            or seal["cache_sha256"] != mark["cache_sha256"]
+            or seal["receipt_sha256"]
+            != b.file_sha256(directory / f"{mode}-receipt.json")
+        ):
+            raise ValueError("reader receipt/cache seal differs")
+        receipts.append(receipt)
+    if (
+        len({r["pid"] for r in receipts}) != 3
+        or len({digest(r["runtime"]) for r in receipts}) != 1
+    ):
+        raise ValueError("reader process/runtime identity differs")
+    return trace
+
+
+def validate_timing(timing):
+    exact_fields(
+        timing,
+        (
+            "discarded_compile_warmup_steps",
+            "mean_milliseconds_per_step",
+            "timed_steps",
+            "total_timed_seconds",
+        ),
+        "reader timing",
+    )
+    for key, value in timing.items():
+        require_number(value, f"reader {key}", minimum=0)
+    if timing["timed_steps"] <= 0:
+        raise ValueError("reader contains no timed steps")
+
+
+def validate_evaluation_result(
+    result, protocol, cell, *, preflight=False, legacy=False
+):
+    fields = set(cell) | {
+        "evaluation_environment_seeds",
+        "episode_returns",
+        "action_saturation_fraction",
+        "telemetry",
+        "coverage",
+        "trace_sha256",
+        "checkpoint_sha256",
+    }
+    if not legacy or "realized_controller_config" in result:
+        fields.add("realized_controller_config")
+    exact_fields(result, fields, "evaluation result")
+    if not finite(result) or digest({k: result[k] for k in cell}) != digest(cell):
+        raise ValueError("evaluation cell identity differs or is nonfinite")
+    if "realized_controller_config" in result:
+        realized = validate_controller_protocol(protocol["controller"])
+        if (
+            validate_controller_protocol(result["realized_controller_config"])
+            != realized
+        ):
+            raise ValueError("realized controller configuration differs")
+    seeds = (
+        protocol["preflight"]["evaluation_seeds"]
+        if preflight
+        else protocol["evaluation_environment_seeds"]
+    )
+    if digest(result["evaluation_environment_seeds"]) != digest(seeds):
+        raise ValueError("evaluation environment seeds differ")
+    if not isinstance(result["episode_returns"], list) or len(
+        result["episode_returns"]
+    ) != len(seeds):
+        raise ValueError("evaluation episode set differs")
+    for value in result["episode_returns"]:
+        require_number(value, "episode return")
+    require_number(
+        result["action_saturation_fraction"], "saturation fraction", minimum=0
+    )
+    if result["action_saturation_fraction"] > 1:
+        raise ValueError("invalid saturation fraction")
+    if not isinstance(result["telemetry"], dict) or not isinstance(
+        result["coverage"], dict
+    ):
+        raise ValueError("invalid evaluation telemetry/coverage")
+    for key in ("trace_sha256", "checkpoint_sha256"):
+        require_sha256(result[key], key)
+
+
+def _artifact_context(root, directory, protocol):
+    """Infer the schema from its canonical location, never from marker flags."""
+    root, directory = Path(root).absolute(), Path(directory).absolute()
+    try:
+        parts = directory.relative_to(root).parts
+    except ValueError as exc:
+        raise ValueError("artifact outside study") from exc
+    if directory.resolve() != root.resolve().joinpath(*parts):
+        raise ValueError("artifact location traverses a symlink")
+    if not parts:
+        return "final", {"stage": "final"}, None
+    if (
+        len(parts) not in (2, 3)
+        or parts[0] not in STAGES
+        or not re.fullmatch(r"[0-9]{3}", parts[1])
+    ):
+        raise ValueError("noncanonical artifact location")
+    stage, index = parts[0], int(parts[1])
+    expected = cells(protocol, stage)
+    if index >= len(expected):
+        raise ValueError("unexpected cell index")
+    cell = expected[index]
+    if len(parts) == 3:
+        if stage != "preflight" or not re.fullmatch(r"arm-[0-9]+", parts[2]):
+            raise ValueError("noncanonical preflight artifact")
+        arm_index = int(parts[2][4:])
+        if arm_index >= len(protocol["arms"]) or parts[2] != f"arm-{arm_index}":
+            raise ValueError("unexpected preflight arm")
+        cell = dict(
+            cell,
+            actor_seed=protocol["preflight"]["actor_seeds"][0],
+            arm=protocol["arms"][arm_index],
+        )
+        return "preflight_arm", cell, directory.parent / "training"
+    dependency = (
+        cell_dir(root, "training", cell["training_index"])
+        if stage == "evaluation"
+        else None
+    )
+    return stage, cell, dependency
+
+
+def verify_files(root, directory):
+    m = manifest(root)
+    protocol, directory = m["protocol"], Path(directory)
+    stage, cell, training_dir = _artifact_context(root, directory, protocol)
+    replay = stage in ("evaluation", "preflight_arm")
+    expected_files = (
+        EVALUATION_FILES
+        if replay
+        else (
+            TRAINING_FILES
+            if stage == "training"
+            else {"report.json"} if stage == "final" else {"result.json"}
+        )
+    )
+    if replay or stage == "training":
+        if {path.name for path in directory.iterdir()} != set(expected_files) | {
+            "verified.json"
+        }:
+            raise ValueError("stage artifact directory set differs")
+    mark = verify_bound_files(m, directory, expected_files, replay=replay)
+    result = read(directory / ("report.json" if stage == "final" else "result.json"))
     if not finite(result):
         raise ValueError("nonfinite result")
-    if mark.get("strict_bitwise_replay"):
-        create, replay = read(directory / "create-receipt.json"), read(
-            directory / "replay-receipt.json"
+    if replay:
+        validate_evaluation_result(
+            result,
+            protocol,
+            cell,
+            preflight=stage == "preflight_arm",
+            legacy=m["source_commit"] in LEGACY_RESULT_COMMITS,
         )
-        if create["core_sha256"] != digest(result) or replay["core_sha256"] != digest(
-            result
-        ):
-            raise ValueError("reader result binding differs")
+        if digest(mark["cell"]) != digest(result):
+            raise ValueError("evaluation marker/result differs")
+        if stage == "evaluation":
+            dependency = verify_files(root, training_dir)
+            expected_checkpoint = dependency["files"]["checkpoint.pkl"]
+            runtime_dir = cell_dir(root, "preflight", 0)
+            pf = verify_bound_files(m, runtime_dir, {"result.json"})
+            pf_result = read(runtime_dir / "result.json")
+            _validate_preflight_result(pf_result, cells(protocol, "preflight")[0])
+            if digest(pf["cell"]) != digest(pf_result["cell"]):
+                raise ValueError("preflight marker/result differs")
+            expected_runtime = pf_result["runtime"]
+        else:
+            training = read(training_dir / "result.json")
+            validate_training_result(
+                training,
+                cell={k: cell[k] for k in ("index", "task", "world_model_seed")},
+                preflight=True,
+            )
+            expected_runtime = training["runtime"]
+            expected_checkpoint = b.file_sha256(training_dir / "checkpoint.pkl")
+        if result["checkpoint_sha256"] != expected_checkpoint:
+            raise ValueError("evaluation checkpoint binding differs")
+        trace = verify_replay_receipts(
+            directory, mark, result, expected_runtime=expected_runtime
+        )
+        required = {
+            "actions",
+            "observations",
+            "rewards",
+            "continuations",
+            "is_last",
+            "lengths",
+            "evaluation_seeds",
+        }
+        if not required <= set(trace):
+            raise ValueError("incomplete retained trace")
+        lengths = np.asarray(trace["lengths"])
+        steps = (
+            protocol["preflight"]["evaluation_steps"]
+            if stage == "preflight_arm"
+            else protocol["maximum_environment_steps"]
+        )
         if (
-            create["trace_sha256"] != replay["trace_sha256"]
-            or result["trace_sha256"] != create["trace_sha256"]
+            lengths.shape != (len(result["episode_returns"]),)
+            or lengths.dtype.kind not in "iu"
+            or np.any(lengths <= 0)
+            or np.any(lengths > steps)
         ):
-            raise ValueError("reader trace binding differs")
-        receipts = [
-            read(directory / f"{mode}-receipt.json")
-            for mode in ("primer", "create", "replay")
-        ]
+            raise ValueError("invalid trace episode lengths")
+        if any(
+            np.asarray(trace[k]).shape[:2] != (len(lengths), int(lengths.max()))
+            for k in required - {"lengths", "evaluation_seeds"}
+        ):
+            raise ValueError("trace episode/step shape differs")
         if (
-            len({r["pid"] for r in receipts}) != 3
-            or len({digest(r["runtime"]) for r in receipts}) != 1
+            np.asarray(trace["evaluation_seeds"]).dtype.kind not in "iu"
+            or trace["evaluation_seeds"].tolist()
+            != result["evaluation_environment_seeds"]
         ):
-            raise ValueError("reader process/runtime identity differs")
-        for mode in ("primer", "create", "replay"):
-            seal = read(directory / f"{mode}-seal.json")
-            if seal["cache_sha256"] != mark["cache_sha256"] or seal[
-                "receipt_sha256"
-            ] != b.file_sha256(directory / f"{mode}-receipt.json"):
-                raise ValueError("reader seal differs")
+            raise ValueError("retained trace evaluation seeds differ")
+        rewards = np.asarray(trace["rewards"])
+        if rewards.ndim != 2 or rewards.dtype not in (
+            np.dtype("float32"),
+            np.dtype("float64"),
+        ):
+            raise ValueError("invalid retained reward dtype/shape")
+        mask = np.arange(rewards.shape[1])[None] < lengths[:, None]
+        reward_sums = np.sum(np.where(mask, rewards, 0), axis=1, dtype=np.float64)
+        # Episode returns use the original float64 environment rewards, while
+        # historical traces retain float32. Bound only that storage rounding;
+        # trace replay and the two reader result digests remain bitwise exact.
+        rounding = (
+            np.sum(
+                np.where(mask, np.abs(np.spacing(rewards)), 0), axis=1, dtype=np.float64
+            )
+            / 2
+        )
+        rounding += (
+            8
+            * np.finfo(np.float64).eps
+            * np.maximum(1, np.sum(np.abs(rewards), axis=1, dtype=np.float64))
+        )
+        if np.any(
+            np.abs(np.asarray(result["episode_returns"]) - reward_sums) > rounding
+        ):
+            raise ValueError("episode returns differ from retained rewards")
+        if (
+            np.asarray(trace["actions"]).ndim != 3
+            or np.asarray(trace["actions"]).shape[-1] < 1
+        ):
+            raise ValueError("invalid retained action shape")
+        saturation = float(np.mean(np.abs(trace["actions"][mask]) >= 0.95))
+        if result["action_saturation_fraction"] != saturation:
+            raise ValueError("saturation statistic differs from retained actions")
+    else:
+        if digest(mark["cell"]) != digest(cell):
+            raise ValueError("cell marker identity differs")
+        if stage == "preflight":
+            _validate_preflight_result(result, cell)
+        elif stage == "training":
+            validate_training_result(result, cell=cell, preflight=False)
+            validate_runtime(result["runtime"])
+        else:
+            validate_final_report(result, m)
+            for stage_name in STAGES:
+                if not (Path(root) / "verified" / f"{stage_name}.json").is_file():
+                    raise ValueError("final stage aggregate is missing")
+                checked = stage_verify(root, stage_name)
+                if digest(checked) != digest(result["stages"][stage_name]):
+                    raise ValueError("final stage artifact binding differs")
+            for key, stage_name in (
+                ("records", "evaluation"),
+                ("training_results", "training"),
+            ):
+                bound = [
+                    read(cell_dir(root, stage_name, c["index"]) / "result.json")
+                    for c in cells(protocol, stage_name)
+                ]
+                if digest(result[key]) != digest(bound):
+                    raise ValueError("final result artifact binding differs")
+            for c in cells(protocol, "evaluation"):
+                output = cell_dir(root, "evaluation", c["index"])
+                roles = {
+                    mode: read(output / f"{mode}-receipt.json") for mode in REPLAY_MODES
+                }
+                bound_timing = dict(
+                    role_wall_seconds={
+                        mode: r["wall_seconds"] for mode, r in roles.items()
+                    },
+                    controller_latency=roles["create"]["timing"],
+                )
+                if digest(
+                    result["runtime"]["evaluation_by_cell"][str(c["index"])]
+                ) != digest(bound_timing):
+                    raise ValueError("final reader timing artifact binding differs")
     return mark
+
+
+def _validate_preflight_result(result, cell):
+    exact_fields(result, ("cell", "runtime", "status"), "preflight result")
+    if digest(result["cell"]) != digest(cell) or result["status"] != "passed":
+        raise ValueError("preflight result identity/status differs")
+    validate_runtime(result["runtime"])
+
+
+def validate_training_result(result, *, cell=None, preflight=False):
+    exact_fields(
+        result,
+        (
+            "cell",
+            "preflight",
+            "runtime",
+            "source_world_sha256",
+            "config",
+            "budgets",
+            "reward_optimizer_updates",
+            "normalization_train_targets",
+            "reward_test",
+            "policies",
+            "endpoints",
+            "replay_sha256",
+            "schedule_sha256",
+            "wall_seconds",
+        ),
+        "training result",
+    )
+    if not finite(result) or result["preflight"] is not preflight:
+        raise ValueError("invalid training result")
+    if cell is not None and digest(result["cell"]) != digest(cell):
+        raise ValueError("training result cell differs")
+    require_number(result["wall_seconds"], "training wall time", minimum=0)
+    for name in ("source_world_sha256", "replay_sha256"):
+        require_sha256(result[name], name)
 
 
 def role(root, stage, index, arm_index, mode, cache):
@@ -839,27 +1329,221 @@ def accounting(job, count=None):
     rows = [line.split("|") for line in out.splitlines() if line.strip()]
     expected = {f"{job}_{i}" for i in range(count)} if count else {str(job)}
     found = {r[0]: r for r in rows if r[0] in expected}
-    if set(found) != expected or any(
-        r[1:3] != ["COMPLETED", "0:0"] for r in found.values()
+    if (
+        set(found) != expected
+        or len([r for r in rows if r[0] in expected]) != len(expected)
+        or any(r[1:3] != ["COMPLETED", "0:0"] for r in found.values())
     ):
         raise RuntimeError(f"scheduler not fully successful: {out}")
-    return dict(raw=out, records=list(found.values()))
+    result = dict(raw=out, records=list(found.values()))
+    validate_accounting(result, str(job), count)
+    return result
+
+
+def validate_accounting(value, job, count):
+    exact_fields(value, ("raw", "records"), "accounting")
+    if not isinstance(value["raw"], str) or not isinstance(value["records"], list):
+        raise ValueError("invalid accounting")
+    if not isinstance(job, str) or not re.fullmatch(r"[0-9]+", job):
+        raise ValueError("invalid accounting job identity")
+    expected = {f"{job}_{i}" for i in range(count)} if count else {str(job)}
+    rows = value["records"]
+    if (
+        len(rows) != len(expected)
+        or any(not isinstance(r, list) or len(r) != 5 for r in rows)
+        or {r[0] for r in rows} != expected
+    ):
+        raise ValueError("accounting cell set differs")
+    for row in rows:
+        if (
+            any(not isinstance(x, str) for x in row)
+            or row[1:3] != ["COMPLETED", "0:0"]
+            or not re.fullmatch(r"[0-9]+", row[3])
+            or "gres/gpu=1" not in row[4].split(",")
+        ):
+            raise ValueError("accounting status/allocation differs")
+    raw_rows = [line.split("|") for line in value["raw"].splitlines() if line.strip()]
+    bound = [r for r in raw_rows if r[0] in expected]
+    if sorted(bound) != sorted(rows):
+        raise ValueError("accounting raw/record binding differs")
+
+
+def validate_submission(receipt, m, stage):
+    exact_fields(
+        receipt,
+        ("job_id", "manifest_sha256", "stage", "count", "script_sha256"),
+        "submission",
+    )
+    if (
+        receipt["manifest_sha256"] != digest(m)
+        or receipt["stage"] != stage
+        or type(receipt["count"]) is not int
+        or receipt["count"] != len(cells(m["protocol"], stage))
+        or not isinstance(receipt["job_id"], str)
+        or not re.fullmatch(r"[0-9]+", receipt["job_id"])
+    ):
+        raise ValueError("submission identity/count differs")
+    require_sha256(receipt["script_sha256"], "submission script")
+
+
+def validate_stage_record(value, m, stage, job):
+    exact_fields(
+        value,
+        ("stage", "manifest_sha256", "accounting", "cell_markers"),
+        "stage aggregate",
+    )
+    expected = cells(m["protocol"], stage)
+    if value["stage"] != stage or value["manifest_sha256"] != digest(m):
+        raise ValueError("stage aggregate identity differs")
+    exact_fields(
+        value["cell_markers"], {str(c["index"]) for c in expected}, "stage cell markers"
+    )
+    for sha in value["cell_markers"].values():
+        require_sha256(sha, "stage cell marker")
+    validate_accounting(value["accounting"], job, len(expected))
+
+
+def validate_final_report(report, m):
+    """Strict final schema; finalize additionally reconstructs it from artifacts."""
+    exact_fields(
+        report,
+        (
+            "scope",
+            "tasks",
+            "cells",
+            "episodes",
+            "arm_task_iqm",
+            "contrasts",
+            "source_commit",
+            "manifest_sha256",
+            "artifact_verification",
+            "limitations",
+            "stages",
+            "records",
+            "training_results",
+            "runtime",
+        ),
+        "final report",
+    )
+    p = m["protocol"]
+    if (
+        not finite(report)
+        or report["source_commit"] != m["source_commit"]
+        or report["manifest_sha256"] != digest(m)
+        or report["scope"] != "fixed_three_task_two_contrast_replication"
+        or report["artifact_verification"]
+        != "all stage/cell hashes and bitwise evaluation replay verified"
+        or report["limitations"] != p["limitations"]
+        or report["tasks"] != p["tasks"]
+    ):
+        raise ValueError("final report identity differs")
+    expected = cells(p, "evaluation")
+    if (
+        type(report["cells"]) is not int
+        or report["cells"] != len(expected)
+        or type(report["episodes"]) is not int
+        or report["episodes"] != len(expected) * len(p["evaluation_environment_seeds"])
+        or not isinstance(report["records"], list)
+        or len(report["records"]) != len(expected)
+    ):
+        raise ValueError("final evaluation cell set differs")
+    for result, cell in zip(report["records"], expected):
+        validate_evaluation_result(
+            result, p, cell, legacy=m["source_commit"] in LEGACY_RESULT_COMMITS
+        )
+    expected_training = cells(p, "training")
+    if not isinstance(report["training_results"], list) or len(
+        report["training_results"]
+    ) != len(expected_training):
+        raise ValueError("final training cell set differs")
+    for result, cell in zip(report["training_results"], expected_training):
+        validate_training_result(result, cell=cell)
+    exact_fields(report["stages"], STAGES, "final stages")
+    exact_fields(
+        report["runtime"],
+        (
+            "allocation_gpu_seconds_by_stage",
+            "training_wall_seconds_by_cell",
+            "evaluation_by_cell",
+            "scope",
+        ),
+        "final runtime",
+    )
+    exact_fields(
+        report["runtime"]["allocation_gpu_seconds_by_stage"],
+        STAGES,
+        "final stage runtime",
+    )
+    exact_fields(
+        report["runtime"]["training_wall_seconds_by_cell"],
+        {str(c["index"]) for c in expected_training},
+        "final training runtime",
+    )
+    exact_fields(
+        report["runtime"]["evaluation_by_cell"],
+        {str(c["index"]) for c in expected},
+        "final evaluation runtime",
+    )
+    for stage in STAGES:
+        # No inferred job id is trusted independently: the raw/records bindings
+        # and stage_verify's authenticated submission are checked separately.
+        records = report["stages"][stage].get("accounting", {}).get("records", [])
+        if not records or not records[0] or not isinstance(records[0][0], str):
+            raise ValueError("missing final accounting")
+        validate_stage_record(
+            report["stages"][stage], m, stage, records[0][0].split("_")[0]
+        )
+        value = report["runtime"]["allocation_gpu_seconds_by_stage"][stage]
+        if type(value) is not int or value != sum(int(r[3]) for r in records):
+            raise ValueError("final allocation accounting differs")
+    from .mechanism_replication_analysis import analyze
+
+    analysis = analyze(report["records"], p)
+    for key in ("tasks", "cells", "episodes", "arm_task_iqm", "contrasts"):
+        if digest(report[key]) != digest(analysis[key]):
+            raise ValueError("final reconstructed analysis differs")
+    expected_training_times = {
+        str(r["cell"]["index"]): r["wall_seconds"] for r in report["training_results"]
+    }
+    if digest(report["runtime"]["training_wall_seconds_by_cell"]) != digest(
+        expected_training_times
+    ):
+        raise ValueError("final training timing binding differs")
+    for value in report["runtime"]["evaluation_by_cell"].values():
+        exact_fields(
+            value, ("role_wall_seconds", "controller_latency"), "final cell runtime"
+        )
+        exact_fields(
+            value["role_wall_seconds"], REPLAY_MODES, "final reader wall times"
+        )
+        for seconds in value["role_wall_seconds"].values():
+            require_number(seconds, "final reader wall time", minimum=0)
+        validate_timing(value["controller_latency"])
+    if (
+        report["runtime"]["scope"]
+        != "one_GPU_per_allocation; successful stage allocations; queue time excluded; process timings exclude shell seals"
+    ):
+        raise ValueError("final runtime scope differs")
 
 
 def stage_verify(root, stage):
     m = manifest(root)
     receipt = read(Path(root) / "submissions" / f"{stage}.json")
+    validate_submission(receipt, m, stage)
     expected = cells(m["protocol"], stage)
     acct = accounting(receipt["job_id"], len(expected))
     marks = {}
     for cell in expected:
         directory = cell_dir(root, stage, cell["index"])
-        mark = verify_files(root, directory)
-        if any(mark["cell"].get(k) != v for k, v in cell.items()):
-            raise ValueError("cell marker mismatch")
+        verify_files(root, directory)
         if stage == "preflight":
-            verify_training(m["protocol"], directory / "training", preflight=True)
-            for i in range(4):
+            training_result = verify_training(
+                m["protocol"], directory / "training", preflight=True
+            )
+            validate_training_result(training_result, cell=cell, preflight=True)
+            if training_result["runtime"] != read(directory / "result.json")["runtime"]:
+                raise ValueError("preflight training/runtime differs")
+            for i in range(len(m["protocol"]["arms"])):
                 verify_files(root, directory / f"arm-{i}")
                 arm_result = read(directory / f"arm-{i}" / "result.json")
                 if arm_result["checkpoint_sha256"] != b.file_sha256(
@@ -875,10 +1559,13 @@ def stage_verify(root, stage):
     result = dict(
         stage=stage, manifest_sha256=digest(m), accounting=acct, cell_markers=marks
     )
+    validate_stage_record(result, m, stage, receipt["job_id"])
     target = Path(root) / "verified" / f"{stage}.json"
     if target.exists():
-        if read(target)["cell_markers"] != marks:
-            raise ValueError("stage marker changed")
+        saved = read(target)
+        validate_stage_record(saved, m, stage, receipt["job_id"])
+        if digest(saved) != digest(result):
+            raise ValueError("stage aggregate changed")
     else:
         publish(target, result)
     print("MECHANISM_REPLICATION_STAGE_VERIFIED", stage, flush=True)
@@ -889,6 +1576,7 @@ def worker(root, stage, index):
     m = manifest(root)
     p = m["protocol"]
     receipt = read(Path(root) / "submissions" / f"{stage}.json")
+    validate_submission(receipt, m, stage)
     if str(receipt["job_id"]) != os.environ.get("SLURM_ARRAY_JOB_ID"):
         raise ValueError("worker scheduler identity differs")
     if digest(m) != receipt["manifest_sha256"]:
@@ -1072,16 +1760,12 @@ def finalize(root):
         runtime=runtime_summary,
     )
     if (root / "report.json").exists():
-        if read(root / "report.json") != report:
+        if digest(read(root / "report.json")) != digest(report):
             raise ValueError("existing final report differs")
     else:
         publish(root / "report.json", report)
         marker(root, root, {"stage": "final"}, ["report.json"])
-    final_marker = read(root / "verified.json")
-    if final_marker["manifest_sha256"] != digest(m) or final_marker["files"] != {
-        "report.json": b.file_sha256(root / "report.json")
-    }:
-        raise ValueError("final report binding differs")
+    verify_files(root, root)
     print("MECHANISM_REPLICATION_FINAL_VERIFIED", flush=True)
 
 

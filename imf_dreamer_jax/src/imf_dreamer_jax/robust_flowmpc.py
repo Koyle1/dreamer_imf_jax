@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from functools import partial
 import math
 from numbers import Real
-from typing import Callable, Literal, NamedTuple, TypeAlias
+from typing import Callable, Literal, Mapping, NamedTuple, TypeAlias
 
 import jax
 import jax.numpy as jnp
@@ -753,6 +753,56 @@ def evaluate_flowmpc_held_out_acceptance(
     return held_out_noise_acceptance(candidate, baseline, acceptance_config)
 
 
+def evaluate_executed_flowmpc_held_out_metrics(
+    proposal_actor: Params,
+    adaptation_start_actor: Params,
+    frozen_reference_actor: Params,
+    executed_actor: Params,
+    critic_params: Params,
+    world_model_params: Params,
+    initial_state: RSSMState,
+    current_observation: Array,
+    held_out_noises: Array,
+    dreamer_config: DreamerConfig,
+    rebrac_config: ReBRACConfig,
+    flowmpc_config: FlowMPCConfig,
+) -> dict[str, Array]:
+    """Score the final actor after acceptance AND the final trust projection.
+
+    These values share the held-out bank, but do not change acceptance. Raw
+    proposal, adaptation start and frozen reference are distinct comparators;
+    the executed gain is not the gain of a rejected or subsequently projected
+    candidate. Model bias is unchanged by independent Monte Carlo noise.
+    """
+
+    values = {}
+    for name, actor in (
+        ("proposal", proposal_actor),
+        ("adaptation_start", adaptation_start_actor),
+        ("reference", frozen_reference_actor),
+        ("executed", executed_actor),
+    ):
+        values[f"heldout_{name}_objective"] = flowmpc_objective(
+            actor,
+            critic_params,
+            world_model_params,
+            initial_state,
+            current_observation,
+            held_out_noises,
+            dreamer_config,
+            rebrac_config,
+            flowmpc_config,
+        ).objective
+    values["heldout_executed_improvement"] = (
+        values["heldout_executed_objective"]
+        - values["heldout_adaptation_start_objective"]
+    )
+    values["heldout_executed_reference_improvement"] = (
+        values["heldout_executed_objective"] - values["heldout_reference_objective"]
+    )
+    return values
+
+
 def apply_held_out_noise_fallback(
     candidate_actor: Params,
     adaptation_start_actor: Params,
@@ -1038,6 +1088,109 @@ def cem_action_sequence_search(
     )
 
 
+def feasible_first_order(metrics: Mapping[str, Array]) -> Array:
+    """Best-first stable lexicographic order, without mixing value and violation.
+
+    Feasible plans maximize the unpenalized objective. Infeasible plans first
+    minimize violation, then maximize objective on exact violation ties. The
+    original index breaks exact ties deterministically. Non-finite objectives
+    or violations cannot outrank finite candidates.
+    """
+
+    objective = jnp.asarray(metrics["objective"])
+    violation = jnp.asarray(metrics["violation"])
+    finite = jnp.isfinite(objective) & jnp.isfinite(violation)
+    feasible = jnp.asarray(metrics["feasible"], dtype=jnp.bool_) & finite
+    return jnp.lexsort(
+        (
+            jnp.arange(objective.shape[0]),
+            -jnp.where(jnp.isfinite(objective), objective, -jnp.inf),
+            jnp.where(feasible, 0.0, jnp.where(finite, violation, jnp.inf)),
+            ~feasible,
+        )
+    )
+
+
+def feasible_first_cem_action_sequence_search(
+    metrics_fn: Callable[[Array], Mapping[str, Array]],
+    domain: ActionSequenceDomain,
+    initial_proposal: ActionSequenceProposal,
+    standard_normal_proposals: Array,
+    config: CEMActionSequenceConfig,
+) -> dict[str, object]:
+    """CEM with structured value/feasibility, retaining all selected metrics.
+
+    Exactly ``2 + iterations * population`` sequence evaluations occur. Keeping
+    the evaluated metrics with each candidate avoids a post-search rescore that
+    could disagree numerically with the decision used for execution.
+    """
+
+    initial = make_action_sequence_proposal(initial_proposal.residuals, domain)
+    proposals = jnp.asarray(standard_normal_proposals, domain.reference_actions.dtype)
+    expected = (config.iterations, config.population, *domain.reference_actions.shape)
+    if proposals.shape != expected:
+        raise ValueError(f"standard_normal_proposals must have shape {expected}")
+    _require_eager_array_condition(
+        jnp.all(jnp.isfinite(proposals)), "standard_normal_proposals must be finite"
+    )
+    mean = initial.residuals
+    std = jnp.full_like(mean, config.initial_std)
+    initial_metrics = metrics_fn(domain.reference_actions + mean)
+    best_metrics = initial_metrics
+    best_residuals = mean
+
+    def retain(candidate_residuals, candidate_metrics, incumbent, incumbent_metrics):
+        pair = jax.tree_util.tree_map(
+            lambda old, new: jnp.stack((old, new)), incumbent_metrics, candidate_metrics
+        )
+        # An exact tie retains the incumbent (index zero).
+        better = feasible_first_order(pair)[0] == 1
+        return (
+            jnp.where(better, candidate_residuals, incumbent),
+            jax.tree_util.tree_map(
+                lambda old, new: jnp.where(better, new, old),
+                incumbent_metrics,
+                candidate_metrics,
+            ),
+        )
+
+    for index in range(config.iterations):
+        candidates = (
+            jnp.clip(
+                mean[None] + std[None] * proposals[index],
+                domain.residual_minimum[None],
+                domain.residual_maximum[None],
+            )
+            .at[0]
+            .set(mean)
+        )
+        metrics = jax.vmap(metrics_fn)(domain.reference_actions[None] + candidates)
+        order = feasible_first_order(metrics)
+        best_index = order[0]
+        best_residuals, best_metrics = retain(
+            candidates[best_index],
+            jax.tree_util.tree_map(lambda value: value[best_index], metrics),
+            best_residuals,
+            best_metrics,
+        )
+        elites = candidates[order[: config.elite_count]]
+        mean = make_action_sequence_proposal(jnp.mean(elites, axis=0), domain).residuals
+        std = jnp.clip(jnp.std(elites, axis=0), config.minimum_std, config.maximum_std)
+    final_metrics = metrics_fn(domain.reference_actions + mean)
+    best_residuals, best_metrics = retain(
+        mean, final_metrics, best_residuals, best_metrics
+    )
+    return {
+        "residuals": best_residuals,
+        "action_sequence": domain.reference_actions + best_residuals,
+        "initial_metrics": initial_metrics,
+        "final_metrics": best_metrics,
+        "evaluations": jnp.asarray(
+            2 + config.iterations * config.population, jnp.int32
+        ),
+    }
+
+
 def ensemble_relative_pessimism(
     candidate_member_objectives: Array,
     frozen_reference_member_objectives: Array,
@@ -1129,6 +1282,10 @@ jit_evaluate_flowmpc_held_out_acceptance = partial(
         "acceptance_config",
     ),
 )(evaluate_flowmpc_held_out_acceptance)
+jit_evaluate_executed_flowmpc_held_out_metrics = partial(
+    jax.jit,
+    static_argnames=("dreamer_config", "rebrac_config", "flowmpc_config"),
+)(evaluate_executed_flowmpc_held_out_metrics)
 jit_apply_held_out_noise_fallback = partial(jax.jit, static_argnames=("config",))(
     apply_held_out_noise_fallback
 )
@@ -1180,6 +1337,9 @@ __all__ = [
     "ensemble_relative_pessimism",
     "ensemble_relative_risk_score",
     "evaluate_flowmpc_held_out_acceptance",
+    "evaluate_executed_flowmpc_held_out_metrics",
+    "feasible_first_order",
+    "feasible_first_cem_action_sequence_search",
     "finish_actor_adaptation_step",
     "gradient_action_sequence_search",
     "held_out_noise_acceptance",
@@ -1191,6 +1351,7 @@ __all__ = [
     "jit_ensemble_relative_pessimism",
     "jit_ensemble_relative_risk_score",
     "jit_evaluate_flowmpc_held_out_acceptance",
+    "jit_evaluate_executed_flowmpc_held_out_metrics",
     "jit_finish_actor_adaptation_step",
     "jit_gradient_action_sequence_search",
     "jit_held_out_noise_acceptance",

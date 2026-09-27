@@ -5047,7 +5047,8 @@ def _run_flowmpc_arm(
         PersistenceConfig,
         ReferenceActorState,
         apply_held_out_noise_fallback,
-        evaluate_flowmpc_held_out_acceptance,
+        jit_evaluate_flowmpc_held_out_acceptance,
+        jit_evaluate_executed_flowmpc_held_out_metrics,
         init_reference_actor_state,
         jit_backtrack_actor_proposal,
         jit_finish_actor_adaptation_step,
@@ -5095,13 +5096,14 @@ def _run_flowmpc_arm(
             dreamer_config,
         )[0]
 
+    @jax.jit
     def select_actor(
         state: ReferenceActorState,
         belief: Any,
         current: Any,
         proposal_noises: Any,
         heldout_noises: Any,
-    ) -> tuple[ReferenceActorState, Any, dict[str, Any]]:
+    ) -> tuple[ReferenceActorState, Any, Any, dict[str, Any]]:
         adaptation_start = (
             state.carried_actor
             if persistence_config.mode == "persistent"
@@ -5134,9 +5136,10 @@ def _run_flowmpc_arm(
             backtracks = constrained.backtracks
             used_reference_fallback = constrained.used_reference_fallback
         acceptance_improvement = jnp.asarray(0.0, dtype=jnp.float32)
+        acceptance_candidate_objective = jnp.asarray(0.0, dtype=jnp.float32)
         accepted = jnp.asarray(True)
         if heldout_acceptance_enabled:
-            acceptance = evaluate_flowmpc_held_out_acceptance(
+            acceptance = jit_evaluate_flowmpc_held_out_acceptance(
                 selected,
                 adaptation_start,
                 state.frozen_reference_actor,
@@ -5158,6 +5161,7 @@ def _run_flowmpc_arm(
                 acceptance_config,
             )
             acceptance_improvement = acceptance.improvement
+            acceptance_candidate_objective = acceptance.candidate_objective
             accepted = acceptance.accepted
         # Acceptance can fall back to an already-carried persistent actor that
         # is infeasible at this new state. Re-project the actually selected
@@ -5216,8 +5220,26 @@ def _run_flowmpc_arm(
             "backtracks": backtracks,
             "used_reference_fallback": used_reference_fallback,
             "heldout_improvement": acceptance_improvement,
+            "heldout_candidate_objective": acceptance_candidate_objective,
             "accepted": accepted,
         }
+        if heldout_acceptance_enabled:
+            telemetry.update(
+                jit_evaluate_executed_flowmpc_held_out_metrics(
+                    update.actor,
+                    adaptation_start,
+                    state.frozen_reference_actor,
+                    selected,
+                    rebrac_state.critics,
+                    world_model,
+                    belief,
+                    current,
+                    heldout_noises,
+                    dreamer_config,
+                    rebrac_config,
+                    flow_config,
+                )
+            )
         return next_state, selected, update.actor, telemetry
 
     world_digest = benchmark._tree_digest(world_model)
@@ -5237,9 +5259,19 @@ def _run_flowmpc_arm(
         "backtracks",
         "used_reference_fallback",
         "heldout_improvement",
+        "heldout_candidate_objective",
         "accepted",
         "within_reference_budgets",
     )
+    if heldout_acceptance_enabled:
+        sequence_names += (
+            "heldout_proposal_objective",
+            "heldout_adaptation_start_objective",
+            "heldout_reference_objective",
+            "heldout_executed_objective",
+            "heldout_executed_improvement",
+            "heldout_executed_reference_improvement",
+        )
     sequences: dict[str, list[np.ndarray]] = {name: [] for name in sequence_names}
     imagined_points: dict[str, list[np.ndarray]] = {
         f"{scope}_{kind}": []

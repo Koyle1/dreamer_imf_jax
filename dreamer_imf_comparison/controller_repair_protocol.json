@@ -1,0 +1,95 @@
+{
+  "schema": "imf-controller-repair-v1",
+  "status": "frozen_before_new_execution",
+  "preregistered": false,
+  "scope": "exploratory_frozen_checkpoint_diagnosis_and_paired_repaired_control",
+  "dependency_commit": "b7e22a5ae4e7d8473624908283f683e0b9b1280a",
+  "dependency_manifest_sha256": "a2b8301649515e2e47bea1b8ff53e01f46c1ff9d54ef2b569aedb29533fecc15",
+  "dependency_report_file_sha256": "1aa21b28150ca73aa91d3fd650fd40c386a4dde521c88b169f624e387a70f1ea",
+  "tasks": ["dmc_reacher_hard", "dmc_cartpole_swingup", "dmc_finger_spin"],
+  "world_model_seeds": [431, 433, 439],
+  "nested_actor_seeds": [541, 547],
+  "arms": ["B0_frozen_rebrac", "A1_compiled_trust", "A3_compiled_acceptance", "K0_repaired_recursive", "K1_repaired_direct"],
+  "evaluation_environment_seeds": [78001, 78007, 78013],
+  "evaluation_episodes_per_cell": 3,
+  "maximum_environment_steps": 1000,
+  "expected_evaluation_cells": 90,
+  "action_repeat": 1,
+  "controller": {
+    "horizon": 5,
+    "flowmpc_step_size": 0.000005,
+    "flowmpc_particles": 4096,
+    "action_sequence_particles": 64,
+    "action_sequence_objective_evaluations": 10,
+    "action_sequence_residual_limit": 0.1,
+    "heldout_minimum_improvement": 0,
+    "trust_anchor_mse_sum_budget": 0.01,
+    "trust_current_linf_budget": 0.1
+  },
+  "diagnostics": {
+    "actor_seed": 541,
+    "calibration_environment_seeds": [76001],
+    "validation_environment_seeds": [76003],
+    "snapshot_steps": [25, 100, 300, 600],
+    "maximum_episode_steps": 1000,
+    "horizon": 5,
+    "direction_scales": [0.025, 0.05, 0.1],
+    "families": ["recursive", "direct"],
+    "reference_modes": ["latent", "endpoint"]
+  },
+  "preflight": {
+    "diagnostic_snapshot_steps": [0],
+    "diagnostic_environment_seeds": [75901],
+    "diagnostic_continuation_steps": 12,
+    "evaluation_seeds": [75901],
+    "evaluation_steps": 12
+  },
+  "selection": {
+    "scope": "one_reference_mode_per_endpoint_family_shared_across_tasks",
+    "default_reference_mode": "latent",
+    "calibration_latent_infeasible_fraction_at_least": 0.5,
+    "calibration_feasibility_improvement_at_least": 0.1,
+    "validation_feasibility_improvement_at_least": 0.1,
+    "validation_real_executed_gain_improvement_strictly_above": 0.0,
+    "validation_tasks_with_positive_gain_improvement_at_least": 2,
+    "otherwise": "keep_bug_fixed_latent_reference_and_report_unresolved_mechanism",
+    "no_reward_critic_or_world_training_without_a_separately_frozen_evidence_justified_protocol": true,
+    "final_evaluation_seeds_never_read_for_selection": true
+  },
+  "contrasts": [
+    {"id": "A1_minus_frozen", "candidate": "A1_compiled_trust", "baseline": "B0_frozen_rebrac"},
+    {"id": "A3_minus_frozen", "candidate": "A3_compiled_acceptance", "baseline": "B0_frozen_rebrac"},
+    {"id": "K0_minus_frozen", "candidate": "K0_repaired_recursive", "baseline": "B0_frozen_rebrac"},
+    {"id": "K1_minus_frozen", "candidate": "K1_repaired_direct", "baseline": "B0_frozen_rebrac"}
+  ],
+  "uncertainty": {
+    "method": "paired_world_seed_cluster_bootstrap_stratified_by_fixed_task",
+    "resamples": 20000,
+    "seed": 78103,
+    "interval_level_per_contrast": 0.9875,
+    "multiplicity": "Bonferroni_four_primary_contrasts_familywise_alpha_0.05"
+  },
+  "execution": {
+    "gpu_partition": "gpu-l40s",
+    "gpu_type": "l40s",
+    "array_concurrency": 4,
+    "cpus": 8,
+    "memory_gb": 64,
+    "time_limit": "04:00:00",
+    "exact_replay_required": true,
+    "stages": ["preflight", "diagnostics", "evaluation"],
+    "processes": ["primer", "create", "replay"],
+    "new_job_index_cache": true,
+    "no_automatic_retry_or_overwrite": true
+  },
+  "limitations": [
+    "Exploratory follow-up designed after observing the prior study; not new independent model-training replication.",
+    "Three top-level world-model seeds per fixed task; actors, episodes and snapshot plans are nested and are not extra independent trained models.",
+    "Contemporaneous repaired arms versus frozen ReBRAC; old outcome traces are not controls and this does not isolate each software repair's return effect.",
+    "Same-model noise acceptance is not a calibrated model-bias certificate.",
+    "Real terminal targets are finite native-episode frozen-ReBRAC continuations, not an oracle infinite-horizon optimal Q.",
+    "Reference-mode selection uses separate calibration/validation environments; final seeds remain reserved, but diagnostics do not prove generalization.",
+    "Sparse rewards may leave ranking and directional changes uninformative; ties and zero-event samples must be reported.",
+    "Do not promote a negative or uncertain result, and do not start unrelated studies."
+  ]
+}

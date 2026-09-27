@@ -109,15 +109,30 @@ def test_historical_default_unchanged_and_task_parameterized():
 
 
 def test_artifact_digest_tamper(tmp_path):
-    manifest = {"source_commit": "abc"}
-    m.publish(tmp_path / "result.json", {"value": 1})
+    p = protocol()
+    manifest = {"source_commit": "abc", "protocol": p}
+    directory = tmp_path / "preflight/000"
+    cell = m.cells(p, "preflight")[0]
+    runtime = dict(
+        python="3.12",
+        jax="0.8",
+        jaxlib="0.8",
+        numpy="2",
+        mujoco="3",
+        dm_control="1",
+        devices=["NVIDIA L40S"],
+        x64=False,
+    )
+    m.publish(
+        directory / "result.json", dict(cell=cell, runtime=runtime, status="passed")
+    )
     with patch.object(m, "manifest", return_value=manifest):
-        m.marker(tmp_path, tmp_path, {"index": 0}, ["result.json"])
-        m.verify_files(tmp_path, tmp_path)
+        m.marker(tmp_path, directory, cell, ["result.json"])
+        m.verify_files(tmp_path, directory)
         # Test fixture corruption, not production evidence.
-        (tmp_path / "result.json").write_text(json.dumps({"value": 2}))
+        (directory / "result.json").write_text(json.dumps({"value": 2}))
         with pytest.raises(ValueError):
-            m.verify_files(tmp_path, tmp_path)
+            m.verify_files(tmp_path, directory)
 
 
 @pytest.mark.parametrize(
@@ -159,6 +174,8 @@ def test_training_numerical_smoke(tmp_path, monkeypatch):
 
     monkeypatch.setattr(roadmap, "FLOWMPC_PARTICLES", 4)
     monkeypatch.setattr(roadmap, "ACTION_SEQUENCE_PARTICLES", 4)
+    p["controller"]["flowmpc_particles"] = 4
+    p["controller"]["action_sequence_particles"] = 4
     p["preflight"]["evaluation_steps"] = 2
     for arm in p["arms"]:
         core, trace, _ = m.evaluate(
