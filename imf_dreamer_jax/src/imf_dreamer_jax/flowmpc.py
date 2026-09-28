@@ -50,6 +50,7 @@ class ReBRACConfig:
     policy_frequency: int = 2
     normalize_q: bool = True
     batch_size: int = 1024
+    q_scale_floor: float = 1e-8
 
     def __post_init__(self) -> None:
         for name in ("state_dim", "action_dim", "hidden_dim", "hidden_layers"):
@@ -57,7 +58,9 @@ class ReBRACConfig:
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
         if self.hidden_layers != 3:
-            raise ValueError("the paper-faithful ReBRAC network has three hidden layers")
+            raise ValueError(
+                "the paper-faithful ReBRAC network has three hidden layers"
+            )
         if self.batch_size != 1024:
             raise ValueError("the paper-faithful ReBRAC batch size is 1024")
         if self.policy_frequency != 2:
@@ -75,6 +78,8 @@ class ReBRACConfig:
                 raise ValueError(f"{name} must be finite and nonnegative")
         if self.actor_learning_rate <= 0.0 or self.critic_learning_rate <= 0.0:
             raise ValueError("learning rates must be positive")
+        if not math.isfinite(self.q_scale_floor) or self.q_scale_floor <= 0.0:
+            raise ValueError("q_scale_floor must be finite and positive")
         if not 0.0 <= self.discount <= 1.0:
             raise ValueError("discount must be in [0, 1]")
         if not 0.0 < self.target_update_rate <= 1.0:
@@ -200,14 +205,10 @@ def _init_rebrac_network(
     width = input_dim
     for index in range(hidden_layers):
         layers.append(
-            _init_hidden_layer(
-                keys[index], width, hidden_dim, layer_norm=layer_norm
-            )
+            _init_hidden_layer(keys[index], width, hidden_dim, layer_norm=layer_norm)
         )
         width = hidden_dim
-    output = _init_output_layer(
-        keys[-1], width, output_dim, bound=output_bound
-    )
+    output = _init_output_layer(keys[-1], width, output_dim, bound=output_bound)
     return {"hidden": tuple(layers), "output": output}
 
 
@@ -331,7 +332,7 @@ def rebrac_actor_loss(
     q_scale = jnp.asarray(1.0, dtype=q_values.dtype)
     if config.normalize_q:
         q_scale = jax.lax.stop_gradient(
-            1.0 / jnp.mean(jnp.abs(q_values))
+            1.0 / jnp.maximum(jnp.mean(jnp.abs(q_values)), config.q_scale_floor)
         )
     loss = jnp.mean(config.actor_bc_coefficient * bc_penalty - q_scale * q_values)
     return loss, (jnp.mean(q_values), jnp.mean(bc_penalty), q_scale)
@@ -549,8 +550,12 @@ def flowmpc_objective(
         raise ValueError("ReBRAC and world-model action dimensions differ")
     particles = flowmpc_config.particles
     state = RSSMState(
-        jnp.broadcast_to(initial_state.deterministic, (particles, dreamer_config.deterministic_dim)),
-        jnp.broadcast_to(initial_state.stochastic, (particles, dreamer_config.stochastic_dim)),
+        jnp.broadcast_to(
+            initial_state.deterministic, (particles, dreamer_config.deterministic_dim)
+        ),
+        jnp.broadcast_to(
+            initial_state.stochastic, (particles, dreamer_config.stochastic_dim)
+        ),
     )
     observation = jnp.broadcast_to(
         current_observation, (particles, *dreamer_config.observation_shape)
@@ -599,7 +604,7 @@ def flowmpc_objective(
     )
     per_particle_stage = jnp.sum(rewards * discounts[None], axis=1)
     stage_return = jnp.mean(per_particle_stage)
-    terminal_value = (flowmpc_config.discount ** flowmpc_config.horizon) * jnp.mean(
+    terminal_value = (flowmpc_config.discount**flowmpc_config.horizon) * jnp.mean(
         terminal_q
     )
     return FlowMPCObjective(
@@ -638,6 +643,7 @@ def flowmpc_adapt_actor(
     )
     gradient_norm = jnp.asarray(0.0, dtype=before.objective.dtype)
     for _ in range(flowmpc_config.inner_steps):
+
         def objective(params: Params) -> Array:
             return flowmpc_objective(
                 params,
@@ -688,9 +694,9 @@ def flowmpc_adapt_actor(
 
 
 jit_rebrac_update = partial(jax.jit, static_argnames=("config",))(rebrac_update)
-jit_train_rebrac_chunk = partial(
-    jax.jit, static_argnames=("updates", "config")
-)(train_rebrac_chunk)
+jit_train_rebrac_chunk = partial(jax.jit, static_argnames=("updates", "config"))(
+    train_rebrac_chunk
+)
 jit_flowmpc_objective = partial(
     jax.jit,
     static_argnames=("dreamer_config", "rebrac_config", "flowmpc_config"),
