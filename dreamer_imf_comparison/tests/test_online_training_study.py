@@ -32,6 +32,11 @@ def records(protocol):
 
 
 def test_cell_matrix_and_training_pair_indices(protocol):
+    assert protocol["execution"]["time_limits"] == {
+        "preflight": "01:00:00",
+        "training": "24:00:00",
+        "evaluation": "02:00:00",
+    }
     assert len(study.cells(protocol, "preflight")) == 1
     training = study.cells(protocol, "training")
     evaluation = study.cells(protocol, "evaluation")

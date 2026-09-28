@@ -1079,7 +1079,7 @@ def launch(root, stage):
         f"--gres=gpu:{e['gpu_type']}:1",
         f"--cpus-per-task={e['cpus']}",
         f"--mem={e['memory_gb']}G",
-        f"--time={e['time_limit']}",
+        f"--time={e['time_limits'][stage]}",
         f"--array=0-{count-1}%{e['concurrency']}",
         f"--job-name=imf-online-{stage}",
         f"--output={root}/logs/{stage}-%A_%a.out",

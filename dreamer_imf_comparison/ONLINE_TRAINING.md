@@ -76,7 +76,9 @@ python -m dreamer_imf_compare.online_training_study finalize --root <root>
 ```
 
 Each launch authenticates its previous complete stage against terminal Slurm
-accounting. Intent/receipt/release records prevent duplicate submission. A
-failed stage is a stop condition requiring diagnosis, not a reason to weaken
+accounting. Intent/receipt/release records prevent duplicate submission.
+Preflight requests one hour, training requests 24 hours per cell, and evaluation
+requests two hours per cell; the short stages do not inherit a full-day allocation.
+A failed stage is a stop condition requiring diagnosis, not a reason to weaken
 validation. Completion requires `ONLINE_BENCHMARK_FINAL_VERIFIED` and independent
 report/manifest validation. No benchmark improvement is assumed in advance.

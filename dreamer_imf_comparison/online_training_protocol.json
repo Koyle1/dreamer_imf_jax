@@ -37,7 +37,11 @@
     "concurrency": 3,
     "cpus": 8,
     "memory_gb": 64,
-    "time_limit": "24:00:00"
+    "time_limits": {
+      "preflight": "01:00:00",
+      "training": "24:00:00",
+      "evaluation": "02:00:00"
+    }
   },
   "semantics": {
     "start": "existing_weights_fresh_world_reward_optimizers_retained_rebrac_state",
