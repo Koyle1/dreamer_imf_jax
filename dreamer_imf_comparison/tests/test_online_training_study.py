@@ -56,6 +56,20 @@ def test_cell_matrix_and_training_pair_indices(protocol):
         study.cells(protocol, "not-a-stage")
 
 
+def test_extended_native_step_budget_and_update_counts(protocol):
+    assert protocol["training_steps"] == 500000
+    assert protocol["episode_steps"] == 1000
+    epochs, remainder = divmod(protocol["training_steps"], protocol["episode_steps"])
+    assert remainder == 0 and epochs == 500
+    assert protocol["evaluation_steps"] == list(range(0, 500001, 100000))
+    for kind in ("world", "reward", "policy"):
+        assert epochs * protocol[f"{kind}_updates_per_episode"] == 125000
+    positive_steps = {
+        c["steps"] for c in study.cells(protocol, "evaluation") if c["arm"] != "F"
+    }
+    assert positive_steps == set(protocol["evaluation_steps"][1:])
+
+
 def test_paired_world_seed_contrasts_and_learning_area(protocol):
     data = records(protocol)
     summary = study.summarize(data[::-1], protocol)
@@ -79,9 +93,9 @@ def test_training_seeds_are_reproducible_disjoint_and_arm_paired(protocol, monke
     values = [
         study.training_seed(protocol, w, ep)
         for w in protocol["world_model_seeds"]
-        for ep in range(1, 101)
+        for ep in range(1, protocol["training_steps"] // protocol["episode_steps"] + 1)
     ]
-    assert len(set(values)) == 300
+    assert len(set(values)) == 1500
     assert not set(values) & set(
         protocol["evaluation_seeds"] + [protocol["preflight_seed"]]
     )

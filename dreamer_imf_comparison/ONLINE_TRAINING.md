@@ -15,7 +15,7 @@ Reacher-hard, three existing world-model seeds (431, 433, 439), actor seed 541:
 | P | ReBRAC actor and critic | Same A1, fixed world and reward models |
 | M | World, scalar reward head, ReBRAC actor and critic | Same A1 |
 
-Each P/M cell collects 100,000 additional native environment steps. Parameters
+Each P/M cell collects 500,000 additional native environment steps. Parameters
 are fixed within each 1,000-step episode. At the boundary, P performs 250
 ReBRAC updates; M additionally performs 250 world and 250 reward updates.
 Both sample half original training replay and half newly collected replay.
@@ -39,7 +39,7 @@ the released objective. Sparse random exploration may still be insufficient.
 
 Every completed training epoch archives its complete learner, shifted episode,
 controller trace, numeric checks, exact update clocks, parameter ancestry and
-SHA-256 marker. Evaluation snapshots at 20k/40k/60k/80k/100k must equal the
+SHA-256 marker. Evaluation snapshots at 100k/200k/300k/400k/500k must equal the
 exported archived learner. Completed epochs can be read on restart; an unsealed
 partial epoch is never overwritten, and submission is not automatically retried.
 
@@ -57,6 +57,28 @@ reports all paired P-F/M-F/M-P final deltas and fixed-grid learning curves, and
 does not select a best checkpoint. Five episodes are nested observations, not
 15 independent trained models. It includes controller diagnostics, reward
 coverage, exact update budgets, measured phase timings and Slurm accounting.
+
+## 500k budget and published DreamerV3 reference
+
+This budget-only successor starts afresh from the same authenticated offline
+dependency, not the completed online study. The completed 100k run at commit
+`ec24278c419d24670309b8947785d87095ec6752` remains immutable. Each training
+cell now has 500 archived episodes and 125,000 policy updates; M additionally
+has 125,000 world and 125,000 reward updates. Seeds, learning rates, update
+ratios, controller, exploration and replay mixture are unchanged. The same six
+training and 33 evaluation cells are used; no best checkpoint is selected.
+
+[DreamerV3 arXiv v2](https://arxiv.org/pdf/2301.04104v2), Table 2,
+specifies 500k environment steps and action repeat 2 for proprioceptive control.
+Its environment-step convention counts before action repeat (the same table
+lists Atari100K as 400k steps with repeat 4). Table 11 reports Reacher Hard
+return **938**. We match the 500k additional native-step budget, but retain our
+native repeat 1: 500k decisions versus Dreamer's 250k. We also retain offline
+pretraining, our own learner/update ratio and controller. Thus this is a
+published reference, not a matched DreamerV3 reproduction or equal-total-data
+comparison. A separately trained Dreamer baseline is not part of this run.
+Compare our fresh 100k and 500k checkpoints within this study; historical 100k
+results are descriptive context, not evidence reused in the new run.
 
 ## Commands (exact clean deployed commit only)
 
