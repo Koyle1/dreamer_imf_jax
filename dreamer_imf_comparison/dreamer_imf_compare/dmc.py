@@ -85,6 +85,7 @@ class Step:
     reward: float
     continuation: float
     is_last: bool
+    native_steps: int = 1
 
 
 @dataclass(frozen=True)
@@ -107,8 +108,12 @@ class DMCAdapter:
     """Native-termination proprioceptive DMC with normalized actions."""
 
     def __init__(self, task: str, *, seed: int, action_repeat: int = 1) -> None:
-        if action_repeat <= 0:
-            raise ValueError("action_repeat must be positive")
+        if (
+            isinstance(action_repeat, bool)
+            or not isinstance(action_repeat, int)
+            or action_repeat <= 0
+        ):
+            raise ValueError("action_repeat must be a positive integer")
         # This comparison is proprioceptive. Disabling OpenGL prevents GLFW
         # from requiring the macOS main thread and removes rendering overhead.
         os.environ.setdefault("MUJOCO_GL", "disable")
@@ -125,7 +130,10 @@ class DMCAdapter:
             raise ValueError("comparison requires a flat continuous action space")
         observation_spec = self._environment.observation_spec()
         self.observation_shape = (
-            sum(int(np.prod(observation_spec[name].shape)) for name in sorted(observation_spec)),
+            sum(
+                int(np.prod(observation_spec[name].shape))
+                for name in sorted(observation_spec)
+            ),
         )
 
     @property
@@ -149,10 +157,14 @@ class DMCAdapter:
         reward = 0.0
         continuation = 1.0
         time_step = None
+        native_steps = 0
         for _ in range(self.action_repeat):
             time_step = self._environment.step(native_action)
+            native_steps += 1
             reward += float(time_step.reward or 0.0)
-            continuation *= float(1.0 if time_step.discount is None else time_step.discount)
+            continuation *= float(
+                1.0 if time_step.discount is None else time_step.discount
+            )
             if time_step.last():
                 break
         assert time_step is not None
@@ -161,6 +173,7 @@ class DMCAdapter:
             reward,
             continuation,
             bool(time_step.last()),
+            native_steps,
         )
 
     def snapshot(self) -> DMCSnapshot:
@@ -181,7 +194,9 @@ class DMCAdapter:
     def restore(self, snapshot: DMCSnapshot) -> None:
         """Restore an exact snapshot captured from this adapter."""
 
-        if not isinstance(snapshot, DMCSnapshot) or snapshot.adapter_identity != id(self):
+        if not isinstance(snapshot, DMCSnapshot) or snapshot.adapter_identity != id(
+            self
+        ):
             raise ValueError("DMC snapshot belongs to a different adapter")
         physics = self._environment.physics
         with physics.reset_context():

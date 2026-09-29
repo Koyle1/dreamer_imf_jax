@@ -198,3 +198,110 @@ def test_matches_existing_a1_rollout(setup, monkeypatch):
         "parameter_delta",
     ):
         np.testing.assert_allclose(actual[name], reference[name], rtol=1e-5, atol=1e-7)
+
+
+def test_random_prefill_partial_repeat_accounting_without_model(setup, monkeypatch):
+    collector, _ = setup
+
+    class PartialRepeat(TinyEnvironment):
+        def __init__(self, task, *, seed, action_repeat):
+            assert action_repeat == 2
+            self.actions, self.closed = [], False
+            self.instances.append(self)
+
+        def step(self, action):
+            transition = super().step(action)
+            return Step(
+                transition.observation,
+                transition.reward,
+                transition.continuation,
+                transition.is_last,
+                1 if transition.is_last else 2,
+            )
+
+    def forbidden(*args):
+        raise AssertionError("random prefill must not call model")
+
+    monkeypatch.setattr(oc, "DMCAdapter", PartialRepeat)
+    monkeypatch.setattr(collector, "observe", forbidden)
+    monkeypatch.setattr(collector, "select", forbidden)
+    kwargs = dict(training=True, random_policy=True, action_repeat=2, maximum_steps=9)
+    episode, trace, metrics = collector.rollout({}, 541, 431, 91, **kwargs)
+    _, repeat, _ = collector.rollout({}, 541, 431, 91, **kwargs)
+    _, other, _ = collector.rollout({}, 541, 431, 92, **kwargs)
+    np.testing.assert_array_equal(trace["native_steps"], [[2, 1]])
+    assert metrics["native_steps"] == 3 and metrics["decision_steps"] == 2
+    assert metrics["discarded_compile_warmup_steps"] == 0
+    np.testing.assert_array_equal(trace["actions"], trace["clean_actions"])
+    np.testing.assert_array_equal(trace["actions"], repeat["actions"])
+    assert not np.array_equal(trace["actions"], other["actions"])
+    assert (np.abs(trace["actions"]) <= 1).all()
+    assert not trace["gradient_norm"].any()
+    assert not trace["parameter_delta"].any()
+    np.testing.assert_array_equal(episode["actions"][0, 1:], trace["actions"][0])
+    assert PartialRepeat.instances[-1].closed
+
+
+def test_real_dmc_repeat_two_matches_native_reward_and_termination():
+    from dreamer_imf_compare.dmc import DMCAdapter
+
+    native = DMCAdapter("dmc_reacher_hard", seed=17, action_repeat=1)
+    repeated = DMCAdapter("dmc_reacher_hard", seed=17, action_repeat=2)
+    try:
+        np.testing.assert_array_equal(native.reset(), repeated.reset())
+        native_count = 0
+        for decision in range(500):
+            action = np.asarray([np.sin(decision), np.cos(decision)], np.float32)
+            first, second = native.step(action), native.step(action)
+            result = repeated.step(action)
+            native_count += result.native_steps
+            assert result.native_steps == 2
+            assert result.reward == first.reward + second.reward
+            assert result.continuation == first.continuation * second.continuation
+            assert result.is_last == second.is_last == (decision == 499)
+            np.testing.assert_array_equal(result.observation, second.observation)
+        assert native_count == 1000
+    finally:
+        native.close()
+        repeated.close()
+
+
+def test_adapter_stops_partial_repeat_at_native_terminal():
+    from types import SimpleNamespace
+    from dreamer_imf_compare.dmc import DMCAdapter
+
+    class TerminalEnvironment:
+        calls = 0
+
+        def step(self, action):
+            self.calls += 1
+            assert self.calls == 1, "must not step after terminal boundary"
+            return SimpleNamespace(
+                observation={"x": np.asarray([2.0])},
+                reward=0.75,
+                discount=0.0,
+                last=lambda: True,
+            )
+
+    adapter = object.__new__(DMCAdapter)
+    adapter.action_repeat = 2
+    adapter.action_shape = (1,)
+    adapter._action_spec = SimpleNamespace(minimum=[-1.0], maximum=[1.0])
+    adapter._environment = TerminalEnvironment()
+    result = adapter.step(np.asarray([0.2], np.float32))
+    assert result.native_steps == 1
+    assert result.reward == 0.75 and result.continuation == 0.0 and result.is_last
+    assert adapter._environment.calls == 1
+
+
+@pytest.mark.parametrize("repeat", [0, -1, True, 1.5])
+def test_invalid_repeat_and_eval_random_are_rejected(setup, repeat):
+    collector, model = setup
+    with pytest.raises(ValueError, match="action_repeat"):
+        collector.rollout(model, 541, 431, 1, action_repeat=repeat)
+    with pytest.raises(ValueError, match="only permitted for training"):
+        collector.rollout({}, 541, 431, 1, random_policy=True)
+    with pytest.raises(ValueError, match="uniform exploration"):
+        collector.rollout(
+            {}, 541, 431, 1, random_policy=True, training=True, exploration_std=0.1
+        )

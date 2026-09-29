@@ -1,0 +1,58 @@
+{
+  "schema": "trajectory-imf-scratch-online-v1",
+  "task": "dmc_reacher_hard",
+  "world_model_seeds": [431, 433, 439],
+  "actor_seed": 541,
+  "anchor_count": 256,
+  "reward_hidden_dim": 512,
+  "training_native_steps": 500000,
+  "action_repeat": 2,
+  "episode_native_steps": 1000,
+  "prefill_native_steps": 5000,
+  "updates_per_episode": 250,
+  "batch_size": 16,
+  "sequence_length": 32,
+  "exploration_std": 0.1,
+  "evaluation_native_steps": [100000, 200000, 300000, 400000, 500000],
+  "evaluation_seeds": [99001, 99013, 99017, 99041, 99053],
+  "training_seed_namespace": "scratch-imf-online-20260929",
+  "preflight_seed": 99101,
+  "preflight_decisions": 48,
+  "preflight_updates": 2,
+  "world_model_template": {
+    "observation_shape": [6], "action_dim": 2,
+    "deterministic_dim": 128, "stochastic_dim": 32,
+    "embedding_dim": 128, "hidden_dim": 256,
+    "prior": "imf", "prior_scale": 0.25,
+    "imf_trajectory_enabled": true, "imf_boundary_velocity_supervision": true,
+    "burn_in": 8, "overshooting_scale": 0.0, "overshooting_distances": [1],
+    "imagination_horizon": 15, "imagination_start_mode": "one_per_sequence",
+    "critic_bins": 51, "reward_loss": "mse", "reward_prediction_horizon": 0
+  },
+  "rebrac_config": {"state_dim": 6, "action_dim": 2},
+  "controller": {
+    "horizon": 5, "flowmpc_particles": 4096, "flowmpc_step_size": 0.000005,
+    "trust_anchor_mse_sum_budget": 0.01, "trust_current_linf_budget": 0.1
+  },
+  "execution": {
+    "partition": "gpu-l40s", "gpu_type": "l40s", "account": "dep_inin_dat",
+    "concurrency": 3, "cpus": 8, "memory_gb": 64,
+    "time_limits": {"preflight": "01:00:00", "training": "08:00:00", "evaluation": "02:00:00"}
+  },
+  "published_reference": {
+    "algorithm": "DreamerV3", "source": "https://arxiv.org/pdf/2301.04104v2",
+    "budget_table": 2, "score_table": 11, "task": "Reacher Hard",
+    "native_steps": 500000, "action_repeat": 2, "reported_return": 938
+  },
+  "semantics": {
+    "initialization": "random_all_networks_zero_optimizer_clocks_no_checkpoint_dependency",
+    "replay": "only_new_training_episodes_including_counted_random_prefill",
+    "statistics": "prefill_only_reward_normalization_and_fixed_trust_anchors",
+    "prefill": "uniform_actions_no_learner_updates_until_all_prefill_collected_then_catch_up",
+    "updates": "world_reward_critic_125000_each_actor_delayed_every_two_critic_updates",
+    "controller": "existing_A1_persistent_trust_ReBRAC_plus_trajectory_iMF",
+    "comparison": "published_reference_not_Dreamer_algorithm_architecture_or_compute_reproduction",
+    "statistical_unit": "three_independent_training_seeds_five_evaluation_episodes_nested",
+    "selection": "fixed_checkpoints_no_best_checkpoint_selection"
+  }
+}

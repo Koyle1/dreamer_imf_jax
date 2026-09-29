@@ -55,6 +55,48 @@ def equal(a, b):
     return at == bt and all(np.array_equal(x, y) for x, y in zip(aa, bb))
 
 
+def test_online_only_batches_and_updates(model):
+    new = ol._episodes(online(), offline=False)
+    batch = ol._sequence_batch(None, new, np.random.default_rng(1), 16, 2, 1)
+    assert batch["observations"].shape[0] == 16
+    assert np.min(batch["observations"]) >= 100
+    data = ol._dataset(new)
+    pb = ol._policy_batch(None, data, np.random.default_rng(1), 1024)
+    assert pb.states.shape == (1024, 1)
+    assert np.min(pb.states) >= 100
+    initial = ol.initialize(model, 541)
+    updated, metrics = ol.update(
+        initial,
+        None,
+        [online()],
+        full_model=True,
+        seed=3,
+        world_updates=1,
+        policy_updates=1,
+        batch_size=2,
+        sequence_length=2,
+    )
+    assert metrics["offline_fraction"] == 0
+    assert (
+        metrics["world_updates"]
+        == metrics["reward_updates"]
+        == metrics["policy_updates"]
+        == 1
+    )
+    assert not equal(initial["world"], updated["world"])
+    contaminated = {**online(), "training": False}
+    with pytest.raises(ValueError, match="evaluation replay"):
+        ol.update(
+            initial,
+            None,
+            [contaminated],
+            full_model=False,
+            seed=3,
+            world_updates=0,
+            policy_updates=0,
+        )
+
+
 @pytest.fixture(scope="module")
 def model():
     cfg = DreamerConfig(

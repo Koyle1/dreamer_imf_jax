@@ -134,8 +134,9 @@ def _sequence_batch(offline, online, rng, batch_size, sequence_length, burn_in):
     context = max(1, burn_in)
     width = context + sequence_length
     rows = []
-    for source in (offline, online):
-        for _ in range(batch_size // 2):
+    sources = (online,) if offline is None else (offline, online)
+    for source in sources:
+        for _ in range(batch_size // len(sources)):
             ep = source[int(rng.integers(len(source)))]
             # Production episodes provide exactly sequence_length loss tokens;
             # only short preflight/early-terminal episodes require masked tails.
@@ -158,11 +159,12 @@ def _sequence_batch(offline, online, rng, batch_size, sequence_length, burn_in):
 
 def _policy_batch(offline, online, rng, size):
     pieces = []
-    for source in (offline, online):
-        ids = rng.integers(source.states.shape[0], size=size // 2)
+    sources = (online,) if offline is None else (offline, online)
+    for source in sources:
+        ids = rng.integers(source.states.shape[0], size=size // len(sources))
         pieces.append([v[ids] for v in source])
     return ReBRACDataset(
-        *(jnp.asarray(np.concatenate((a, b))) for a, b in zip(*pieces))
+        *(jnp.asarray(np.concatenate(columns)) for columns in zip(*pieces))
     )
 
 
@@ -178,7 +180,7 @@ def update(
     batch_size=16,
     sequence_length=32,
 ):
-    """Apply 50/50 replay updates; only constant-size batches enter JIT code."""
+    """Use online-only replay if offline=None, otherwise explicit 50/50 replay."""
     for name, value in (
         ("world_updates", world_updates),
         ("policy_updates", policy_updates),
@@ -189,7 +191,8 @@ def update(
         raise ValueError(
             "positive sequence length and positive even batch size required"
         )
-    old, new = _episodes(offline, offline=True), _episodes(online, offline=False)
+    old = None if offline is None else _episodes(offline, offline=True)
+    new = _episodes(online, offline=False)
     rng = np.random.default_rng(seed)
     key = jax.random.PRNGKey(seed)
     result = dict(state)
@@ -198,7 +201,7 @@ def update(
         "world_updates": 0,
         "reward_updates": 0,
         "policy_updates": 0,
-        "offline_fraction": 0.5,
+        "offline_fraction": 0.0 if offline is None else 0.5,
     }
     if full_model:
         empty = init_adam({})
@@ -235,7 +238,7 @@ def update(
         )
         metrics.update(world_updates=world_updates, reward_updates=world_updates)
     if policy_updates:
-        a, b = _dataset(old), _dataset(new)
+        a, b = None if old is None else _dataset(old), _dataset(new)
         for i in range(policy_updates):
             result["policy"], pm = jit_rebrac_update(
                 result["policy"],
