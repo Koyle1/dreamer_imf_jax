@@ -209,7 +209,9 @@ def _finite(tree, label):
     import jax
 
     for value in jax.tree.leaves(tree):
-        array = np.asarray(value)
+        # Upstream enables transfer_guard=disallow on GPU. Validation is an
+        # intentional host read, not an accidental implicit transfer.
+        array = np.asarray(jax.device_get(value))
         if array.dtype.kind not in ("O", "U", "S") and not np.isfinite(array).all():
             raise FloatingPointError(f"Nonfinite {label}")
 

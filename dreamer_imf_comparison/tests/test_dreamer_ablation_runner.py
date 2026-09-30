@@ -11,6 +11,7 @@ import unittest
 from dreamer_imf_compare.dreamer_ablation_runner import (
     _settings,
     _runtime_telemetry,
+    _finite,
     run_cell,
 )
 from types import SimpleNamespace
@@ -18,6 +19,17 @@ import numpy as np
 
 
 class RunnerContractTest(unittest.TestCase):
+    def test_finite_uses_explicit_device_get(self):
+        import jax
+        from unittest import mock
+
+        with mock.patch.object(jax, "device_get", wraps=jax.device_get) as get:
+            with jax.transfer_guard("disallow"):
+                _finite({"params": np.array([1.0])}, "fixture")
+            self.assertEqual(get.call_count, 1)
+        with self.assertRaises(FloatingPointError):
+            _finite({"params": np.array([np.nan])}, "fixture")
+
     def test_production_and_full_geometry_preflight(self):
         prod = _settings({}, False)
         smoke = _settings({}, True)
