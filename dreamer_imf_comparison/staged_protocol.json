@@ -1,0 +1,42 @@
+{
+  "schema": "staged-scratch-v1",
+  "arms": ["gaussian", "imf"],
+  "seeds": [431, 433, 439],
+  "upstream_commit": "e3f02248693a79dc8b0ebd62c93683888ddaccfe",
+  "task": "dmc_reacher_hard",
+  "native_steps": 500000,
+  "action_repeat": 2,
+  "eval_at_native_steps": [100000, 200000, 300000, 400000, 500000],
+  "eval_episodes": 5,
+  "episode_native_steps": 1000,
+  "envs": 16,
+  "train_ratio": 512,
+  "model_size": "size12m",
+  "batch_size": 16,
+  "batch_length": 64,
+  "jax_platform": "cuda",
+  "preflight": {
+    "native_steps": 4096,
+    "eval_at_native_steps": [4096],
+    "eval_episodes": 1,
+    "max_updates": 8
+  },
+  "schedule": {
+    "warmup_native_steps": 50000,
+    "representation_block_steps": 10000,
+    "cycle_steps": 50000,
+    "max_gap_by_boundary": [[0, 0.1], [50000, 0.25], [100000, 0.5], [150000, 1.0]],
+    "diagnostic_period": 50000,
+    "fixed_batch_shape": [2, 16],
+    "earliest_quality_gate": 150000,
+    "consecutive_passes": 2,
+    "latent_mse_threshold": 0.5,
+    "reward_mse_threshold": 1.0,
+    "initial_sampler_steps": 4,
+    "initial_horizon": 5,
+    "reliable_sampler_steps": 1,
+    "reliable_horizon": 15,
+    "gradient_scale_bounds": [0.1, 10.0],
+    "gradient_scale_smoothing": 0.5
+  }
+}
