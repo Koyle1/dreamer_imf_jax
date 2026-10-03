@@ -55,6 +55,13 @@ only the first five steps and their correct value bootstrap enter the short
 actor objective. Thus a short horizon does not imply proportional runtime savings.
 Model warmup reduces actor updates within the fixed interaction budget.
 
+Logging metrics are detached from autodiff inside each horizon-selection branch.
+This is necessary because a zero-variance standard deviation has an undefined
+derivative: JAX can propagate NaNs through an unused conditional output even
+with a zero cotangent. Detachment preserves metric values and all learning losses.
+A regression exercises this case with exact zero variance during both warmup
+and actor training for both dynamics families.
+
 Compare the new paired arms first. Historical returns may be reported as context,
 not as a controlled estimate of any individual change. Three training seeds are
 the independent units, not fifteen evaluation episodes. Negative results must be

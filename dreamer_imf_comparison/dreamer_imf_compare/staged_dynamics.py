@@ -235,7 +235,11 @@ class StagedAgent(upstream.Agent):
             return (
                 {k: v.mean(1).reshape((B, K)) for k, v in los.items()},
                 out["ret"][:, 0].reshape(B, K),
-                mets,
+                # A conditional's transpose can propagate zero cotangents
+                # through unused metric outputs. At zero variance, std has an
+                # undefined derivative and 0 * NaN poisons reward/con gradients.
+                # Detach inside each branch, before the conditional boundary.
+                jax.tree.map(sg, mets),
             )
 
         los, boot, mets = nj.cond(

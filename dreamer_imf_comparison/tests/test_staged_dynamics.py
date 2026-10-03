@@ -1,6 +1,7 @@
 """Behavioral checks for exact frozen groups and trace-safe phase changes."""
 
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import elements
@@ -20,6 +21,7 @@ from dreamer_imf_compare.staged_dynamics import (
     install,
 )
 from imf_dreamer_jax.imf import init_imf, sample_imf_steps, sample_time_pairs
+from dreamerv3 import agent as upstream
 
 
 class StagedDynamicsTests(unittest.TestCase):
@@ -71,6 +73,8 @@ class StagedDynamicsTests(unittest.TestCase):
             train = jax.jit(nj.pure(model.train))
             old = {k: np.array(v) for k, v in state.items()}
             state, (carry, _, _) = train(state, initial, data, seed=1)
+            for key, value in state.items():
+                self.assertTrue(np.isfinite(value).all(), key)
             for key in old:
                 if key.startswith(("pol/", "val/", "slowval/", "retnorm/")):
                     np.testing.assert_array_equal(old[key], state[key], err_msg=key)
@@ -81,6 +85,8 @@ class StagedDynamicsTests(unittest.TestCase):
             state["staged_sample_steps/value"] = jnp.array(1)
             old = {k: np.array(v) for k, v in state.items()}
             state, _ = train(state, carry, data, seed=2)
+            for key, value in state.items():
+                self.assertTrue(np.isfinite(value).all(), key)
             for key in old:
                 if (
                     key.startswith(("enc/", "dyn/", "dec/", "rew/", "con/"))
@@ -94,6 +100,21 @@ class StagedDynamicsTests(unittest.TestCase):
                     if k.startswith("pol/")
                 )
             )
+
+    def test_zero_variance_logging_metric_cannot_poison_training(self):
+        original = upstream.imag_loss
+
+        def with_zero_variance_metric(*args, **kwargs):
+            losses, outs, metrics = original(*args, **kwargs)
+            reward = args[1]
+            # Exactly zero variance on every device, with a genuine dependency
+            # on reward-head parameters. Its derivative is undefined at zero;
+            # logging this finite value must never enter the loss backward pass.
+            metrics["adv_std"] = jnp.stack([reward, reward], -1).std(-1).mean()
+            return losses, outs, metrics
+
+        with mock.patch.object(upstream, "imag_loss", with_zero_variance_metric):
+            self.test_complete_upstream_train_phase_switches()
 
     def test_controls_fail_closed(self):
         for update in (
