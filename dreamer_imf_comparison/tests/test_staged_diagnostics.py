@@ -85,6 +85,25 @@ class DiagnosticTest(unittest.TestCase):
         self.assertEqual(float(_distribution(x, x[::-1])["sliced_wasserstein2"]), 0)
         self.assertGreater(float(_distribution(x, x + 10)["mean_mse"]), 90)
 
+    def test_joint_observable_controls_repeat_without_state_mutation(self):
+        from dreamer_imf_compare.joint_diagnostics import evaluate_controls
+
+        model, params = self.models[1]
+        before = {k: np.asarray(v).copy() for k, v in params.items()}
+        result = evaluate_controls(model, params, self.batch, 37)
+        self.assertEqual(result, evaluate_controls(model, params, self.batch, 37))
+        # Constant recorded actions make shuffling an exact null intervention.
+        self.assertEqual(result["rows"]["model"], result["rows"]["shuffled_actions"])
+        self.assertFalse(result["assessment"]["useful_control_certified"])
+        self.assertEqual(result["assessment"]["status"], "insufficient_reward_coverage")
+        reset = dict(self.batch, is_first=np.ones_like(self.batch["is_first"]))
+        self.assertEqual(
+            evaluate_controls(model, params, reset, 37)["rows"]["model"]["valid_paths"],
+            0,
+        )
+        for key in params:
+            np.testing.assert_array_equal(before[key], params[key])
+
     def test_actual_models_finite_repeatable_and_immutable(self):
         for model, params in self.models:
             before = {k: np.asarray(v).copy() for k, v in params.items()}

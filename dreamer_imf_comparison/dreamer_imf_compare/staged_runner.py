@@ -93,16 +93,26 @@ def installed_runner(root, arm, seed, preflight=False):
     directory = (
         Path(root) / ("preflight" if preflight else "cells") / arm / f"seed_{seed}"
     )
-    schedule = Schedule()
+    joint = protocol.get("schema") == "imf-joint-one-seed-v1"
+    if joint:
+        from .joint_diagnostics import JointSchedule, retained_views, evaluate_controls
+    schedule = JointSchedule() if joint else Schedule()
     state = dict(
         native=0,
         updates=0,
         controls=[],
         diagnostics=[],
         freeze_checks=[],
-        protocol="staged-scratch-v1",
+        protocol=protocol["schema"],
     )
+    if joint:
+        state["retained_batches"] = []
+        state["coverage_diagnostics"] = []
+        state["gate_interpretation"] = (
+            "legacy scheduling heuristic; not a control certificate"
+        )
     reference = batch = None
+    recent = None
     next_diagnostic = 50000
 
     def diagnostic(agent, force=False):
@@ -118,6 +128,57 @@ def installed_runner(root, arm, seed, preflight=False):
             metrics, reference = evaluate_batch(
                 agent.model, agent.params, batch, seed + 900000, reference
             )
+            if joint:
+                if recent is None:
+                    raise ValueError("Missing contemporaneous replay sample")
+                batch_name = f"replay_sample_{state['native']}_{state['updates']}.npz"
+                with (directory / batch_name).open("xb") as out:
+                    np.savez_compressed(out, **recent)
+                state["retained_batches"].append(
+                    dict(
+                        path=batch_name,
+                        sha256=hashlib.sha256(
+                            (directory / batch_name).read_bytes()
+                        ).hexdigest(),
+                        native_steps=state["native"],
+                        learner_updates=state["updates"],
+                        positive_rewards=int(np.count_nonzero(recent["reward"] > 0)),
+                        total_rewards=int(recent["reward"].size),
+                        sampling="current learner minibatch, before this update; not held-out",
+                    )
+                )
+                views = retained_views(recent)
+                evidence = {
+                    key: evaluate_controls(
+                        agent.model, agent.params, value, seed + 910000
+                    )
+                    for key, value in views.items()
+                }
+                clocks = {
+                    key: int(np.asarray(jax.device_get(value)))
+                    for key, value in agent.params.items()
+                    if key.startswith("opt/state/") and key.endswith("/3/count")
+                }
+                coverage_name = f"coverage_{state['native']}_{state['updates']}.json"
+                old_json(
+                    directory / coverage_name,
+                    dict(
+                        native_steps=state["native"],
+                        learner_updates=state["updates"],
+                        batch_path=batch_name,
+                        views=evidence,
+                        optimizer_clocks=clocks,
+                        learner_unchanged=tree_digest(agent.params) == before,
+                    ),
+                )
+                state["coverage_diagnostics"].append(
+                    dict(
+                        path=coverage_name,
+                        sha256=hashlib.sha256(
+                            (directory / coverage_name).read_bytes()
+                        ).hexdigest(),
+                    )
+                )
         if tree_digest(agent.params) != before:
             raise AssertionError("Diagnostics modified learner state")
         schedule.observe(state["native"], metrics)
@@ -147,7 +208,16 @@ def installed_runner(root, arm, seed, preflight=False):
             return policy(carry, obs, mode=mode)
 
         def tracked_train(carry, data):
-            nonlocal batch
+            nonlocal batch, recent
+            if joint and (
+                recent is None or state["native"] >= next_diagnostic or preflight
+            ):
+                fields = set(agent.model.obs_space) | set(agent.model.act_space)
+                recent = {
+                    k: np.asarray(jax.device_get(v)).copy()
+                    for k, v in data.items()
+                    if k in fields
+                }
             if batch is None:
                 fields = set(agent.model.obs_space) | set(agent.model.act_space)
                 batch = {

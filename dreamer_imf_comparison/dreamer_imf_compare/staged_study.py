@@ -71,7 +71,9 @@ def submit(root, stage, partition):
     if partition not in ("gpu-l40s", "gpu-a30", "clara"):
         raise ValueError("Unreviewed partition")
     if stage == "training":
-        evidence.scheduler_complete(root, "preflight", 2)
+        evidence.scheduler_complete(
+            root, "preflight", len(evidence.cells(protocol, "preflight"))
+        )
         evidence.verify_stage(root, "preflight")
     intent = root / "submissions" / f"{stage}-intent.json"
     receipt = root / "submissions" / f"{stage}.json"
