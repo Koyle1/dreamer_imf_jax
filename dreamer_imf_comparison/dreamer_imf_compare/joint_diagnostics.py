@@ -68,23 +68,26 @@ def assess(rows):
     )
 
 
-def evaluate_controls(model, params, batch, seed):
+def evaluate_controls(model, params, batch, seed, steps=1):
     import jax
     from .staged_diagnostics import _json
 
     rows = _json(
-        _observable_arrays(model, params, jax.tree.map(jax.device_put, batch), seed)
+        _observable_arrays(
+            model, params, jax.tree.map(jax.device_put, batch), seed, steps
+        )
     )
     return dict(
         rows=rows,
         assessment=assess(rows),
         batch_positive_rewards=int(np.count_nonzero(batch["reward"] > 0)),
         batch_rewards=int(batch["reward"].size),
+        sampling_steps=steps,
     )
 
 
 # Keep imports of JAX/upstream out of lightweight schedule/unit tests.
-def _observable_arrays(model, params, data, seed):
+def _observable_arrays(model, params, data, seed, steps=1):
     from functools import partial
     import jax
     import jax.numpy as jnp
@@ -96,8 +99,8 @@ def _observable_arrays(model, params, data, seed):
     fn = getattr(model, "_joint_observable_probe", None)
     if fn is None:
 
-        @partial(jax.jit, static_argnums=(2,))
-        def fn(params, data, seed):
+        @partial(jax.jit, static_argnums=(2, 3))
+        def fn(params, data, seed, steps):
             b, t = data["is_first"].shape
             reset = data["is_first"].at[:, 0].set(True)
             actions = {
@@ -166,7 +169,7 @@ def _observable_arrays(model, params, data, seed):
                         (samples * n, int(np.prod(feat["stoch"].shape[2:]))),
                     )
                     stoch = sample_imf_steps(
-                        flow, deter.astype(jnp.float32), noise=eps, steps=1
+                        flow, deter.astype(jnp.float32), noise=eps, steps=steps
                     )
                     ensemble = dict(
                         deter=deter,
@@ -212,4 +215,4 @@ def _observable_arrays(model, params, data, seed):
 
         # object.__setattr__ avoids registering diagnostic functions as parameters.
         object.__setattr__(model, "_joint_observable_probe", fn)
-    return fn(params, data, seed)
+    return fn(params, data, seed, steps)

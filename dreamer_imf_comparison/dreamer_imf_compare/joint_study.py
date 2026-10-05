@@ -17,13 +17,14 @@ def configure():
     evidence.verify_cell = verify_cell
 
 
-def verify_extra(directory, result, preflight):
+def verify_extra(directory, result, preflight, conditional=False):
     """Check extra evidence before publishing the inherited strict marker."""
     from .joint_diagnostics import assess
 
     state = result["staged"]
     if (
-        state["protocol"] != "imf-joint-one-seed-v1"
+        state["protocol"]
+        != ("imf-conditional-one-seed-v1" if conditional else "imf-joint-one-seed-v1")
         or state["native"] != result["native_steps"]
         or state["updates"] != result["learner_updates"]
         or not state["controls"]
@@ -31,14 +32,21 @@ def verify_extra(directory, result, preflight):
         or not all(c["passed"] for c in state["freeze_checks"])
         or any(c["values"]["transition_only"] for c in state["controls"])
         or state["gate_interpretation"]
-        != "legacy scheduling heuristic; not a control certificate"
+        != (
+            "diagnostics only; fixed controls never consume gate outcomes"
+            if conditional
+            else "legacy scheduling heuristic; not a control certificate"
+        )
     ):
         raise ValueError("Joint schedule evidence differs")
-    if not any(not c["values"]["actor_enabled"] for c in state["controls"]):
+    if not conditional and not any(
+        not c["values"]["actor_enabled"] for c in state["controls"]
+    ):
         raise ValueError("Scratch actor warmup missing")
     if preflight and (
         result["learner_updates"] != 8
-        or {c["values"]["imag_horizon"] for c in state["controls"]} != {5, 15}
+        or {c["values"]["imag_horizon"] for c in state["controls"]}
+        != ({15} if conditional else {5, 15})
     ):
         raise ValueError("Incomplete preflight phase coverage")
     if evidence.filehash(directory / "diagnostic_batch.npz") != state["batch_sha256"]:
@@ -72,13 +80,19 @@ def verify_extra(directory, result, preflight):
                     }:
                         raise ValueError("Unbound coverage input")
                     clocks = value["optimizer_clocks"]
-                    for group in ("representation", "transition"):
+                    for group in (
+                        ("representation", "transition", "actor")
+                        if conditional
+                        else ("representation", "transition")
+                    ):
                         if (
                             clocks.get(f"opt/state/{group}/3/count")
                             != value["learner_updates"]
                         ):
                             raise ValueError("Representation/transition clocks differ")
                     for view in value["views"].values():
+                        if conditional and view["sampling_steps"] != 4:
+                            raise ValueError("Diagnostic sampler differs from training")
                         if view["assessment"] != assess(view["rows"]):
                             raise ValueError("Control assessment differs")
     if len(state["coverage_diagnostics"]) != len(state["retained_batches"]):
@@ -103,6 +117,12 @@ def verify_extra(directory, result, preflight):
             or not all(np.isfinite(v).all() for v in params.values())
         ):
             raise ValueError("Checkpoint optimizer clocks or finiteness differ")
+        if conditional and (
+            int(params["opt/state/actor/3/count"]) != rep
+            or not any(k.startswith("dyn/priornormal/") for k in params)
+            or not any(k.startswith("dyn/imf") for k in params)
+        ):
+            raise ValueError("Conditional prior or all-module clocks missing")
 
 
 def verify_cell(root, stage, cell):

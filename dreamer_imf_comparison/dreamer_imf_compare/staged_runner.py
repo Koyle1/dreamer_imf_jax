@@ -84,19 +84,33 @@ def installed_runner(root, arm, seed, preflight=False):
     from .staged_diagnostics import evaluate_batch
     import jax
 
-    old_install, old_agent, old_json, old_evaluate = (
+    old_install, old_agent, old_json, old_evaluate, old_config = (
         original.install,
         upstream.Agent,
         base._json,
         base._evaluate,
+        base._config,
     )
     directory = (
         Path(root) / ("preflight" if preflight else "cells") / arm / f"seed_{seed}"
     )
-    joint = protocol.get("schema") == "imf-joint-one-seed-v1"
+    conditional = protocol.get("schema") == "imf-conditional-one-seed-v1"
+    joint = protocol.get("schema") == "imf-joint-one-seed-v1" or conditional
     if joint:
         from .joint_diagnostics import JointSchedule, retained_views, evaluate_controls
     schedule = JointSchedule() if joint else Schedule()
+    if conditional:
+        from . import conditional_dynamics
+        from . import conditional_schedule as repaired_schedule
+
+        schedule = repaired_schedule.ConditionalSchedule()
+
+        def repaired_config(*args, **kwargs):
+            return old_config(*args, **kwargs).update(
+                {"agent.repval_grad": False, "agent.reward_grad": True}
+            )
+
+        base._config = repaired_config
     state = dict(
         native=0,
         updates=0,
@@ -109,8 +123,12 @@ def installed_runner(root, arm, seed, preflight=False):
         state["retained_batches"] = []
         state["coverage_diagnostics"] = []
         state["gate_interpretation"] = (
-            "legacy scheduling heuristic; not a control certificate"
+            "diagnostics only; fixed controls never consume gate outcomes"
+            if conditional
+            else "legacy scheduling heuristic; not a control certificate"
         )
+    if conditional:
+        state["metrics_snapshots"] = []
     reference = batch = None
     recent = None
     next_diagnostic = 50000
@@ -147,10 +165,26 @@ def installed_runner(root, arm, seed, preflight=False):
                         sampling="current learner minibatch, before this update; not held-out",
                     )
                 )
-                views = retained_views(recent)
+                views = (
+                    repaired_schedule.retained_views if conditional else retained_views
+                )(recent)
                 evidence = {
                     key: evaluate_controls(
-                        agent.model, agent.params, value, seed + 910000
+                        agent.model,
+                        agent.params,
+                        value,
+                        seed + 910000,
+                        steps=(
+                            int(
+                                np.asarray(
+                                    jax.device_get(
+                                        agent.params["staged_sample_steps/value"]
+                                    )
+                                )
+                            )
+                            if conditional
+                            else 1
+                        ),
                     )
                     for key, value in views.items()
                 }
@@ -199,7 +233,11 @@ def installed_runner(root, arm, seed, preflight=False):
         next_diagnostic = (state["native"] // 50000 + 1) * 50000
 
     def factory(*args, **kwargs):
-        agent = dynamics.StagedAgent(*args, **kwargs)
+        agent = (
+            conditional_dynamics.ConditionalAgent
+            if conditional
+            else dynamics.StagedAgent
+        )(*args, **kwargs)
         train, policy = agent.train, agent.policy
 
         def tracked_policy(carry, obs, mode="train"):
@@ -230,7 +268,7 @@ def installed_runner(root, arm, seed, preflight=False):
                     (directory / "diagnostic_batch.npz").read_bytes()
                 ).hexdigest()
             controls = schedule.controls(state["native"])
-            if preflight:
+            if preflight and not conditional:
                 # Exercise all phases on full geometry, without spending 150k steps.
                 controls = schedule.controls(
                     [0, 60000, 100000, 160000][state["updates"] % 4]
@@ -292,7 +330,7 @@ def installed_runner(root, arm, seed, preflight=False):
     def install(which):
         if which != arm:
             raise ValueError("Arm mismatch")
-        dynamics.install(which)
+        (conditional_dynamics.install if conditional else dynamics.install)(which)
         upstream.Agent = factory
 
     def evaluate(agent, *args, **kwargs):
@@ -303,17 +341,41 @@ def installed_runner(root, arm, seed, preflight=False):
     def write(path, value):
         if Path(path).name in ("progress.json", "complete.json"):
             value = dict(value, staged=state.copy())
+        if conditional and Path(path).name == "progress.json":
+            # Preserve snapshots instead of leaving only the final overwritten metrics.
+            snapshot = directory / f"metrics_{state['native']}_{state['updates']}.json"
+            if not snapshot.exists():
+                old_json(snapshot, value)
+            evaluations = value.get("evaluations", [])
+            if evaluations and evaluations[-1]["native_steps"] == state["native"]:
+                name = f"metrics_evaluation_{state['native']}.json"
+                if not (directory / name).exists():
+                    old_json(directory / name, value["metrics"])
+                    state["metrics_snapshots"].append(
+                        dict(
+                            path=name,
+                            sha256=hashlib.sha256(
+                                (directory / name).read_bytes()
+                            ).hexdigest(),
+                            native_steps=state["native"],
+                        )
+                    )
+        if conditional and Path(path).name == "complete.json":
+            value["staged"]["config_sha256"] = hashlib.sha256(
+                (directory / "config.yaml").read_bytes()
+            ).hexdigest()
         old_json(path, value)
 
     original.install, base._json, base._evaluate = install, write, evaluate
     try:
         yield
     finally:
-        original.install, upstream.Agent, base._json, base._evaluate = (
+        original.install, upstream.Agent, base._json, base._evaluate, base._config = (
             old_install,
             old_agent,
             old_json,
             old_evaluate,
+            old_config,
         )
 
 

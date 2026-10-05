@@ -68,6 +68,7 @@ def run(root, stage, index):
 def submit(root, stage, partition):
     root = Path(root).resolve()
     manifest, protocol = evidence.manifest(root)
+    conditional = protocol.get("schema") == "imf-conditional-one-seed-v1"
     if partition not in ("gpu-l40s", "gpu-a30", "clara"):
         raise ValueError("Unreviewed partition")
     if stage == "training":
@@ -106,6 +107,13 @@ def submit(root, stage, partition):
         out.write(
             "unset JAX_PLATFORMS JAX_PLATFORM_NAME XLA_FLAGS\nexport OMP_NUM_THREADS=8\nexport MUJOCO_GL=egl\nexport XLA_PYTHON_CLIENT_PREALLOCATE=false\n"
         )
+        if conditional:
+            out.write("export PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=8\n")
+            probe = "import faulthandler; faulthandler.enable(); faulthandler.dump_traceback_later(120); print('JAX_STARTUP_BEGIN', flush=True); import jax; d=jax.devices(); assert any(x.platform=='gpu' for x in d), d; print('JAX_GPU_READY', d, flush=True)"
+            out.write(
+                shlex.join(["timeout", "300s", sys.executable, "-u", "-c", probe])
+                + "\n"
+            )
         out.write(command + ' --index "$SLURM_ARRAY_TASK_ID"\n')
     evidence.publish(
         intent,
@@ -127,9 +135,14 @@ def submit(root, stage, partition):
                 "--gres=gpu:1",
                 "--cpus-per-task=8",
                 "--mem=64G",
-                "--time=" + ("02:00:00" if stage == "preflight" else "08:00:00"),
+                "--time="
+                + (
+                    "02:00:00"
+                    if stage == "preflight"
+                    else "12:00:00" if conditional else "08:00:00"
+                ),
                 f"--array=0-{len(cells)-1}%3",
-                f"--job-name=imf-staged-{stage}",
+                f"--job-name=imf-{'conditional' if conditional else 'staged'}-{stage}",
                 f"--output={root}/submissions/{stage}-%A_%a.log",
                 str(script),
             ],
