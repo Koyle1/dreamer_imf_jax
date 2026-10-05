@@ -28,6 +28,8 @@ for model in (imf, cat, imf):
     obs["is_first"] = np.asarray(True)
     carry, feature = model.observe(model.initial(), obs, np.zeros(2, np.float32), 431)
     action = model.action(feature, 91)
+    assert action.shape == (2,) and np.isfinite(action).all()
+    assert np.all(action >= -1) and np.all(action <= 1)
     for nfe in ((1, 4) if model.arm == "imf" else (1,)):
         f = model.rollout(
             feature[None], np.repeat(action[None, None], 15, axis=1), 917, 2, nfe

@@ -207,7 +207,7 @@ class FrozenModel:
     def action(self, feature, seed):
         import jax
 
-        return np.asarray(
+        action = np.asarray(
             jax.device_get(
                 self._action(
                     self.params,
@@ -216,6 +216,14 @@ class FrozenModel:
                 )
             )
         )[0]
+        if not np.isfinite(action).all():
+            raise ValueError("nonfinite frozen policy action")
+        # Pinned Dreamer main.wrap_env installs ClipAction outside CheckSpaces.
+        # Normalization is identity on Reacher's [-1, 1] action coordinates.
+        # Return the executed action, not an unbounded raw policy sample; the
+        # pinned recurrent core likewise divides each coordinate by max(1, |a|).
+        space = self.act_space["action"]
+        return np.clip(action, space.low, space.high).astype(np.float32)
 
     def decode(self, features):
         import jax.numpy as jnp

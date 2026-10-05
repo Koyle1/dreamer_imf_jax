@@ -63,6 +63,29 @@ class FrozenDigestTests(unittest.TestCase):
                     model.frozen_digest()
 
 
+class FrozenActionTests(unittest.TestCase):
+    def model(self, action):
+        model = FrozenModel.__new__(FrozenModel)
+        model.params = {}
+        model.act_space = {"action": SimpleNamespace(low=-1.0, high=1.0)}
+        model._action = lambda *args: jnp.asarray([action], jnp.float32)
+        return model
+
+    def test_executed_action_matches_pinned_clip_wrapper_and_core(self):
+        for raw in ([2.0, -3.0], [0.25, -0.125], [1.0, -1.0]):
+            raw = np.asarray(raw, np.float32)
+            result = self.model(raw).action(np.zeros(3), 1)
+            np.testing.assert_array_equal(result, np.clip(raw, -1, 1))
+            np.testing.assert_array_equal(result, raw / np.maximum(1, abs(raw)))
+            self.assertEqual(result.dtype, np.float32)
+
+    def test_clipping_must_not_hide_nonfinite_policy_output(self):
+        for bad in (np.inf, -np.inf, np.nan):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError, "nonfinite frozen policy"):
+                    self.model([bad, 0.0]).action(np.zeros(3), 1)
+
+
 class _TimeStep:
     def __init__(self, observation, reward=None, first=False, last=False, discount=1.0):
         self.observation = observation
