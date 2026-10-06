@@ -388,6 +388,36 @@ class AuthenticationTests(unittest.TestCase):
             after["packages"]["numpy"]["files_sha256"],
         )
 
+    def test_cluster_interpreters_are_exactly_pinned_not_version_only(self):
+        registered = dict(
+            copy.deepcopy(p.INTERPRETER_PROFILES[0]), packages={"jax": "hash"}
+        )
+        compute = dict(
+            copy.deepcopy(p.INTERPRETER_PROFILES[1]), packages={"jax": "hash"}
+        )
+        p.verify_runtime_identity(registered, compute)
+        for field in ("sha256", "path", "bytes"):
+            changed = copy.deepcopy(compute)
+            changed["executable"][field] = "unexpected"
+            with self.assertRaisesRegex(ValueError, "interpreter"):
+                p.verify_runtime_identity(registered, changed)
+        changed = copy.deepcopy(compute)
+        changed["python_version"] = registered["python_version"]
+        with self.assertRaisesRegex(ValueError, "interpreter"):
+            p.verify_runtime_identity(registered, changed)
+
+    def test_cluster_interpreter_variation_never_accepts_package_changes(self):
+        registered = dict(
+            copy.deepcopy(p.INTERPRETER_PROFILES[0]), packages={"jax": "hash"}
+        )
+        changed = dict(
+            copy.deepcopy(p.INTERPRETER_PROFILES[1]), packages={"jax": "edited"}
+        )
+        with self.assertRaisesRegex(ValueError, "dependency identity"):
+            p.verify_runtime_identity(registered, changed)
+        with self.assertRaisesRegex(ValueError, "fields"):
+            p.verify_runtime_identity(registered, dict(registered, ignored=True))
+
     def test_wrong_parent_or_common_dataset_sha_is_rejected(self):
         parent = self.root / "parent"
         parent.mkdir()

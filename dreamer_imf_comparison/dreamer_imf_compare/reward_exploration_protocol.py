@@ -31,6 +31,27 @@ ARMS = ("A", "B", "C", "D")
 SEEDS = (701, 702, 703)
 STAGES = ("match", "preflight", "cells", "finalize")
 ZERO_HASH = "0" * 64
+# Architecture-specific module builds share one path. Read-only probes 28277646
+# (A30) and 28277653 (CPU handoff) bind the compute build explicitly. Installed
+# Python/CUDA package bytes must still match; this is not version-only checking.
+INTERPRETER_PROFILES = [
+    {
+        "python_version": "3.12.3 (main, Nov 17 2025, 14:11:43) [GCC 13.3.0]",
+        "executable": {
+            "path": "/software/all/Python/3.12.3-GCCcore-13.3.0/bin/python3.12",
+            "sha256": "1fb797ac65a3820ee5c328e5d3b32843c89a09e9b027e3d469b5d21810ee5632",
+            "bytes": 21136,
+        },
+    },
+    {
+        "python_version": "3.12.3 (main, Nov 17 2025, 12:47:01) [GCC 13.3.0]",
+        "executable": {
+            "path": "/software/all/Python/3.12.3-GCCcore-13.3.0/bin/python3.12",
+            "sha256": "f3a23874360698d88c850604a1405aac16b19ce986ee1b2940e214d81309eae2",
+            "bytes": 21096,
+        },
+    },
+]
 
 
 def _finite(value):
@@ -308,6 +329,18 @@ def runtime_identity():
     )
 
 
+def verify_runtime_identity(registered, current):
+    required = {"python_version", "executable", "packages"}
+    if set(registered) != required or set(current) != required:
+        raise ValueError("unexpected runtime identity fields")
+    for runtime in (registered, current):
+        interpreter = {key: runtime[key] for key in required - {"packages"}}
+        if interpreter not in INTERPRETER_PROFILES:
+            raise ValueError("unregistered interpreter binary/build")
+    if registered["packages"] != current["packages"]:
+        raise ValueError("installed runtime dependency identity changed")
+
+
 def _parent_identity(parent_cell, dataset, protocol):
     parent_cell, dataset = Path(parent_cell).resolve(), Path(dataset).resolve()
     checkpoint = parent_cell / protocol["parent"]["checkpoint_name"]
@@ -367,6 +400,8 @@ def initialize_manifest(
     dependency_files = {
         name: artifact(path) for name, path in sorted((dependencies or {}).items())
     }
+    runtime = runtime_identity()
+    verify_runtime_identity(runtime, runtime)
     manifest = dict(
         schema=protocol["schema"],
         source=str(source),
@@ -376,7 +411,8 @@ def initialize_manifest(
         protocol_sha256=object_sha256(protocol),
         inputs=inputs,
         dependencies=dependency_files,
-        runtime=runtime_identity(),
+        runtime=runtime,
+        runtime_interpreter_profiles=copy.deepcopy(INTERPRETER_PROFILES),
         cells=[cell_for_index(i) for i in range(12)],
     )
     output.mkdir(parents=True, exist_ok=False)
@@ -419,8 +455,9 @@ def authenticate(output):
         or manifest["upstream"]["commit"] != protocol["upstream_commit"]
     ):
         raise ValueError("upstream dependency changed")
-    if runtime_identity() != manifest["runtime"]:
-        raise ValueError("installed runtime dependency identity changed")
+    if manifest.get("runtime_interpreter_profiles") != INTERPRETER_PROFILES:
+        raise ValueError("registered interpreter profile set changed")
+    verify_runtime_identity(manifest["runtime"], runtime_identity())
     inputs = manifest["inputs"]
     if (
         _parent_identity(inputs["parent_cell"], inputs["dataset"]["path"], protocol)

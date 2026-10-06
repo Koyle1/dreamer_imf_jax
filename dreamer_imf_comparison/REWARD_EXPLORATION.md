@@ -65,6 +65,12 @@ write-once submission intents/receipts, scheduler success and independently
 verified stage markers. Ambiguous, failed, running, pending and completed attempts
 are never automatically resubmitted. Native charges are persisted before calls.
 
+The cluster serves two architecture-specific Python builds under the same module
+path. Both exact interpreter binary hashes/build strings are explicitly pinned;
+all installed Python and CUDA package bytes must remain identical. The initial
+`6e320d4` deployment failed this portability check before fitting or simulator use
+and remains preserved. No numerical or replay-equality threshold was relaxed.
+
 Sequence: tests → matched fit + independent replay → full GPU update preflight
 for A and D →12 continuation cells at concurrency4 → independent final report.
 CPU handoffs submit a next GPU stage only after the previous allocation completes
