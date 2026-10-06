@@ -1,0 +1,29 @@
+{
+  "schema": "reward-readout-diagnostic-v1",
+  "parent_commit": "ea16d4dafc434ec215446b7b46a3a61b0fec5d71",
+  "parent_report_sha256": "9ec5523ce4cec93ea43730b4b5348c87956f2c41d975c2f242ee463047f87aea",
+  "additional_simulator_steps": 0,
+  "ridge_alpha": [0.001, 0.1, 10.0, 1000.0],
+  "ridge_groups": ["h", "z", "hz", "observation"],
+  "mlp_seeds": [0, 1, 2],
+  "mlp_hidden": [128, 128],
+  "mlp_classes": [0, 1, 2],
+  "mlp_updates": 5000,
+  "mlp_batch": 256,
+  "mlp_lr": 0.0003,
+  "mlp_validation_period": 250,
+  "normalization_std_floor": 0.01,
+  "selection": "validation normalized 15-step cumulative-reward MSE; earlier candidate/update wins exact ties",
+  "primary_candidates": ["ridge_hz", "mlp_0", "mlp_1", "mlp_2"],
+  "posterior_draws": 8,
+  "posterior_subset": "lowest-ID test episode, all four anchors and four action branches",
+  "bootstrap_reps": 2000,
+  "limitations": [
+    "Exploratory reuse of a previously examined test set, not confirmation",
+    "One frozen world-model seed; three readout initializations are not independent world models",
+    "New data are off-policy branches; full original training replay is unavailable, but a small contemporaneous learner minibatch is retained",
+    "Posterior resampling is a bounded one-episode diagnostic, not a global causal decomposition",
+    "Representation recoverability probes do not prove an irreducible information floor",
+    "No actor updates, new environment interactions, or online-performance claims"
+  ]
+}
