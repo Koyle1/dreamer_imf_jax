@@ -136,6 +136,10 @@ class StagedAgent(upstream.Agent):
             for k, v in DEFAULT_CONTROLS.items()
         }
 
+    def imagined_reward(self, features, bdims):
+        """Default-compatible task readout hook; never changes real reward loss."""
+        return self.rew(features, bdims).pred()
+
     def _make_opt(self, **kwargs):
         def enabled(group):
             if group == "actor":
@@ -219,7 +223,7 @@ class StagedAgent(upstream.Agent):
             act = jax.tree.map(lambda x: x[:, : horizon + 1], actions)
             los, out, mets = upstream.imag_loss(
                 act,
-                self.rew(inp, 2).pred(),
+                self.imagined_reward(inp, 2),
                 self.con(inp, 2).prob(1),
                 self.pol(inp, 2),
                 self.val(inp, 2),
