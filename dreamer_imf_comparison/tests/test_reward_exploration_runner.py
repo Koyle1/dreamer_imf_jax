@@ -34,6 +34,18 @@ def episode():
 
 
 class RunnerTests(unittest.TestCase):
+    def test_preflight_source_survives_prefetch_without_mutating_input(self):
+        source_batch = {"reward": np.ones((16, 65), np.float32)}
+        source = runner.preflight_batches(source_batch)
+        # Upstream prefetch can ask for additional batches beyond the two that
+        # the learner consumes. Exhaustion in its worker terminates the process.
+        batches = [next(source) for _ in range(100)]
+        self.assertEqual(len({id(batch) for batch in batches}), 100)
+        batches[0]["seed"] = 7
+        self.assertNotIn("seed", source_batch)
+        self.assertNotIn("seed", batches[1])
+        self.assertIs(batches[-1]["reward"], source_batch["reward"])
+
     def test_reward_and_action_timing_positive_control(self):
         data = episode()
         result = verify.verify_episode(data)

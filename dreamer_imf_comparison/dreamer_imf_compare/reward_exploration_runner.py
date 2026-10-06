@@ -213,6 +213,16 @@ def retained_batch(parent_cell, agent):
     return data, path
 
 
+def preflight_batches(batch):
+    """Prefetch needs an unbounded source; the consumer executes two updates.
+
+    Return separate dictionaries because the upstream stream adds its RNG seed.
+    Arrays are retained diagnostic inputs, not newly collected transitions.
+    """
+    while True:
+        yield dict(batch)
+
+
 def preflight_arm(output, parent_cell, arm, protocol):
     import jax
 
@@ -224,7 +234,7 @@ def preflight_arm(output, parent_cell, arm, protocol):
     )
     before = agent.save()
     batch, batch_path = retained_batch(parent_cell, agent)
-    stream = agent.stream(iter([dict(batch), dict(batch)]))
+    stream = agent.stream(preflight_batches(batch))
     carry = agent.init_train(config.batch_size)
     stream = iter(stream)
     for _ in range(2):
