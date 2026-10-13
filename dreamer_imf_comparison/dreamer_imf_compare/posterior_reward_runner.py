@@ -259,7 +259,7 @@ def _proxy(directory, arm, seed, protocol, checkpoint):
 
 
 def _probe_fixture(batch):
-    """Retained minibatch tiled to the probe interface; not scientific evidence."""
+    """Synthetic bounded history tiled from a minibatch; not scientific evidence."""
     result = {}
     keys = (
         *("position", "to_target", "velocity"),
@@ -273,6 +273,13 @@ def _probe_fixture(batch):
         value = batch[key][:10]
         reps = (1, 8) + (1,) * (value.ndim - 2)
         result[key] = np.tile(value, reps)[:, :501].copy()
+    # Legacy minibatches can retain unbounded Gaussian policy proposals. This
+    # discarded fixture exercises the executed-action history interface used by
+    # evaluate(), so mirror its clipping before reconstructing incoming actions.
+    # Never rewrite the source batch or relax validation of scientific histories.
+    if not np.isfinite(result["action"]).all():
+        raise ValueError("nonfinite preflight fixture action")
+    result["action"] = np.clip(result["action"], -1, 1)
     result["is_first"][:] = False
     result["is_first"][:, 0] = True
     result["is_last"][:] = False
@@ -401,7 +408,7 @@ def preflight_arm(output, parent_cell, arm, protocol, verify=False):
             metrics={k: float(v) for k, v in metrics.items() if np.ndim(v) == 0},
             process_id=os.getpid(),
             wall_seconds=time.monotonic() - started,
-            synthetic_fixture="tiled retained batch; not scientific predictions",
+            synthetic_fixture="tiled retained batch with bounded synthetic actions; not scientific predictions",
         ),
     )
     print("POSTERIOR_REWARD_PREFLIGHT_ARM_CREATED", arm, flush=True)

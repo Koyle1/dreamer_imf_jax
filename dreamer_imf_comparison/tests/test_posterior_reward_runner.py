@@ -185,12 +185,36 @@ class OnlineAccounting(unittest.TestCase):
             np.testing.assert_array_equal(result["episode_seed"], np.arange(10, 20))
 
     def test_preflight_fixture_is_synthetic_and_nonmutating(self):
+        from dreamer_imf_compare.posterior_reward_probe import validate_histories
+
         batch = {k: np.repeat(v[None, :65], 16, 0) for k, v in episode().items()}
         for key in ("position", "to_target", "velocity"):
             batch[key] = np.zeros((16, 65, 2), np.float32)
         batch["is_terminal"] = np.zeros((16, 65), bool)
+        # Parent minibatches may contain proposed Gaussian actions, whereas the
+        # prediction interface requires bounded simulator-executed actions.
+        batch["action"][:] = np.linspace(-2.5, 2.5, 65)[None, :, None]
         before = {k: v.copy() for k, v in batch.items()}
         result = runner._probe_fixture(batch)
+        proxy = types.SimpleNamespace(
+            obs_space={
+                k: types.SimpleNamespace(shape=batch[k].shape[2:])
+                for k in (
+                    "position",
+                    "to_target",
+                    "velocity",
+                    "reward",
+                    "is_first",
+                    "is_last",
+                    "is_terminal",
+                )
+            }
+        )
+        validate_histories(proxy, result)
+        np.testing.assert_array_equal(
+            result["action"],
+            np.clip(np.tile(before["action"][:10], (1, 8, 1))[:, :501], -1, 1),
+        )
         self.assertEqual(result["reward"].shape, (10, 501))
         self.assertEqual(result["is_first"].sum(), 10)
         self.assertEqual(result["is_last"].sum(), 10)
@@ -200,6 +224,15 @@ class OnlineAccounting(unittest.TestCase):
         np.testing.assert_array_equal(
             result["previous_action"][:, 1:], result["action"][:, :-1]
         )
+        # Only the synthetic fixture is converted. Real retained histories must
+        # still fail closed for even a single out-of-bounds action.
+        result["action"][0, 10, 0] = 1.01
+        with self.assertRaisesRegex(ValueError, "simulator bounds"):
+            validate_histories(proxy, result)
+        for invalid in (np.nan, np.inf, -np.inf):
+            batch["action"][0, 0, 0] = invalid
+            with self.assertRaisesRegex(ValueError, "nonfinite.*fixture.*action"):
+                runner._probe_fixture(batch)
 
     def test_checkpoint_import_preserves_every_existing_optimizer_value(self):
         import sys
