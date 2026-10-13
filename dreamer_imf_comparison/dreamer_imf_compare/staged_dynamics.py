@@ -140,6 +140,10 @@ class StagedAgent(upstream.Agent):
         """Default-compatible task readout hook; never changes real reward loss."""
         return self.rew(features, bdims).pred()
 
+    def _dynamics_observation(self, carry, tokens, actions, reset, training):
+        """Default-compatible extension point for same-pass auxiliary outputs."""
+        return (*self.dyn.loss(carry, tokens, actions, reset, training), {})
+
     def _make_opt(self, **kwargs):
         def enabled(group):
             if group == "actor":
@@ -185,8 +189,8 @@ class StagedAgent(upstream.Agent):
         reset = obs["is_first"]
         B, T = reset.shape
         enc_carry, enc_entries, tokens = self.enc(enc_carry, obs, reset, training)
-        dyn_carry, dyn_entries, losses, repfeat, metrics = self.dyn.loss(
-            dyn_carry, tokens, prevact, reset, training
+        dyn_carry, dyn_entries, losses, repfeat, metrics, auxiliary = (
+            self._dynamics_observation(dyn_carry, tokens, prevact, reset, training)
         )
         dec_carry, dec_entries, recons = self.dec(dec_carry, repfeat, reset, training)
         inp = upstream.sg(self.feat2tensor(repfeat), skip=self.config.reward_grad)
@@ -293,7 +297,7 @@ class StagedAgent(upstream.Agent):
         return sum(terms), (
             (enc_carry, dyn_carry, dec_carry),
             (enc_entries, dyn_entries, dec_entries),
-            dict(tokens=tokens, repfeat=repfeat, losses=losses),
+            dict(tokens=tokens, repfeat=repfeat, losses=losses, **auxiliary),
             metrics,
         )
 

@@ -36,6 +36,13 @@ class ConditionalIMFRSSM(StagedIMFRSSM):
     _prior_normal = GaussianRSSM._prior_normal
 
     def loss(self, carry, tokens, acts, reset, training):
+        return self._observed_loss(carry, tokens, acts, reset, training, False)
+
+    def loss_with_statistics(self, carry, tokens, acts, reset, training):
+        """Expose statistics from this observation pass, outside model features."""
+        return self._observed_loss(carry, tokens, acts, reset, training, True)
+
+    def _observed_loss(self, carry, tokens, acts, reset, training, statistics):
         carry, entries, feat = self.observe(carry, tokens, acts, reset, training)
         prior_mean, prior_std = self._prior_normal(feat["deter"])
         aux, rep = balanced_alignment(
@@ -59,13 +66,16 @@ class ConditionalIMFRSSM(StagedIMFRSSM):
             ).mean(),
         )
         features = {k: feat[k] for k in ("deter", "stoch")}
-        return (
+        result = (
             carry,
             entries,
             dict(dyn=flow, aux_dyn=aux, rep=rep),
             features,
             sg(metrics),
         )
+        if statistics:
+            return (*result, {"posterior": sg({k: feat[k] for k in ("mean", "std")})})
+        return result
 
 
 ConditionalIMFRSSM.__annotations__ = dict(_UPSTREAM_RSSM.__annotations__)
