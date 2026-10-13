@@ -26,6 +26,7 @@ import jax.numpy as jnp
 import ninjax as nj
 import numpy as np
 import optax
+from dreamerv3 import agent as upstream
 from ruamel.yaml import YAML
 
 from dreamer_imf_compare.conditional_dynamics import ConditionalAgent
@@ -490,7 +491,13 @@ class PosteriorRewardIntegrationTests(unittest.TestCase):
                 self.state, self.initial, obs, mode=mode, seed=29
             )
             _, expected = nj.pure(parent.policy)(
-                self.state, self.initial, obs, mode=mode, seed=29
+                # The pinned e3f0224 parent samples in both modes. Do not let an
+                # unrelated local deterministic-eval patch redefine this oracle.
+                self.state,
+                self.initial,
+                obs,
+                mode="train",
+                seed=29,
             )
             exact_tree(self, actual[:2], expected[:2])
             self.assertEqual(set(actual[0][1]), {"deter", "stoch"})
@@ -499,6 +506,36 @@ class PosteriorRewardIntegrationTests(unittest.TestCase):
                     actual[2]["log/" + key].sum(-1), 1, atol=1e-6
                 )
             self.assertNotIn("log/original_categorical_nll", actual[2])
+
+    def test_compiled_policy_all_arms_without_optional_upstream_predict(self):
+        obs = {k: self.data[k][:, 1] for k in self.obs}
+        parent = object.__new__(ConditionalAgent)
+        parent.__init__(self.obs, self.act, self.cfg)
+        reference = jax.jit(nj.pure(parent.policy), static_argnames=("mode",))(
+            self.state, self.initial, obs, mode="train", seed=29
+        )[1]
+        # Production's pinned upstream has no predict helper. Explicitly remove
+        # it so even an ambient patched checkout cannot hide that API mismatch.
+        with mock.patch.dict(upstream.__dict__):
+            upstream.__dict__.pop("predict", None)
+            self.assertFalse(hasattr(upstream, "predict"))
+            for arm in ("A", "B", "C"):
+                model = model_for(arm, self.cfg, self.obs, self.act)
+                policy = jax.jit(nj.pure(model.policy), static_argnames=("mode",))
+                for mode in ("train", "eval"):
+                    with self.subTest(arm=arm, mode=mode):
+                        state, actual = policy(
+                            self.state, self.initial, obs, mode=mode, seed=29
+                        )
+                        # Same compiler role for exact stochastic comparisons.
+                        exact_tree(self, actual[:2], reference[:2])
+                        exact_tree(self, state, self.state)
+                        self.assertEqual(actual[1]["action"].shape, (2, 2))
+                        self.assertTrue(np.isfinite(actual[1]["action"]).all())
+                        for key in ("student_probabilities", "teacher_probabilities"):
+                            np.testing.assert_allclose(
+                                actual[2]["log/" + key].sum(-1), 1, atol=1e-6
+                            )
 
 
 if __name__ == "__main__":

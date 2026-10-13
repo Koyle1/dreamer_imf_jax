@@ -335,11 +335,10 @@ class PosteriorRewardAgent(ConditionalAgent):
             dec_carry, dec_entry, _ = self.dec(dec_carry, repfeat, reset, **kwargs)
         flat = self.feat2tensor(repfeat)
         distribution = self.pol(flat, bdims=1)
-        action = (
-            upstream.predict(distribution)
-            if mode == "eval"
-            else upstream.sample(distribution)
-        )
+        # Pinned Dreamer e3f0224 samples in both train and eval modes and does
+        # not export predict(). Preserve its action semantics and RNG use;
+        # an ambient checkout's optional deterministic-eval patch is not an API.
+        action = upstream.sample(distribution)
         student = self.reward_student(flat, 1)
         teacher_features = posterior_mean_features(repfeat, features, 1)
         teacher = self.reward_teacher(teacher_features, 1)
