@@ -194,8 +194,14 @@ def predict_arrays(proxy, data, seed):
         )
 
     pure = nj.pure(body)
-    predict = jax.jit(
-        lambda params, obs, previous, plans, truth: pure(
+
+    @jax.jit
+    def predict(params, obs, previous, plans, truth):
+        # Ninjax scan discovers accessed parameters in its prepass. Disabling
+        # both create and modify skips that discovery and passes an empty state
+        # into the recurrent body. Permit local context bookkeeping, but reject
+        # any actual parameter/state mutation before returning probe evidence.
+        after, values = pure(
             params,
             obs,
             previous,
@@ -203,16 +209,30 @@ def predict_arrays(proxy, data, seed):
             truth,
             seed=int(seed),
             create=False,
-            modify=False,
-        )[1]
-    )
-    values = predict(
+            modify=True,
+        )
+        if set(after) != set(params):
+            raise ValueError("prediction probe changed checkpoint state keys")
+        if any(
+            after[key].shape != params[key].shape
+            or after[key].dtype != params[key].dtype
+            for key in params
+        ):
+            raise ValueError("prediction probe modified checkpoint state shape/dtype")
+        unchanged = jnp.stack(
+            [jnp.array_equal(after[key], params[key]) for key in params]
+        ).all()
+        return values, unchanged
+
+    values, unchanged = predict(
         proxy.params,
         jax.device_put({k: retained[k] for k in proxy.obs_space}),
         jax.device_put(retained["previous_action"]),
         jax.device_put(action),
         jax.device_put(truth_reward),
     )
+    if not bool(jax.device_get(unchanged)):
+        raise ValueError("prediction probe modified checkpoint state")
     # Materialize portable float32 evidence even if an upstream output uses the
     # backbone's bfloat16 storage dtype (NumPy reports that as a void dtype).
     arrays = {

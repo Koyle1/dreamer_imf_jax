@@ -370,8 +370,11 @@ class PureProbeTests(unittest.TestCase):
                 probe.predict_arrays(proxy, histories(), 19)
             self.assertEqual(proxy.calls["observe"], 1)
 
-    def test_frozen_ninjax_context_refuses_parameter_writes_and_creation(self):
-        for key in ("untouched", "new_parameter"):
+    def test_immutable_prediction_rejects_parameter_writes_and_creation(self):
+        for key, error, message in (
+            ("untouched", ValueError, "modified checkpoint state"),
+            ("new_parameter", RuntimeError, "create=True"),
+        ):
             proxy = tiny_proxy()
 
             def writes(features, bdims):
@@ -379,7 +382,7 @@ class PureProbeTests(unittest.TestCase):
                 return Native(features)
 
             proxy.model.rew = writes
-            with self.subTest(key=key), self.assertRaises(RuntimeError):
+            with self.subTest(key=key), self.assertRaisesRegex(error, message):
                 probe.predict_arrays(proxy, histories(), 19)
             np.testing.assert_array_equal(proxy.params["untouched"], [3.25])
             self.assertEqual(set(proxy.params), {"untouched"})

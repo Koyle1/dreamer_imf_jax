@@ -7,6 +7,7 @@ from pathlib import Path
 import pickle
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -536,6 +537,41 @@ class PosteriorRewardIntegrationTests(unittest.TestCase):
                             np.testing.assert_allclose(
                                 actual[2]["log/" + key].sum(-1), 1, atol=1e-6
                             )
+
+    def test_prediction_probe_real_recurrent_scan_and_state_immutability(self):
+        from dreamer_imf_compare.posterior_reward_probe import predict_arrays
+        from test_posterior_reward_probe import histories
+
+        obs_space = {k: v for k, v in self.obs.items() if k != "vector"}
+        data = {k: v for k, v in self.data.items() if k != "vector"}
+        for i, key in enumerate(("position", "to_target", "velocity")):
+            obs_space[key] = elements.Space(np.float32, (2,))
+            data[key] = self.data["vector"][..., i * 2 : (i + 1) * 2]
+        model = model_for("C", self.cfg, obs_space, self.act)
+        state = nj.init(model.train)({}, model.init_train(2), data, seed=0)
+        params = {
+            k: v
+            for k, v in state.items()
+            if not k.startswith(("opt/", "reward_aux_opt/"))
+        }
+        before = jax.tree.map(lambda x: np.asarray(x).copy(), params)
+        proxy = types.SimpleNamespace(model=model, params=params, obs_space=obs_space)
+        first = predict_arrays(proxy, histories(), 91)
+        second = predict_arrays(proxy, histories(), 91)
+        exact_tree(self, first, second)
+        exact_tree(self, params, before)
+        original_observe = model.dyn.observe
+
+        def mutate(*args, **kwargs):
+            result = original_observe(*args, **kwargs)
+            key = "reward_student/logits_bias"
+            nj.context()[key] = nj.context()[key] + 1
+            return result
+
+        with mock.patch.object(model.dyn, "observe", side_effect=mutate):
+            with self.assertRaisesRegex(ValueError, "modified checkpoint state"):
+                predict_arrays(proxy, histories(), 91)
+        exact_tree(self, params, before)
 
 
 if __name__ == "__main__":
